@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { join, relative, sep } from "node:path";
 import test from "node:test";
 
+const directoryLinkType = process.platform === "win32" ? "junction" : "dir";
 const guard = new URL("../scripts/check-bundled-notices.mjs", import.meta.url);
 const license = "MIT License\nCopyright Example Contributors\nPermission is hereby granted.\n";
 
@@ -72,7 +73,7 @@ function setInput(root, input) {
   writeFileSync(
     join(root, "dist/metafile-esm.json"),
     JSON.stringify({
-      outputs: { "dist/dvmctl.js": { inputs: { [input]: { bytesInOutput: 12 } } } },
+      outputs: { "dist/dvmctl.js": { inputs: { [input.split(sep).join("/")]: { bytesInOutput: 12 } } } },
     })
   );
 }
@@ -94,7 +95,7 @@ test("license check accepts sibling-relative inputs from linked node_modules", (
   const root = fixture(context, `example@1.0.0\n${license}`);
   const cache = externalPackage(context);
   rmSync(join(root, "node_modules"), { recursive: true });
-  symlinkSync(join(cache, "node_modules"), join(root, "node_modules"), "dir");
+  symlinkSync(join(cache, "node_modules"), join(root, "node_modules"), directoryLinkType);
   setInput(root, relative(root, join(cache, "node_modules/example/index.js")));
   const result = check(root);
   assert.equal(result.status, 0, result.stderr);
@@ -115,7 +116,7 @@ test("license check rejects package symlinks escaping the declared dependency di
   const root = fixture(context, `example@1.0.0\n${license}`);
   const cache = externalPackage(context);
   rmSync(join(root, "node_modules/example"), { recursive: true });
-  symlinkSync(join(cache, "node_modules/example"), join(root, "node_modules/example"), "dir");
+  symlinkSync(join(cache, "node_modules/example"), join(root, "node_modules/example"), directoryLinkType);
   const result = check(root);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /Cannot identify a bundled dependency's license owner/);
