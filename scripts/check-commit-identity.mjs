@@ -8,7 +8,6 @@ const approvedEmails = new Set([
   "noreply@github.com",
   "41898282+github-actions[bot]@users.noreply.github.com",
   "319907686+dvmkit-release-automation[bot]@users.noreply.github.com",
-  "326342320+dvmkit-dvmctl-release-automation[bot]@users.noreply.github.com",
   "49699333+dependabot[bot]@users.noreply.github.com",
   "29139614+renovate[bot]@users.noreply.github.com",
   "github-actions[bot]@users.noreply.github.com",
