@@ -1,0 +1,61 @@
+name: Release policy base-owned check
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Reject changes to release controls from an unreviewed pull request
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
+          AUTHOR: ${{ github.event.pull_request.user.login }}
+          AUTHOR_ID: ${{ github.event.pull_request.user.id }}
+          AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # This workflow deliberately does not check out or run pull-request code.
+          # The policy is approved on the base branch. Changes to publisher, signer,
+          # artifact, or workflow invariants must first land from a maintainer branch.
+          protected='^(\.github/(workflows|actions)/.*|\.github/release-signers|release-please-config\.json|scripts/(release-artifact|release-provenance|release-channel|sdk-version|install-published-release|verify-published-release|check-commit-identity|publish-release|pinned-publish-npm|release-tag|public-safety|check-source-boundary|check-bundled-skills)\.mjs)$'
+          files="$(gh api --paginate "repos/$REPOSITORY/pulls/$NUMBER/files" --jq '.[].filename')"
+          if grep -Eq "$protected" <<< "$files"; then
+            test "$HEAD_REPOSITORY" = "$REPOSITORY" || { echo "release controls require a same-repository maintainer branch" >&2; exit 1; }
+            test "$AUTHOR_TYPE" = User || { echo "release controls require a human maintainer" >&2; exit 1; }
+            [[ "$AUTHOR" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}$ ]] || { echo "invalid author login" >&2; exit 1; }
+            [[ "$AUTHOR_ID" =~ ^[1-9][0-9]*$ ]] || { echo "invalid author identity" >&2; exit 1; }
+            # Association describes past participation, not current repository access.
+            # The metadata-read endpoint maps maintain to write and custom roles to
+            # their base permission. Only write/admin may modify release controls.
+            permission="$(timeout 30s gh api --method GET "repos/$REPOSITORY/collaborators/$AUTHOR/permission")"
+            jq -e -s --argjson author_id "$AUTHOR_ID" '
+              length == 1 and (.[0] |
+                type == "object" and
+                (.user.id | type == "number") and .user.id == $author_id and
+                .user.type == "User" and
+                (.permission == "write" or .permission == "admin"))
+            ' <<< "$permission" > /dev/null
+            policy_repo="$(mktemp -d "$RUNNER_TEMP/release-policy.XXXXXX")"
+            trap 'rm -rf "$policy_repo"' EXIT
+            git init --quiet "$policy_repo"
+            git -C "$policy_repo" remote add origin "https://github.com/$REPOSITORY.git"
+            fetch_header="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+            GIT_TERMINAL_PROMPT=0 git -C "$policy_repo" -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $fetch_header" fetch --quiet --no-tags origin "$HEAD_SHA"
+            unset fetch_header
+            printf '%s\n' '265668992+aioli3@users.noreply.github.com namespaces="git" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIOAABfWAkQaX/F7qoDtDVT1APZho1qYllrCaXQOCWXR' > "$policy_repo/allowed_signers"
+            git -C "$policy_repo" -c gpg.format=ssh -c "gpg.ssh.allowedSignersFile=$policy_repo/allowed_signers" verify-commit "$HEAD_SHA"
+          fi
+          # The required check is enabled only after this workflow is merged, so its
+          # first merge cannot rely on a check that does not exist yet.

@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/dvmkit/dvmctl/security/advisories/new
+    about: Use GitHub's private form. Never open a public issue for a suspected vulnerability.
+  - name: Ideas and design questions
+    url: https://github.com/dvmkit/dvmctl/discussions
+    about: Ideas and design questions without a reproduction.
+  - name: Account, billing, or dvmkit service support
+    url: https://github.com/dvmkit/dvmctl/blob/master/SUPPORT.md#email
+    about: Account, billing, or dvmkit service support.
+  - name: Command reference
+    url: https://dvmkit.com/docs/cli-dvmctl
+    about: The full dvmctl command reference. Read before filing.

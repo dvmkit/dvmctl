@@ -1,0 +1,3366 @@
+---
+title: dvmctl CLI reference
+description: Complete reference for the dvmctl builder CLI — every command, flag, JSON output shape, and error anchor.
+---
+
+`dvmctl` is the builder CLI for creating, deploying, and managing DVMs on the dvmkit platform.
+
+Every command that targets a DVM by `<slug>` resolves it only within the active `dvmctl switch` context. Pass `--org <handle>` for a one-shot override; after resolution, the operation is bound to the immutable `dvmId`, never to a global slug fallback.
+
+All commands write JSON to stdout by default. Pass `--human` for prose output. Commands that start servers (`dev`, `serve`, `logs`) stream to stdout until interrupted.
+
+Every JSON payload below is also prefixed with a `trace_id` string. `dvmctl` generates one locally at startup, and the platform's own trace_id replaces it whenever the command makes a platform call — so a local-only command like `validate` still prints one. Quote it when reporting a problem, and pass it to [`dvmctl trace get`](#trace-get) to see the spans behind a platform call. The samples in this reference omit it, except where a command returns a trace_id of its own ([`trace get`](#trace-get)). Two outputs carry no `trace_id` at all: [`auth`](#auth) and [`deploy --target self-host`](#deploy), which print their JSON without the wrapper.
+
+Two URLs recur across the DVM payloads and they are not interchangeable. `dvmkitUrl` — `https://<handle>--<slug>.dvmkit.ai` — is the public address you give callers; it is `null` until the owning account claims a handle with [`dvmctl handle set`](#handle-set). `url` is where the DVM answers from outside dvmkit: the same router address for a cloud deploy, whose Fly app has no public address of its own, and your own upstream on the connect tier. There is no `<slug>.dvmkit.ai` — a slug names a DVM only inside its owning org, so it cannot claim a hostname.
+
+## Authentication
+
+`dvmctl` authenticates via a long-lived API key. Two ways to supply it:
+
+| Method | How |
+|---|---|
+| Interactive browser flow | `dvmctl auth` — opens browser, stores key in `~/.dvmctl/config.json` |
+| Environment variable | `DVMKIT_API_KEY=dvmk_...` — takes precedence over stored key, useful in CI |
+
+## Environment variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DVMKIT_API_KEY` | — | API key; overrides stored credentials |
+| `DVMKIT_PLATFORM_URL` | `https://api.dvmkit.dev` | Platform API base URL |
+| `DVMKIT_WEB_URL` | `https://dvmkit.com` | Web app base URL (used by `dvmctl auth`) |
+
+## Error envelope
+
+Same shape as the `dvm` CLI — every failure exits with code `1` and prints:
+
+```json
+{
+  "error": {
+    "code": "auth_required",
+    "message": "Not authenticated.",
+    "hint": "Set DVMKIT_API_KEY or run `dvmctl auth`."
+  }
+}
+```
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | Any error |
+
+---
+
+## auth
+
+Authenticate with the dvmkit platform. Opens a browser for the interactive consent flow and stores the returned API key at `~/.dvmctl/config.json` (mode `0600`).
+
+```sh
+dvmctl auth
+dvmctl auth --status
+dvmctl auth --logout
+```
+
+See [Logging in to dvmkit](/docs/cli-auth) for the full flow, security details, and headless CI usage.
+
+| Flag | Description |
+|---|---|
+| `--status` | Show current authentication state |
+| `--logout` | Remove stored credentials |
+| `--human` | Prose output |
+
+**JSON output — `--status` (authenticated):**
+
+```json
+{ "authenticated": true, "account": "you@example.com" }
+```
+
+**JSON output — `--logout`:**
+
+```json
+{ "status": "logged_out" }
+```
+
+---
+
+## create
+
+Scaffold a new DVM project in the current directory.
+
+```sh
+dvmctl create my-dvm
+dvmctl create my-dvm --price '$0.05' --name "My DVM" --description "Does something useful"
+```
+
+Creates a `package.json` with `dvmkit` config, a starter `handler.ts`, and a `Dockerfile` for container deployment.
+
+| Flag | Description |
+|---|---|
+| `--price <price>` | Static price per request (default: `$0.01`) |
+| `--name <name>` | DVM display name (default: derived from directory) |
+| `--description <text>` | DVM description |
+
+No JSON output — writes files and prints progress to stderr.
+
+---
+
+## dev
+
+Start a local development server for a DVM handler with hot reload.
+
+```sh
+dvmctl dev handler.ts
+dvmctl dev handler.ts --port 4000
+dvmctl dev handler.ts --no-reload
+```
+
+Serves the DVM protocol on the specified port. Runs until interrupted.
+
+Saving the handler or any local file it imports reloads it; packages under `node_modules` are not watched. Each reload loads the handler in a fresh process. If the new code fails to load, the error is printed and the previous version keeps serving until the next save.
+
+| Flag | Description |
+|---|---|
+| `--port <port>` | HTTP port (default: `PORT` env var or `3000`) |
+| `--no-reload` | Disable hot reload |
+| `--human` | Human-readable errors instead of JSON |
+
+While it runs, all output is informational. If the handler fails to load at startup, the command prints the [error envelope](#error-envelope) with the handler's own message and the file and line it names, then exits with code `1`. If the port can't be opened at startup, the envelope names the port and carries it as `port`, then the command exits with code `1`.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `handler_load_failed` | The handler threw while loading, has a syntax error, or exports no `configureDVM()` result |
+| `dev_port_in_use` | Another process is already listening on the port, often an earlier `dvmctl dev`. Stop it or pass `--port` |
+| `dev_listen_failed` | The port can't be opened for any other reason, such as a number above `65535` |
+
+---
+
+## deploy
+
+Deploy a DVM project to the dvmkit cloud or generate a self-host Dockerfile.
+
+```sh
+dvmctl deploy
+dvmctl deploy --name my-dvm
+dvmctl deploy --dry-run
+dvmctl deploy --create-identity
+dvmctl deploy --target self-host
+dvmctl deploy --allow-dirty
+```
+
+With no `--target`, deploys to dvmkit cloud. Reads `dvmkit` config from `package.json` in the current directory. Requires authentication. Cloud deploys refuse when packaged files differ from `HEAD`; commit or discard them first, or pass `--allow-dirty` when shipping the uncommitted state is deliberate. `--yes` does not bypass this guard. Local and self-host targets are unaffected.
+
+| Flag | Description |
+|---|---|
+| `--target <target>` | `cloud` (default), `self-host`, or `local` |
+| `--name <slug>` | DVM slug for cloud deploy (default: from `package.json`) |
+| `--runtime <runtime>` | `container` (default) or `isolate`. The builder beta hosts containers only, so the platform refuses `isolate` except from operator accounts |
+| `--endpoint-url <url>` | Connect-tier upstream URL (required on plans where the platform doesn't host compute) |
+| `--local` | Register a locally-running DVM into the local platform (no Fly), pointing at its localhost URL |
+| `--url <url>` | Localhost URL the DVM is running at, for `--local` (default `http://localhost:<PORT or 3000>`) |
+| `--dry-run` | Validate and build locally without contacting platform |
+| `--create-identity` | Create the builder signing identity when it is absent; intended for noninteractive first deploys |
+| `--yes` | Skip the SDK-staleness confirmation prompt and proceed automatically |
+| `--env-stdin` | Read a JSON string map from standard input for a cloud deploy; overrides matching `.env` keys without placing secrets in arguments. Invalid or oversized input fails before network access. |
+| `--allow-dirty` | Allow a cloud image to include uncommitted packaged files; the image SHA retains its `-dirty` suffix |
+| `--org <handle>` | Deploy under this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output — cloud deploy (success):**
+
+```json
+{
+  "status": "deployed",
+  "slug": "my-dvm",
+  "url": "https://alice--my-dvm.dvmkit.ai",
+  "dvmkitUrl": "https://alice--my-dvm.dvmkit.ai",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
+`dvmkitUrl` is the address you give callers — `https://<handle>--<slug>.dvmkit.ai`, built from the handle of the org that owns the DVM. A cloud deploy needs that handle: its Fly app is reachable only through the router, so a deploy from an owner without one fails with `handle_required` until the handle is claimed with [`dvmctl handle set`](#handle-set). `url` is the same router address for a cloud deploy, or your own upstream on the connect tier. A DVM is **not** reachable at `<slug>.dvmkit.ai`: slugs repeat across orgs, so a bare name addresses nobody.
+
+The connect-tier path omits `dvmId`; the `--local` path adds an optional `warning` string when registration succeeded with caveats.
+
+**JSON output — dry run:**
+
+```json
+{
+  "status": "dry-run-ok",
+  "slug": "my-dvm",
+  "name": "My DVM",
+  "runtime": "container",
+  "docker_built": true,
+  "dockerfile": "Dockerfile",
+  "vm_config": null,
+  "inherit_secrets": ["GROQ_*"]
+}
+```
+
+`inherit_secrets` is omitted entirely when the project inherits none; `vm_config` is `null` when `package.json` carries no `dvmkit.vm` block.
+
+**JSON output — self-host:**
+
+```json
+{
+  "status": "ready",
+  "file": "Dockerfile",
+  "target": "self-host",
+  "attestation_env": {
+    "DVMKIT_BUILDER_PUBKEY": "f2f1d2c3b3382d924d13f55d0a70d0d555239c39a36464980c0b37804ddd1846",
+    "DVMKIT_BUILDER_ATTESTATION": "{\"slug\":\"my-dvm\",\"capabilities_hash\":\"709523528f4df152c0cfbb352eda593872fd6bd72543de62ca8d1f0b4c19cdb6\",\"builder_pubkey\":\"f2f1d2c3b3382d924d13f55d0a70d0d555239c39a36464980c0b37804ddd1846\",\"deployed_at\":1747900800}",
+    "DVMKIT_BUILDER_SIGNATURE": "ab85e4d1560ac15b5b16f95e3b4f55c5eaa6da6ed903ac6a42c728460d25231616295b13c1d45c4c9e4db94d5ec6e2e92b1416cd5574cc7d4e2d909ac34b1c18"
+  }
+}
+```
+
+`attestation_env` is the set of environment variables you must inject into your self-hosted container so its `/v1/info` advertises a verifiable `builder.pubkey`. `DVMKIT_BUILDER_PUBKEY` is the x-only BIP-340 identity key (64 hex chars — no `02`/`03` prefix), `DVMKIT_BUILDER_ATTESTATION` is the JSON payload as a string, and `DVMKIT_BUILDER_SIGNATURE` is the 64-byte Schnorr signature over it. This is the one `dvmctl` JSON output with no `trace_id` prefix besides [`auth`](#auth).
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `auth_required` | Not authenticated |
+| `dirty_worktree` | Packaged files differ from `HEAD` on a cloud deploy without `--allow-dirty` |
+| `missing_dockerfile` | No `Dockerfile` at the project root. Cloud deploys run as containers, so `dvmctl create` scaffolds one |
+| `isolate_runtime_unavailable` | The platform refused `--runtime isolate`, or a redeploy of a DVM that was on the isolate runtime: that runtime is limited to operator accounts |
+| `invalid_slug` | Slug is too short (min 3 chars) |
+| `docker_build_failed` | Local Docker build failed |
+| `invalid_dvmkit_config` | Malformed `dvmkit` field in `package.json` |
+| `terms_not_accepted` | The account has not accepted the current Builder Terms; the message names the page to accept them on |
+| `handle_required` | A cloud deploy from an owner with no handle. The DVM would have no address, so claim one with [`dvmctl handle set`](#handle-set) and deploy again |
+
+---
+
+## deploy-status
+
+Show the current status of a deploy by ID — the recovery handle for a `dvmctl deploy` whose stream was interrupted. The deploy ID is printed in the `deploy` progress events.
+
+```sh
+dvmctl deploy-status 3dcc9623-8db4-4c03-9929-a0cd5841c1d2
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "status": "building",
+  "url": "https://alice--my-dvm.dvmkit.ai",
+  "dvmkitUrl": "https://alice--my-dvm.dvmkit.ai",
+  "slug": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "deployId": "3dcc9623-8db4-4c03-9929-a0cd5841c1d2",
+  "startedAt": 1747785600000,
+  "endedAt": null,
+  "error": null
+}
+```
+
+`status` mirrors the platform deploy state (`pending`, `building`, `deployed`, `failed`). `startedAt`/`endedAt` are epoch-millisecond numbers (`--human` renders them as dates). `url`/`dvmkitUrl` may be `null` until the deploy lands; `endedAt`/`error` are populated once the deploy reaches a terminal state.
+
+---
+
+## validate
+
+Load the DVM handler and lint its capabilities, schemas, examples, prices, and tags alongside `package.json#dvmkit` (vmConfig + inheritSecrets), without contacting the platform. Runs offline — no auth, no network — and exits non-zero with a specific handler or package error. Package validation remains the pre-flight gate inside `dvmctl deploy` and the CI check for first-party DVM manifests.
+
+```sh
+dvmctl validate
+dvmctl validate --handler src/handler.ts
+dvmctl validate --human
+```
+
+| Flag | Description |
+|---|---|
+| `--handler <path>` | Handler module to load (default: `handler.ts`, then `handler.js`) |
+| `--human` | Prose output |
+
+**JSON output — success:**
+
+```json
+{
+  "status": "ok",
+  "slug": "scribe",
+  "name": "Scribe",
+  "vm_config": { "memoryMb": 1024, "cpuKind": "shared", "minMachinesRunning": 0, "maxMachines": 3 },
+  "inherit_secrets": ["GROQ_*", "REPLICATE_*"]
+}
+```
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `missing_package_json` | No `package.json` in the current directory |
+| `invalid_dvmkit_config` | Malformed `dvmkit` field (bad vmConfig or inheritSecrets pattern) |
+
+---
+
+## doctor
+
+Check builder-side state stored under `~/.dvmkit`. The command is local and read-only. It emits a warning when timestamped plaintext copies of an older builder mnemonic remain beside `~/.dvmkit/builder.mnemonic`, including copies beside the legacy `~/.dvmkit/recovery.mnemonic` and `~/.dvm/recovery.mnemonic` paths that builder mnemonic migration replaced; warnings do not change the successful exit code.
+
+```sh
+dvmctl doctor
+dvmctl doctor --human
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+No check row is emitted when no mnemonic backups exist. With backups present, JSON includes every path and its age so an agent can relay the exact files to review:
+
+```json
+{
+  "checks": [
+    {
+      "name": "mnemonic_backups",
+      "group": "files",
+      "status": "warn",
+      "display": "1 plaintext builder-mnemonic backup remains on disk: ~/.dvmkit/builder.mnemonic.2026-08-13T12-00-00-000Z.bak (10 days old).",
+      "hint": "Each file contains older recovery words. Deleting it is safe once your password-manager and offline backups are refreshed; until then it is a rescue copy of an earlier derivation root.",
+      "details": {
+        "count": 1,
+        "paths": ["~/.dvmkit/builder.mnemonic.2026-08-13T12-00-00-000Z.bak"],
+        "backups": [
+          {
+            "path": "~/.dvmkit/builder.mnemonic.2026-08-13T12-00-00-000Z.bak",
+            "modifiedAt": "2026-08-13T12:00:00.000Z",
+            "ageMs": 864000000,
+            "ageDays": 10,
+            "age": "10 days old"
+          }
+        ]
+      }
+    }
+  ],
+  "summary": { "ok": 0, "warn": 1, "fail": 0 },
+  "configDir": "~/.dvmkit",
+  "cliVersion": "0.1.0",
+  "nodeVersion": "v22.0.0"
+}
+```
+
+Delete a `.bak` only after refreshing the password-manager and offline copies of the mnemonic. `doctor` never deletes or expires one itself.
+
+---
+
+## serve
+
+Start a production DVM server for a handler file.
+
+```sh
+dvmctl serve handler.ts
+dvmctl serve handler.ts --port 8080
+dvmctl serve handler.ts --dvm my-dvm
+```
+
+Like `dev` but without hot reload. Used inside Dockerfiles for container-runtime DVMs.
+
+| Flag | Description |
+|---|---|
+| `--port <port>` | HTTP port (default: `PORT` env var or `8080`) |
+| `--dvm <handle>` | Serve under the lock identity `builder.json` holds for `<handle>` — advertises the Cashu lock pubkey derived from your recovery mnemonic instead of whatever `DVMKIT_CASHU_LOCK_PUBKEY` happens to be set to |
+
+Reach for `--dvm` when you self-host. `dvmctl deploy` publishes a lock pubkey derived from your recovery mnemonic, which is what lets `dvmctl melt-pending` and `dvmctl rotate` sign for that DVM later; a hand-rolled `serve` has no such link, so a DVM booted with an unrelated lock key can take Cashu payments it can never melt — and can never park a credit-drain refund, because the admin routes only accept a signature from the key the DVM advertises. The flag derives the pubkey and the DVM id together and prints both at boot. If `DVMKIT_CASHU_LOCK_PUBKEY`, `DVMKIT_DVM_ID`, or `DVMKIT_CANONICAL_DVM_ID` is already set to a conflicting value, the boot refuses with `lock_identity_conflict` rather than silently overriding it.
+
+No JSON output — all output is informational (stderr).
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `no_builder_mnemonic` | `--dvm` passed but no mnemonic found — run `dvmctl lock create` first |
+| `dvm_not_initialized` | `--dvm` passed but no `builder.json` entry for this handle — run `dvmctl deploy`, or `dvmctl init <handle> --self-hosted` |
+| `lock_identity_conflict` | `--dvm` derives an identity that contradicts one already set in the environment |
+
+---
+
+## list
+
+List the DVMs in your current org context — the org set by [`switch`](#switch), or your personal account when none is set.
+
+```sh
+dvmctl list
+
+# One-off: read a shared org without changing your context
+dvmctl list --org my-org
+```
+
+| Flag | Description |
+|---|---|
+| `--org <handle>` | Read as this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output (columnar table) |
+
+**JSON output:**
+
+```json
+{
+  "dvms": [
+    {
+      "id": "550e8400-e29b-41d4-a716-446655440000",
+      "orgId": "acffd753-105a-4958-9f37-243ac032f332",
+      "slug": "my-dvm",
+      "name": "My DVM",
+      "url": "https://alice--my-dvm.dvmkit.ai",
+      "dvmkitUrl": "https://alice--my-dvm.dvmkit.ai",
+      "status": "deployed",
+      "runtime": "container",
+      "dvmMeta": {
+        "name": "My DVM",
+        "description": "Does something useful",
+        "tags": ["text"],
+        "price": "$0.01"
+      },
+      "hidden": false,
+      "region": "iad",
+      "suspensionReason": null,
+      "pausedAt": null,
+      "githubRepoFullName": null,
+      "gitBranch": null,
+      "rootDir": null,
+      "entrypoint": null,
+      "endpointUrl": null,
+      "lastJobAt": 1745000000000,
+      "feedbackEnabled": true,
+      "createdAt": 1744000000000,
+      "updatedAt": 1745000000000,
+      "lifetimeRevenueFiatMinor": 14237
+    }
+  ],
+  "org": {
+    "id": "acffd753-105a-4958-9f37-243ac032f332",
+    "handle": "my-org",
+    "role": "admin",
+    "personal": false
+  }
+}
+```
+
+Every row is the full builder projection — same field set `info` returns for a single DVM, minus `orgHandle`. `dvmMeta` is the DVM's advertised metadata (`null` until the first successful deploy captures it); the git fields are set only for DVMs wired to git-push deploys; `endpointUrl` only on the connect tier; `lifetimeRevenueFiatMinor` is gross revenue in minor units of your reporting currency (cents for USD).
+
+`org` is the context the list was answered from, so an empty `dvms` array is never ambiguous about *which* org it was empty for. `handle` is `null` and `personal` is `true` when you have no org context set — personal accounts have no public org handle.
+
+The `--human` table's `URL` column shows `dvmkitUrl` — the public address callers use. It falls back to `url` only while you have no handle; see [`info`](#info) below.
+
+---
+
+## info
+
+Show detailed information about a single DVM: metadata, recent deploys, and custom domains. The bare slug is resolved within your current org context; pass `--org` for a one-off shared-org read without changing `dvmctl switch`.
+
+```sh
+dvmctl info my-dvm
+```
+
+| Flag | Description |
+|---|---|
+| `--org <handle>` | Read as this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "dvm": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "orgId": "acffd753-105a-4958-9f37-243ac032f332",
+    "slug": "my-dvm",
+    "name": "My DVM",
+    "url": "https://alice--my-dvm.dvmkit.ai",
+    "dvmkitUrl": "https://alice--my-dvm.dvmkit.ai",
+    "status": "deployed",
+    "runtime": "container",
+    "dvmMeta": {
+      "name": "My DVM",
+      "description": "Does something useful",
+      "tags": ["text"],
+      "price": "$0.01"
+    },
+    "hidden": false,
+    "region": "iad",
+    "suspensionReason": null,
+    "pausedAt": null,
+    "githubRepoFullName": null,
+    "gitBranch": null,
+    "rootDir": null,
+    "entrypoint": null,
+    "endpointUrl": null,
+    "lastJobAt": 1745000000000,
+    "feedbackEnabled": true,
+    "createdAt": 1744000000000,
+    "updatedAt": 1745000000000,
+    "lifetimeRevenueFiatMinor": 14237,
+    "orgHandle": null
+  },
+  "deploys": [
+    {
+      "id": "3dcc9623-8db4-4c03-9929-a0cd5841c1d2",
+      "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+      "status": "deployed",
+      "error": null,
+      "logs": null,
+      "startedAt": 1744999000000,
+      "endedAt": 1745000000000,
+      "trigger": "cli",
+      "commitSha": null,
+      "commitRef": null,
+      "commitMessage": null,
+      "commitAuthorName": null
+    }
+  ],
+  "domains": [
+    {
+      "id": "7c2ab918-3ef4-4a21-8d6c-0b5e1f9a2d84",
+      "orgId": "acffd753-105a-4958-9f37-243ac032f332",
+      "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+      "domain": "my-dvm.example.com",
+      "status": "verified",
+      "verificationAttemptedAt": 1745000000000,
+      "createdAt": 1744900000000,
+      "updatedAt": 1745000000000
+    }
+  ]
+}
+```
+
+`dvmkitUrl` is the public address callers use — `https://<handle>--<slug>.dvmkit.ai`, resolved from the owning handle (your builder handle, or the org's for an org-owned DVM). It is `null` until you claim a handle with [`dvmctl handle set`](#handle-set). `url` is the same router address for a cloud DVM, or your own upstream on the connect tier. `orgHandle` is set only when a *shared* org owns the DVM; a personal org reports `null`.
+
+`deploys[].status` is the deploy-lifecycle enum (`pending`, `building`, `deployed`, `failed`) and `trigger` is how it was started (`cli`, `push`, `redeploy`, `rollback`); the `commit*` fields are populated for git-push deploys only. `dvm.status` is the DVM-lifecycle enum (`created`, `deploying`, `deployed`, `deploy_failed`, `destroyed`, `suspended`), and when it reads `suspended`, `suspensionReason` says who put it down — `builder_pause` is your own [`dvmctl pause`](#pause) and yours to lift, anything else came from the platform. All timestamps (`createdAt`, `updatedAt`, `pausedAt`, `lastJobAt`, deploy `startedAt`/`endedAt`) are epoch-millisecond numbers.
+
+---
+
+## status
+
+Show a deployed DVM's **live Fly-side runtime state** — which machines are running, in what region, on what image, their health-check results, and the current scale. Where [`dvmctl info`](#info) reads DVM-level metadata from the platform DB, `status` reflects what Fly is running right now. The platform fetches it via the Fly Machines API using its own credentials; no flyctl builder-side. This is the `flyctl status` replacement for builders. Like `info`, it resolves the bare slug in your current org context; `--org` overrides that context once.
+
+```sh
+dvmctl status my-dvm
+
+# Prose summary
+dvmctl status my-dvm --human
+```
+
+| Flag | Description |
+|---|---|
+| `--org <handle>` | Read as this org, overriding the `dvmctl switch` context |
+| `--human` | Print a per-machine summary instead of JSON |
+
+**JSON output:**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "status": "deployed",
+  "paused": false,
+  "suspensionReason": null,
+  "withdrawal": null,
+  "reclaimsOpen": true,
+  "machines": [
+    {
+      "id": "148e2deef03e89",
+      "state": "started",
+      "region": "iad",
+      "instance_id": "01J9Z...",
+      "created": "2026-05-19T10:00:00Z",
+      "started": "2026-05-19T10:00:05Z",
+      "image": { "version": "deployment-01J9Z...", "sha": "sha256:abc123..." },
+      "checks": [
+        { "name": "health", "status": "passing", "output": "200 OK", "endpoint": ":8080/health" }
+      ]
+    }
+  ],
+  "scale": { "count": 1, "vm_size": { "cpus": 1, "cpu_kind": "shared", "memory_mb": 256 } }
+}
+```
+
+`started` is the timestamp of the machine's most recent start; it is `null` if the machine has no start event. A DVM with no running machines returns `machines: []` and `scale.count: 0`. `status` is the DVM-lifecycle enum from the platform DB and `paused` is true when your [`dvmctl pause`](#pause) is on record — without them, a paused DVM's stopped machines look the same as a crashed one's.
+
+`suspensionReason` is what's actually holding a suspended DVM down: `builder_pause` is your own pause and `free_tier_idle` is the idle auto-suspend — [`dvmctl resume`](#resume) lifts either. Any other reason came from the platform and `resume` refuses it. A pause and a platform suspension can be set at once — the suspension takes precedence over your pause without discarding it, so `paused: true` with a `suspensionReason` other than `builder_pause` means the DVM returns to paused once the platform lifts its suspension.
+
+`withdrawal` is set while a destroy is winding the DVM down because callers still hold prepaid balances at it (see [`destroy`](#destroy)): `delete_after` is when the platform deletes it, `started_at` when the wind-down began, both epoch milliseconds, and `keep_db` whether the deletion keeps the database. `suspensionReason` reads `withdrawn` meanwhile. `reclaimsOpen` says whether callers can reclaim their balances right now. A suspended DVM keeps answering reclaims, so it is `false` only when the platform has closed them for a legal or fraud reason.
+
+`free_tier_idle` is the benign one: nothing is wrong, the platform just stopped the machines of a free-tier DVM that had gone quiet, and the next request through the router wakes it. It needs no action from you — but an idle DVM can't be acted on: [`scale`](#scale), [`restart`](#restart), [`ssh`](#ssh) and [`env`](#env) refuse with `idle`, and [`deploy`](#deploy) fails with `deploy_failed` carrying the same advice. Run [`dvmctl resume`](#resume) first when you want to act on it rather than wait for traffic.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `not_found` | The slug doesn't exist, or the caller doesn't own it (non-owners get 404, not 403, to avoid leaking which slugs exist) |
+| `gone` | The DVM has been destroyed |
+
+---
+
+## content-holds list
+
+Read one job's content-retention metadata and hold history through a signed service-admin request. The service requires a supported store and verifies your local builder lock key. The response contains no raw job content.
+
+```sh
+dvmctl content-holds list my-dvm job_abc123 --org my-org
+```
+
+| Flag | Description |
+|---|---|
+| `--org <handle>` | Owning organisation |
+| `--endpoint <url>` | Self-hosted service recorded in local builder state |
+| `--human` | Readable output |
+
+JSON includes effective and baseline expiry in epoch milliseconds or null, hold IDs, verified actors, review dates, overdue status, and immutable events. Multiple holds compose. An overdue review never clears a hold. An unsupported service gives an upgrade action; typed `job_not_found` remains a missing-job error. Isolate and arbitrary custom stores do not automatically support these controls.
+
+## content-holds place
+
+Retain one job's content for support or a dispute. A hold cannot recover content already redacted. While any hold is active, effective expiry is null and the original baseline deadline stays visible to admins.
+
+```sh
+dvmctl content-holds place my-dvm job_abc123 --org my-org --purpose support --reason 'Investigating result' --review-due-at 2030-01-01T00:00:00Z
+```
+
+| Flag | Description |
+|---|---|
+| `--purpose <purpose>` | `support` or `dispute` |
+| `--reason <reason>` | Reason for retaining the job |
+| `--review-due-at <date>` | Future ISO date or epoch milliseconds |
+| `--org <handle>` | Owning organisation |
+| `--endpoint <url>` | Self-hosted service recorded in local builder state |
+| `--human` | Readable output |
+
+The [list response](#content-holds-list) returns the new hold and its immutable placement event. The actor is the service-verified public key, not a body field supplied by the client.
+
+## content-holds renew
+
+Record the continuing reason and a later review date for an active hold. Renewal appends an event and preserves earlier decisions. It does not clear the hold.
+
+```sh
+dvmctl content-holds renew my-dvm job_abc123 hold_abc123 --org my-org --reason 'Review continues' --review-due-at 2030-02-01T00:00:00Z
+```
+
+| Flag | Description |
+|---|---|
+| `--reason <reason>` | Continuing reason |
+| `--review-due-at <date>` | Future ISO date or epoch milliseconds |
+| `--org <handle>` | Owning organisation |
+| `--endpoint <url>` | Self-hosted service recorded in local builder state |
+| `--human` | Readable output |
+
+## content-holds clear
+
+Explicitly end a hold when its purpose ends. Clearing the last active hold restores the baseline expiry, which may already have passed. Eligible content can then be removed on the next sweep; other active holds still protect it.
+
+```sh
+dvmctl content-holds clear my-dvm job_abc123 hold_abc123 --org my-org --reason 'Review complete'
+```
+
+| Flag | Description |
+|---|---|
+| `--reason <reason>` | Reason for ending the hold |
+| `--org <handle>` | Owning organisation |
+| `--endpoint <url>` | Self-hosted service recorded in local builder state |
+| `--human` | Readable output |
+
+The clear decision stays in the immutable history. A review date never performs this action automatically.
+
+## destroy
+
+`--org <handle>` selects the owning org for this one command.
+
+Permanently destroy a deployed DVM and its paired Postgres cluster. To take a DVM offline temporarily — no traffic, no compute cost, but slug, secrets and data all kept — use [`dvmctl pause`](#pause) instead.
+
+```sh
+dvmctl destroy my-dvm
+dvmctl destroy my-dvm --confirm
+dvmctl destroy my-dvm --confirm --keep-db
+```
+
+If you want financial evidence after destruction, save and verify the minimized SQL export before either variant. Both remove compute and its database tunnel, including `--keep-db`. Carry the same owning organisation through database and destruction commands. The recipe is shipped with the service's exact SDK at `recipes/postgres/financial-export-v1.sql`; it preserves signed receipts, amounts, currencies, financial links, and recovery outcomes while excluding raw job input/output, bearer proofs, and operational credentials. A full database backup is not this minimized export.
+
+Run `dvmctl db connect my-dvm --org my-org` for an interactive PostgreSQL client, or keep `dvmctl db proxy my-dvm --org my-org` running for an automated client. From the service project, locate the installed SDK recipe:
+
+```sh
+sdk_entry="$(node --input-type=module -e 'console.log(import.meta.resolve("@dvmkit/sdk"))')"
+recipe="$(node --input-type=module -e 'import { fileURLToPath } from "node:url"; console.log(fileURLToPath(new URL("../recipes/postgres/financial-export-v1.sql", process.argv[1])))' "$sdk_entry")"
+umask 077
+psql "$DATABASE_URL" -X -q -t -A -v ON_ERROR_STOP=1 -f "$recipe" > financial-evidence.json
+```
+
+Configure `DATABASE_URL` privately from the proxy's `database_url`; it is a credential. Check the exit status, parse the JSON, and verify retained receipts with the service's receipt public key. Keep the file and recipe securely under your own retention policy. A failed export may leave a partial file. Only after verification, run `dvmctl destroy my-dvm --org my-org --confirm`, adding `--keep-db` when storage must remain. Later tunnel access needs a redeployed service and reattached database. Platform financial history does not replace this optional builder-owned evidence.
+
+Without `--confirm`, prompts interactively. In non-interactive contexts (CI, agents), `--confirm` is required.
+
+A DVM whose callers still hold prepaid balances is not deleted at once. The builder terms give those callers at least 30 days to reclaim what they are owed, so the platform stops the DVM taking new jobs and deposits, keeps it answering reclaims, lets its machines sleep when idle, and deletes it 30 days later. The org's admins get an email with the date, and [`dvmctl status`](#status) shows it under `withdrawal`. A DVM that owes nobody is deleted straight away.
+
+| Flag | Description |
+|---|---|
+| `--confirm` | Skip confirmation prompt |
+| `--keep-db` | Preserve the Postgres cluster (allows re-attachment on redeploy) |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "status": "destroyed",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "keptDb": false
+}
+```
+
+---
+
+## metrics
+
+Show request metrics for a deployed DVM over a trailing time window. The bare slug is resolved in your current org context; `--org` overrides that context once.
+
+```sh
+dvmctl metrics my-dvm
+dvmctl metrics my-dvm --hours 48
+```
+
+| Flag | Description |
+|---|---|
+| `--hours <hours>` | Look-back window in hours (default: 24) |
+| `--org <handle>` | Read as this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output (aggregated totals + error breakdown) |
+
+**JSON output:**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "hours": 24,
+  "metrics": [
+    {
+      "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+      "hour": 1746489600000,
+      "status2xx": 40,
+      "status4xx": 1,
+      "status5xx": 1,
+      "totalRequests": 42,
+      "totalLatencyMs": 84000,
+      "egressBytes": 1048576
+    }
+  ]
+}
+```
+
+One bucket per hour in the window; `hour` is the epoch-millisecond bucket start.
+
+---
+
+## events
+
+Show a chronological "what happened to my DVM recently" feed — deploys, restarts, pauses and resumes, scale changes, env-var changes, and Fly machine state transitions (start/stop/exit/OOM kills) — over a trailing window (default 7 days). Platform-mediated; you do not need `flyctl` or Fly access. The bare slug is resolved in your current org context; `--org` overrides that context once.
+
+```sh
+dvmctl events my-dvm
+dvmctl events my-dvm --since 24h
+dvmctl events my-dvm --since 1h --human
+```
+
+| Flag | Description |
+|---|---|
+| `--since <duration>` | Look-back window — `30s`, `5m`, `2h`, `7d` (default: `7d`) |
+| `--org <handle>` | Read as this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output (chronological list) |
+
+Events are merged from the deploy history, the config-change audit log, and the Fly Machines API, then sorted newest-first. Each entry carries a `type`, a `timestamp` (epoch ms), an `actor` (builder handle/email, commit author for deploys, or `"fly"` for machine events), a `source` (`deploy` \| `audit` \| `machine`), and source-specific `details`.
+
+Machine events are best-effort: if the Fly Machines API is unavailable (or the DVM was never deployed / has been torn down), the feed still returns deploy and audit events, with a note in `warnings`.
+
+**JSON output:**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "since": "7d",
+  "events": [
+    {
+      "type": "deploy",
+      "timestamp": 1715000000000,
+      "actor": "alice",
+      "source": "deploy",
+      "details": {
+        "id": "3dcc9623-8db4-4c03-9929-a0cd5841c1d2",
+        "status": "deployed",
+        "trigger": "cli",
+        "durationMs": 64000,
+        "commitSha": "a1b2c3d",
+        "commitRef": "main",
+        "commitMessage": "Tighten retry backoff",
+        "error": null
+      }
+    },
+    {
+      "type": "scale",
+      "timestamp": 1714990000000,
+      "actor": "alice",
+      "source": "audit",
+      "details": { "before": { "maxMachines": 1 }, "after": { "maxMachines": 2 } }
+    },
+    {
+      "type": "machine.start",
+      "timestamp": 1714980000000,
+      "actor": "fly",
+      "source": "machine",
+      "details": { "machineId": "148e2deef03e89", "status": "started", "flySource": "flyd" }
+    }
+  ]
+}
+```
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `bad_request` | `--since` is not a valid duration (e.g. `5x`) |
+| `not_found` | Unknown or unowned slug |
+
+---
+
+## env
+
+`--org <handle>` selects the owning org for this one command.
+
+View or update environment variables for a deployed DVM.
+
+```sh
+# List variable names (values are not shown)
+dvmctl env my-dvm
+
+# Set one or more variables
+dvmctl env my-dvm --set API_KEY=abc123 --set MODEL=gpt-4o
+
+# Unset variables
+dvmctl env my-dvm --unset OLD_KEY
+```
+
+| Flag | Description |
+|---|---|
+| `--set <KEY=value>` | Set an environment variable (repeatable) |
+| `--unset <KEY>` | Unset an environment variable (repeatable) |
+| `--human` | Prose output |
+
+**JSON output — list:**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "env": ["API_KEY", "MODEL"]
+}
+```
+
+**JSON output — after set/unset:**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "updated": ["API_KEY", "MODEL"],
+  "removed": ["OLD_KEY"]
+}
+```
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `bad_request` | `--set` value missing `=` separator |
+
+---
+
+## logs
+
+`--org <handle>` selects the owning org for this one command.
+
+View or stream logs for a deployed DVM. Default is a snapshot of recent lines; pass `--tail` to follow live.
+
+```sh
+# Snapshot mode (default): show recent lines and exit
+dvmctl logs my-dvm
+dvmctl logs my-dvm --lines 50
+
+# Look-back window
+dvmctl logs my-dvm --since 30m
+
+# Stream live until interrupted (Ctrl-C)
+dvmctl logs my-dvm --tail
+```
+
+| Flag | Description |
+|---|---|
+| `--tail` | Stream live logs until interrupted (Ctrl-C) |
+| `--since <duration>` | Only show logs newer than this (e.g. `30s`, `5m`, `2h`, `1d`) |
+| `--lines <count>` | Max recent lines to show in non-tail mode (default: 100) |
+
+No JSON envelope — `logs` writes raw log lines to stdout (one per line) in both snapshot and `--tail` mode, so the output pipes cleanly into `grep`, `jq -R`, or a file. There is no `--human` flag.
+
+---
+
+## ssh
+
+`--org <handle>` selects the owning org for this one command.
+
+SSH into a running Fly machine of a deployed DVM, for debugging without flyctl. The platform validates ownership and brokers the connection on your behalf.
+
+With no `--command`, `dvmctl ssh <slug>` opens an **interactive shell** on a running machine, relayed over a websocket. Type `exit` or press Ctrl-D to disconnect; `dvmctl` exits with the remote shell's exit code. Requires an interactive terminal.
+
+> **Note:** the remote PTY is currently fixed at 80×24 and does not track your terminal size or live resizes (`SIGWINCH`), so full-screen TUIs (`vim`, `less`, `htop`) may render to the wrong dimensions. For plain shell use this isn't noticeable.
+
+With `--command`, it runs a **one-shot command** and returns the output plus the remote exit code as JSON (the `dvmctl` process exits with that code). The command runs through `/bin/sh -c`, so shell features (pipes, redirects, env-var expansion) work. Fly caps each one-shot command at 60 seconds.
+
+For DVMs owned by an org, this requires the `admin` role — a shell (or arbitrary command) can read secret values (e.g. `env`), so ssh matches the admin gating on [`dvmctl env`](#env).
+
+```sh
+# Open an interactive shell on a running machine
+dvmctl ssh my-dvm
+
+# Open a shell on a specific machine of a multi-machine DVM
+dvmctl ssh my-dvm --machine 148e2deef03e89
+
+# Run a one-shot command instead
+dvmctl ssh my-dvm --command "cat /tmp/state"
+dvmctl ssh my-dvm --machine 148e2deef03e89 --command "top -bn1 | head"
+```
+
+| Flag | Description |
+|---|---|
+| `--command <cmd>` | Run a one-shot command instead of opening an interactive shell |
+| `--machine <id>` | Target a specific machine (default: first running machine) |
+| `--human` | Print stdout/stderr directly instead of JSON (one-shot `--command` only) |
+
+**JSON output (one-shot `--command`):**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "stdout": "running\n",
+  "stderr": "",
+  "exit_code": 0,
+  "machine_id": "148e2deef03e89"
+}
+```
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `not_a_tty` | Interactive shell requested without an attached terminal (use `--command`) |
+| `forbidden` | Caller lacks the `admin` role on the owning org |
+| `no_running_machine` | The DVM has no machine in the `started` state |
+| `machine_not_found` | `--machine <id>` does not match any machine on this DVM |
+| `machine_not_running` | `--machine <id>` exists but is not in the `started` state |
+
+---
+
+## restart
+
+`--org <handle>` selects the owning org for this one command.
+
+Restart a deployed DVM's Fly machines without a redeploy — handy after a [`dvmctl env`](#env) change or to clear bad state. The platform validates ownership and restarts each machine via Fly using its own credentials; no flyctl builder-side. Restarts all running machines by default, or a single machine with `--machine <id>`. Returns each restarted machine's post-restart state.
+
+For DVMs owned by an org, this requires the `admin` role, matching the other mutating surfaces ([`dvmctl env`](#env), `deploy`, `destroy`).
+
+```sh
+# Restart all of the DVM's running machines
+dvmctl restart my-dvm
+
+# Restart a single machine on a multi-machine DVM
+dvmctl restart my-dvm --machine 148e2deef03e89
+```
+
+| Flag | Description |
+|---|---|
+| `--machine <id>` | Restart a single machine (default: all running machines) |
+| `--human` | Print a machine/state summary instead of JSON |
+
+**JSON output:**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "machines": [{ "id": "148e2deef03e89", "state": "started" }],
+  "restarted": 1
+}
+```
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `forbidden` | Caller lacks the `admin` role on the owning org |
+| `no_running_machine` | The DVM has no machine in the `started` state |
+| `machine_not_found` | `--machine <id>` does not match any machine on this DVM |
+| `machine_not_running` | `--machine <id>` exists but is not in the `started` state |
+
+---
+
+## pause
+
+`--org <handle>` selects the owning org for this one command.
+
+Take a DVM offline without destroying it. The router stops routing to it (callers get a `503` with code `paused`), it drops out of `/explore`, and its Fly machines are stopped so it stops accruing [compute](/docs/resources#how-much-does-compute-cost). Its slug, secrets, volumes and paired Postgres are all left alone — this is the "I'm reworking this, park it for a few weeks" move, and the one thing [`dvmctl scale`](#scale) can't do (it floors at one machine) and [`dvmctl destroy`](#destroy) does far too much of.
+
+[`dvmctl resume`](#resume) brings it back on the same image, with no redeploy.
+
+For DVMs owned by an org, this requires the `admin` role.
+
+```sh
+dvmctl pause my-dvm
+
+# Prose summary
+dvmctl pause my-dvm --human
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Print a machine/state summary instead of JSON |
+
+**JSON output:**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "status": "suspended",
+  "paused": true,
+  "machines": [{ "id": "148e2deef03e89", "state": "stopping" }],
+  "stopped": 1
+}
+```
+
+A paused DVM *is* a suspended one — the difference is who suspended it, which is what `paused` tells you. `status` and `paused` mean the same thing here as in [`dvmctl status`](#status).
+
+Fly acknowledges a stop and transitions the machine asynchronously, so `machines[].state` is usually `stopping` rather than `stopped` at the moment the call returns. Pausing is idempotent: re-running it on an already-paused DVM re-issues the stop, which is what makes a pause whose Fly call failed safe to retry.
+
+The router is the only way into a cloud DVM, since its Fly app has no public address, so a paused DVM stays dark to callers until you resume it.
+
+You can't deploy to a paused DVM — resume it first.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `forbidden` | Caller lacks the `admin` role on the owning org |
+| `invalid_state` | The DVM isn't deployed (e.g. still deploying, or a failed first deploy) |
+| `suspended_by_platform` | The DVM is already suspended by the platform (operator, enforcement, or reputation) — it's offline already, so there's nothing to pause |
+| `machine_stop_failed` | Fly refused to stop a machine. The DVM is already refusing traffic; re-run `pause` to retry |
+
+---
+
+## resume
+
+`--org <handle>` selects the owning org for this one command.
+
+Bring an offline DVM back: its Fly machines start again on the same image, with the same volumes and the same database. No redeploy, no new image build.
+
+`resume` lifts the two suspensions that are yours to lift — a pause **you** made (`builder_pause`), and the idle auto-suspend the platform applies to a quiet free-tier DVM (`free_tier_idle`). The idle one also clears on the next request through the router, but resuming is how you get an idle DVM back without sending it traffic: `deploy`, `scale`, `restart`, `exec` and `ssh` all refuse while it's idle.
+
+Resuming an idle DVM does not reset its idle clock — that clock reads the last request the DVM *served*, and resuming isn't a request. So a DVM that's been quiet past the free-tier idle threshold can be idle-suspended again at the platform's next hourly sweep, even though you just resumed it. In practice you resume, do what you came to do, and move on; but a long session on a long-quiet DVM may need a second `resume`.
+
+A DVM the platform suspended for any other reason — operator action, plan enforcement, or a reputation sweep — stays suspended and returns `suspended_by_platform`; lifting it is the platform's call, not yours.
+
+The platform can also suspend a DVM you'd already paused, and its suspension takes precedence — but it doesn't discard your pause. When the platform lifts the suspension, the DVM goes back to *paused*, not back online: it stays offline (and off the compute meter) until you resume it yourself. `dvmctl status` reports `paused: true` throughout.
+
+For DVMs owned by an org, this requires the `admin` role.
+
+```sh
+dvmctl resume my-dvm
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Print a machine/state summary instead of JSON |
+
+**JSON output:**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "status": "deployed",
+  "paused": false,
+  "machines": [{ "id": "148e2deef03e89", "state": "started" }],
+  "started": 1
+}
+```
+
+The machines are started before the DVM is un-suspended, so traffic only returns once there's something to serve it. If a machine fails to start, the DVM stays offline and the call is a clean re-run.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `forbidden` | Caller lacks the `admin` role on the owning org |
+| `not_paused` | The DVM isn't suspended (nothing to resume) |
+| `suspended_by_platform` | The DVM was suspended by the platform, not paused by you and not idle — only the platform can lift it |
+| `withdrawn` | A [`destroy`](#destroy) is winding the DVM down while callers reclaim their balances; it is deleted on the date shown and can't be resumed |
+| `machine_start_failed` | Fly refused to start a machine. The DVM stays offline; re-run `resume` to retry |
+
+---
+
+## rollback
+
+`--org <handle>` selects the owning org for this one command.
+
+Revert a deployed DVM to a previous successful deploy's image. Defaults to the prior deploy; target a specific one with `--to <deploy-id>` (find IDs via [`dvmctl events`](#events) or [`dvmctl deploy-status`](#deploy-status)).
+
+```sh
+# Roll back to the previous successful deploy
+dvmctl rollback my-dvm
+
+# Roll back to a specific deploy
+dvmctl rollback my-dvm --to 3dcc9623-8db4-4c03-9929-a0cd5841c1d2
+```
+
+| Flag | Description |
+|---|---|
+| `--to <deploy-id>` | Roll back to a specific `deploy_id` (default: previous deploy) |
+| `--human` | Prose output |
+
+Progress events (`queued`, `log`, `phase`) stream to stderr; the final result object goes to stdout.
+
+**JSON output:**
+
+```json
+{
+  "status": "deployed",
+  "url": "https://alice--my-dvm.dvmkit.ai",
+  "dvmkitUrl": "https://alice--my-dvm.dvmkit.ai",
+  "slug": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "deployId": "9f1c4e07-2b55-4a3e-9f0d-71a2c8b4d611",
+  "rolledBackTo": "3dcc9623-8db4-4c03-9929-a0cd5841c1d2"
+}
+```
+
+---
+
+## scale
+
+`--org <handle>` selects the owning org for this one command.
+
+Change a deployed DVM's machine count and/or VM size without redeploying. The platform validates ownership and the requested config against your plan caps, then resizes the live machines in place (`fly scale count` / `fly scale vm`). At least one of `--count` or `--size` is required.
+
+For DVMs owned by an org, this requires the `admin` role — scaling changes spend, matching the gating on [`dvmctl env`](#env) and [`dvmctl ssh`](#ssh).
+
+```sh
+# Run two machines
+dvmctl scale my-dvm --count 2
+
+# Resize the VM
+dvmctl scale my-dvm --size shared-cpu-2x
+
+# Both at once, human-readable
+dvmctl scale my-dvm --count 2 --size performance-1x --human
+```
+
+| Flag | Description |
+|---|---|
+| `--count <n>` | Number of machines to run (1–100, subject to your plan's cap) |
+| `--size <vm-size>` | Fly VM size (see below) |
+| `--human` | Print a before → after summary instead of JSON |
+
+**Valid sizes:** `shared-cpu-1x`, `shared-cpu-2x`, `shared-cpu-4x`, `shared-cpu-8x`, `performance-1x`, `performance-2x`, `performance-4x`, `performance-8x`. Each maps to a fixed CPU count, CPU kind, and memory.
+
+**JSON output** — the resolved machine config before and after the change:
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "before": { "memoryMb": 256, "cpuCount": 1, "cpuKind": "shared", "minMachinesRunning": 0, "maxMachines": 1 },
+  "after":  { "memoryMb": 512, "cpuCount": 2, "cpuKind": "shared", "minMachinesRunning": 0, "maxMachines": 2 }
+}
+```
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `bad_request` | Neither `--count` nor `--size` given, count out of range, unknown size, or count below the DVM's `min_machines_running` |
+| `forbidden` | Caller lacks the `admin` role on the owning org |
+| `idle` | The DVM is idle-suspended (`free_tier_idle`) — the platform stopped its machines after a quiet spell. Run [`dvmctl resume`](#resume) first |
+| `paused` | The DVM is [paused](#pause) — scaling it would start machines it can't serve traffic from. Resume it first |
+| `plan_limit_exceeded` | Requested count/size exceeds your plan's caps. The error `data` carries `upgradeUrl`, `cap`, and `planName` |
+
+A `plan_limit_exceeded` error returns HTTP `402` and includes an upgrade link:
+
+```json
+{
+  "error": {
+    "code": "plan_limit_exceeded",
+    "message": "Your Free plan allows up to 1 machine per DVM. You requested 2. Upgrade at https://dvmkit.com/dashboard/billing to run more machines.",
+    "data": { "limit": "max_machines", "requested": 2, "cap": 1, "planName": "Free", "upgradeUrl": "https://dvmkit.com/dashboard/billing" }
+  }
+}
+```
+
+---
+
+## switch
+
+Set or inspect the active org context. When an org is active, every `dvmctl` command runs against it: reads ([`list`](#list), [`feedback list`](#feedback-list), [`revenue summary`](#revenue-summary), [`trace get`](#trace-get)) answer for that org, and [`deploy`](#deploy) creates new DVMs under its account. Pass `--org <handle>` to any of those — reads and `deploy` alike — to override the context for one invocation.
+
+```sh
+# Show current context
+dvmctl switch
+
+# Switch to an org
+dvmctl switch my-org
+
+# Return to personal context
+dvmctl switch --personal
+```
+
+Verifies org membership before saving. The active handle is stored in `~/.dvmctl/config.json`.
+
+| Flag | Description |
+|---|---|
+| `--personal` | Clear org context (run as personal builder) |
+| `--human` | Prose output |
+
+**JSON output — show current:**
+
+```json
+{ "activeOrg": "my-org" }
+```
+
+**JSON output — after switch:**
+
+```json
+{ "activeOrg": "my-org", "role": "owner" }
+```
+
+`role` is your actual membership role in the target org — one of `owner`, `admin`, or `member`.
+
+**JSON output — after `--personal`:**
+
+```json
+{ "activeOrg": null }
+```
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `auth_required` | Not authenticated |
+| `bad_arguments` | Both `<handle>` and `--personal` passed |
+
+---
+
+## orgs
+
+List every org membership. Use a shared-org `handle` with [`switch`](#switch) or a one-shot `--org` override. Your personal context is listed without a handle because it is already the default and cannot be selected with `switch`.
+
+```sh
+dvmctl orgs
+dvmctl orgs --human
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Print a membership table |
+
+**JSON output:**
+
+```json
+{
+  "activeOrg": "my-org",
+  "memberships": [
+    {
+      "handle": "my-org",
+      "displayName": "My Org",
+      "role": "owner",
+      "personal": false,
+      "active": true
+    },
+    {
+      "displayName": "Alice",
+      "role": "owner",
+      "personal": true,
+      "active": false
+    }
+  ],
+  "display": "1 shared org membership. Active context: my-org.",
+  "hint": "Run `dvmctl switch <handle>` to choose a shared org, or `dvmctl switch --personal` for your personal context."
+}
+```
+
+When you have no shared-org memberships, `memberships` still includes your personal context. `display` says that you have no shared memberships, and `hint` tells you to create or join one in the dashboard.
+
+---
+
+## whoami
+
+Show the local builder identity, authenticated builder profile, every org membership, and the active context. Every listed membership can deploy a new DVM. A personal context has no switchable handle.
+
+```sh
+dvmctl whoami
+dvmctl whoami --human
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Print the identity, profile, and membership table |
+
+**JSON output:**
+
+```json
+{
+  "identity_pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "identity_status": "available",
+  "builder": {
+    "id": "bld_123",
+    "email": "builder@example.com",
+    "handle": "builder",
+    "authId": "auth_123",
+    "displayName": "Builder",
+    "bio": null,
+    "avatarUrl": null,
+    "website": null,
+    "links": {},
+    "isOperator": false,
+    "createdAt": 1744000000000,
+    "updatedAt": 1745000000000
+  },
+  "activeOrg": "my-org",
+  "memberships": [
+    {
+      "handle": "my-org",
+      "displayName": "My Org",
+      "role": "owner",
+      "personal": false,
+      "deployable": true,
+      "active": true
+    },
+    {
+      "displayName": "Builder",
+      "role": "owner",
+      "personal": true,
+      "deployable": true,
+      "active": false
+    }
+  ],
+  "display": "Builder builder@example.com. Active context: my-org.",
+  "hint": "Every listed membership can deploy a new DVM. The role shows its existing access level."
+}
+```
+
+`identity_status` is `missing` when no local identity has been created, or `unreadable` when the local builder config cannot be read. In both cases, the platform profile and memberships remain available.
+
+---
+
+## handle set
+
+Claim a builder handle (2–20 characters, lowercase alphanumeric with hyphens, no leading/trailing `--`).
+
+**Your handle is what gives your DVMs a public URL.** The router resolves callers at `https://<handle>--<slug>.dvmkit.ai`, so until you claim one, a cloud deploy fails with `handle_required`, and a connect-tier DVM you own reports `dvmkitUrl: null` from [`deploy`](#deploy), [`list`](#list) and [`info`](#info). Claim the handle once and every DVM the owning account holds, present and future, gets its public URL. DVMs owned by a shared org take the *org's* handle, not yours.
+
+```sh
+dvmctl handle set alice
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{ "status": "ok", "handle": "alice" }
+```
+
+---
+
+## handle check
+
+Check whether a handle is available without claiming it. Unauthenticated — no API key needed.
+
+```sh
+dvmctl handle check alice
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{ "handle": "alice", "available": true }
+```
+
+---
+
+## domains add
+
+`--org <handle>` selects the owning org for this one command.
+
+Add a custom domain to a deployed DVM. After adding, point your DNS to the dvmkit router and verify with `domains verify`.
+
+```sh
+dvmctl domains add my-dvm api.example.com
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{ "status": "added", "dvmId": "550e8400-e29b-41d4-a716-446655440000", "slug": "my-dvm", "domain": "api.example.com" }
+```
+
+---
+
+## domains remove
+
+`--org <handle>` selects the owning org for this one command.
+
+Remove a custom domain from a deployed DVM.
+
+```sh
+dvmctl domains remove my-dvm api.example.com
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{ "status": "removed", "dvmId": "550e8400-e29b-41d4-a716-446655440000", "slug": "my-dvm", "domain": "api.example.com" }
+```
+
+---
+
+## domains verify
+
+`--org <handle>` selects the owning org for this one command.
+
+Verify that DNS is correctly configured for a custom domain.
+
+```sh
+dvmctl domains verify my-dvm api.example.com
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{ "status": "verified", "dvmId": "550e8400-e29b-41d4-a716-446655440000", "slug": "my-dvm", "domain": "api.example.com" }
+```
+
+---
+
+## domains list
+
+`--org <handle>` selects the owning org for this one command.
+
+List all custom domains configured for a DVM.
+
+```sh
+dvmctl domains list my-dvm
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "domains": [
+    {
+      "id": "7c2ab918-3ef4-4a21-8d6c-0b5e1f9a2d84",
+      "orgId": "acffd753-105a-4958-9f37-243ac032f332",
+      "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+      "domain": "api.example.com",
+      "status": "verified",
+      "verificationAttemptedAt": 1746489600000,
+      "createdAt": 1746489600000,
+      "updatedAt": 1746489600000
+    }
+  ]
+}
+```
+
+`status` is `pending`, `verified`, `failed` or `revoked` — a domain is only served once it reads `verified`. `dvmId` is the DVM currently serving the domain (`null` once it's been de-routed; the domain itself survives, owned by `orgId`).
+
+---
+
+## identity create
+
+Generate a per-workstation secp256k1 builder identity keypair. Persists the pubkey to `~/.dvmkit/builder.json` and the secret to `~/.dvmkit/builder.key` (mode `0600`). This key signs deploy attestations and populates `builder.pubkey` on each DVM's `/v1/info` — distinct from the Cashu lock keypair managed by [`dvmctl lock create`](#lock-create).
+
+```sh
+dvmctl identity create
+dvmctl identity create --force
+```
+
+| Flag | Description |
+|---|---|
+| `--force` | Overwrite an existing identity. DVMs deployed under the old key need a redeploy to refresh their `/v1/info` attestation |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "status": "created",
+  "identity_pubkey": "f2f1d2c3b3382d924d13f55d0a70d0d555239c39a36464980c0b37804ddd1846",
+  "secret_path": "~/.dvmkit/builder.key",
+  "pubkey_path": "~/.dvmkit/builder.json",
+  "mode": "0600"
+}
+```
+
+`identity_pubkey` is the x-only BIP-340 pubkey — 64 hex chars, no `02`/`03` prefix (unlike the compressed Cashu lock pubkeys that [`rotate`](#rotate) prints).
+
+On Windows, `mode` is replaced by a `windows_note` string (POSIX file modes don't apply).
+
+---
+
+## identity show
+
+Print the builder identity pubkey from `~/.dvmkit/builder.json`.
+
+```sh
+dvmctl identity show
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "identity_pubkey": "f2f1d2c3b3382d924d13f55d0a70d0d555239c39a36464980c0b37804ddd1846",
+  "pubkey_path": "~/.dvmkit/builder.json"
+}
+```
+
+Errors with `identity_missing` when no identity has been created yet.
+
+---
+
+## lock create
+
+Generate a BIP-39 mnemonic for builder Cashu P2PK lock keypairs, saved to `~/.dvmkit/builder.mnemonic`. The mnemonic is the derivation root for per-DVM lock keypairs — `dvmctl deploy` derives and registers the per-DVM lock pubkey automatically, and `dvmctl rotate` / `dvmctl melt-pending` derive against it.
+
+A bare `dvmctl lock create` reports `already_exists` and leaves an existing mnemonic alone. Replacing one takes `--import` (restore known words) or `--force` (generate fresh ones), and either way the replaced mnemonic is copied to a timestamped `.bak` sibling at mode 0600 before the write. That backup is the only local trace of the old words: proofs locked to lock pubkeys derived from them are not spendable with the new mnemonic, so every DVM needs a `dvmctl deploy` afterwards to advertise a pubkey you can still derive.
+
+```sh
+dvmctl lock create
+dvmctl lock create --import "word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12"
+dvmctl lock create --force
+```
+
+| Flag | Description |
+|---|---|
+| `--import <mnemonic>` | Import an existing 12-word BIP-39 mnemonic instead of generating a new one. Replaces an existing mnemonic — this is the restore path |
+| `--force` | Replace an existing mnemonic with a freshly generated one |
+| `--human` | Prose output |
+
+**JSON output — generated or imported:**
+
+```json
+{
+  "status": "generated",
+  "mnemonicFile": "~/.dvmkit/builder.mnemonic"
+}
+```
+
+`status` is `"generated"` for new mnemonics, `"imported"` when `--import` is used.
+
+**JSON output — an existing mnemonic was replaced:**
+
+```json
+{
+  "status": "imported",
+  "mnemonicFile": "~/.dvmkit/builder.mnemonic",
+  "backupFile": "~/.dvmkit/builder.mnemonic.2026-08-01T09-14-22-113Z.bak",
+  "hint": "The mnemonic this replaced was copied to ~/.dvmkit/builder.mnemonic.2026-08-01T09-14-22-113Z.bak (mode 0600). ..."
+}
+```
+
+`backupFile` is present only when words were actually replaced — absent on a first write, and absent when `--import` re-imports the mnemonic already on disk.
+
+**JSON output — mnemonic already exists:**
+
+```json
+{
+  "status": "already_exists",
+  "mnemonicFile": "~/.dvmkit/builder.mnemonic",
+  "hint": "A builder mnemonic already exists, so nothing was written. Re-run with --force to generate fresh words, or --import <words> to restore a known mnemonic; either way the current mnemonic is copied to a timestamped .bak sibling (mode 0600) first. …"
+}
+```
+
+The `hint` is the agent's only signal that a next step exists, so it names both flags and the consequence of taking either.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `invalid_mnemonic` | Provided `--import` value is not a valid 12-word BIP-39 phrase |
+| `mnemonic_exists` | A mnemonic exists — at `~/.dvmkit/builder.mnemonic`, the former `~/.dvmkit/recovery.mnemonic`, or the pre-state-split `~/.dvm/recovery.mnemonic` — and the write did not opt in to replacing it. `lock create` never surfaces this — it reports `already_exists` first — but any other caller of the underlying library hits it |
+
+---
+
+## init
+
+Bootstrap a self-hosted DVM: generate a `canonical_dvm_id` (UUIDv4) and persist it to `~/.dvmkit/builder.json`. Platform-hosted DVMs get their `canonical_dvm_id` at deploy time and don't need this command.
+
+```sh
+dvmctl init my-dvm --self-hosted
+```
+
+| Flag | Description |
+|---|---|
+| `--self-hosted` | Mark the DVM as self-hosted (required) |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "status": "initialized",
+  "handle": "my-dvm",
+  "canonical_dvm_id": "550e8400-e29b-41d4-a716-446655440000",
+  "current_rotation_index": 0,
+  "self_hosted": true
+}
+```
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `init_requires_self_hosted` | `--self-hosted` flag not passed |
+| `invalid_handle` | Handle doesn't match slug pattern (3-40 lowercase alphanumeric or hyphens) |
+| `already_initialized` | Handle already has a `canonical_dvm_id` in `builder.json` |
+
+---
+
+## rotate
+
+Rotate the per-DVM Cashu lock pubkey. Derives the next BIP-32 child from the builder mnemonic, publishes it to the DVM's admin endpoint (signed with the current privkey), and demotes the prior pubkey to retired. For cloud-hosted DVMs, it then updates the platform's lock pubkey. Starting with 0.3.5-rc.1, a failed platform update leaves a local pending marker and exits with an error. Finish that update before deploying or rotating again.
+
+```sh
+dvmctl rotate my-dvm
+dvmctl rotate my-dvm --endpoint https://my-dvm.example.com
+dvmctl rotate my-dvm --sync-platform
+```
+
+| Flag | Description |
+|---|---|
+| `--endpoint <url>` | DVM admin endpoint URL (skips platform lookup; required for self-hosted DVMs) |
+| `--sync-platform` | Finish a recorded pending platform update without another rotation (0.3.5-rc.1 or later) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output — rotated:**
+
+```json
+{
+  "status": "rotated",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "canonical_dvm_id": "550e8400-e29b-41d4-a716-446655440000",
+  "previous_rotation_index": 0,
+  "current_rotation_index": 1,
+  "current_pubkey": "021104d14e5c045c0e9d25e50e2efa1acd7978284e2b2d559ba0eb476050ec91f3",
+  "retired": [
+    {
+      "pubkey": "036d85c25e8a23f918712b2ecced8d3ed2d9e0d937283f66c45ddc4b6dc4352054",
+      "retired_at_ms": 1700000000000
+    }
+  ]
+}
+```
+
+Lock pubkeys are compressed secp256k1 — 66 hex chars starting `02` or `03` — not the x-only form [`identity show`](#identity-show) prints.
+
+`status` is `"resynced"` when the server reports that the DVM is already at the next rotation index. This depends on the server accepting the request: a stale signing key can instead receive `admin_bad_signature`. Do not assume repeating a rotation will recover every lost response.
+
+`--sync-platform` returns `status: "platform_resynced"`, the handle, `dvmId`, `canonical_dvm_id`, `current_rotation_index`, and `current_pubkey`. It does not advance the rotation index. A pending update blocks ordinary rotation with `platform_lock_sync_pending`; restore platform authentication and follow the sync-only hint. Version 0.3.4-rc.1 lacks this flag and can return `platform_sync_warning` in its rotation output.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `no_builder_mnemonic` | No mnemonic found — run `dvmctl lock create` first |
+| `dvm_not_initialized` | No `builder.json` entry for this handle |
+| `platform_lock_sync_failed` | Rotation is saved locally, but the platform update is unconfirmed |
+| `platform_lock_sync_pending` | A prior platform update must finish before another rotation |
+| `no_pending_platform_lock_sync` | `--sync-platform` has no recorded cloud update to finish |
+| `endpoint_required` | Self-hosted DVM without `--endpoint` |
+| `auth_required` | Not authenticated (needed to resolve endpoint via platform) |
+| `admin_bad_signature` | DVM's lock pubkey doesn't match the derived privkey |
+| `dvm_url_unset` | DVM has no platform URL yet (still deploying) |
+
+---
+
+## melt-pending
+
+Drain a DVM's pending Cashu accumulator batches. Derives the per-DVM lock privkey locally, signs NUT-11 witnesses, melts proofs at the mint via LNURL-pay to the payout Lightning address, and posts `mark-melted` back to the DVM admin endpoint. With `--watch`, runs as a long-lived daemon suitable for systemd.
+
+Each tick services outstanding **credit drains** before it melts anything: a caller reclaiming an expired prepaid balance gets accumulator proofs swapped into notes P2PK-locked to their refund key and parked on the DVM for pickup, and your payout melt is held back while any cashu drain liability is still outstanding — refunds never get swept to your Lightning address first. Ecash is the only refund this job settles: a Lightning-funded credit reclaims as ecash too, since direct Lightning payout is not a reclaim method.
+
+Sometimes no accumulator batch covers a refund at all. A Lightning-funded credit has no proofs behind it, and a Cashu-funded one loses its proofs the moment you legitimately melt them. `--refund-nwc` lets the tick **buy** the refund instead: it asks one of your accepted mints for a quote, pays that quote's invoice from the wallet you named, mints the notes locked to the caller, and parks them the same way. The wallet only ever pays invoices this command obtained from your own mints in the same run or from its own on-disk record; nothing a caller signs is a destination. Without the flag such a refund stays queued and visible, rather than being minted from a wallet you did not authorise.
+
+```sh
+dvmctl melt-pending my-dvm --payout builder@example.com
+dvmctl melt-pending my-dvm --watch --interval 120
+dvmctl melt-pending my-dvm --endpoint http://localhost:3000
+dvmctl melt-pending my-dvm --drains-only
+dvmctl melt-pending my-dvm --refund-nwc 'nostr+walletconnect://…'
+```
+
+| Flag | Description |
+|---|---|
+| `--payout <ln-address>` | Lightning address to melt to (overrides default set via `dvmctl set-payout`) |
+| `--endpoint <url>` | DVM admin endpoint URL (skips platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--watch` | Run as a long-lived daemon polling on an interval |
+| `--interval <seconds>` | Poll cadence under `--watch` (default: 60, range: 10–3600) |
+| `--drains-only` | Settle the credit drains you owe and stop — no batch sweep to your payout address. `--payout` is not required, because nothing melts |
+| `--hold-alarm-after <duration>` | How long this DVM's drain surface may stay unreadable before a one-shot sweep exits non-zero instead of holding the melt again (default: `24h`; e.g. `6h`, `2d`). Nothing melts and no refund parks while it is held, so this is the ceiling on a silent stall |
+| `--refund-nwc <uri>` | Send-capable NWC connection used to buy a caller's refund when no accumulator batch covers it (env: `DVMKIT_REFUND_NWC_URL`). Keep it separate from the receive-only connection your DVM funds credit over, and hold it here rather than on the DVM |
+| `--payout-nwc <uri>` | Mint the payout invoice from this NWC wallet instead of resolving `--payout` over LNURL (env: `DVMKIT_MELT_PAYOUT_NWC_URL`). Use when the melt destination is a node with no Lightning address of its own |
+| `--human` | Prose output |
+
+**JSON output — one-shot (and each tick in `--watch` mode):**
+
+```json
+{
+  "tick": "2026-05-14T00:00:00.000Z",
+  "dvm_id": "550e8400-e29b-41d4-a716-446655440000",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "endpoint": "https://alice--my-dvm.dvmkit.ai",
+  "batches_seen": 5,
+  "batches_melted": 4,
+  "batches_skipped": 1,
+  "batches_failed": 0,
+  "sats_melted": 50000,
+  "recovered": 0,
+  "drains_seen": 2,
+  "drains_parked": 1,
+  "drains_jit_minted": 0,
+  "drains_failed": 0,
+  "drains_queued": 0,
+  "drains_manual": 0,
+  "drains_channel": 0,
+  "drains_recovered": 0,
+  "drain_state_known": true,
+  "drain_state_unknown_since": null,
+  "melt_held": false,
+  "melt_skipped": null
+}
+```
+
+In `--watch` mode, one JSON object is emitted per tick. `endpoint` is the DVM's admin endpoint — its `url`, resolved from the platform, or whatever `--endpoint` overrode it with. For a cloud DVM that is its router address, and the router passes these admin calls through even while the DVM is paused or suspended.
+
+The `drains_*` counters cover this tick's credit-drain pass: `parked` are cashu refunds now waiting for caller pickup, `jit_minted` is the subset of those whose notes were bought from a mint rather than swapped out of the accumulator, `manual` are one-payment (`exact`) x402 drains and any other rail without an automated sender that you must settle from your own keys and record with `POST /admin/credit/mark-drain-sent`, `queued` are refunds nothing was attempted for this tick, and `recovered` are in-flight drains reconciled from the local park log before fresh work started. `melt_held` is true when the payout melt was skipped because cashu drain liability was still outstanding.
+
+`queued` is not `failed`, and the difference is what you do about it. Nothing was tried: no send wallet was wired, no accepted mint would quote, or an earlier purchase for that refund is still in flight and the tick is holding it deliberately so it cannot be paid for twice. The `drain_jit_*` line above each one names which of those it was.
+
+Read `drain_state_known` before any of them. It is false when the tick could not reach the DVM's drain admin surface at all — every drain counter except `drains_recovered` then reads zero for want of an answer, not for want of work, and the melt is held back rather than run blind to what you owe. Recovery replays the local park log before that fetch, so `drains_recovered` can be non-zero even on a tick that learned nothing about what is still owed.
+
+`drain_state_unknown_since` then says how long that has been true, carried across runs. A hold is meant to be a pause: one silent tick is a DVM still booting, a week of them is a DVM that stopped melting revenue and stopped parking refunds without ever saying so. Past `--hold-alarm-after` a one-shot sweep stops holding quietly and exits `drain_state_unknown_sustained`; a `--watch` daemon logs `melt_pending_drain_hold_sustained` on every tick instead, since exiting would only end the retries that might still fix it.
+
+`melt_skipped` says the batch sweep never ran because you told it not to — `"drains_only"` under `--drains-only`, `null` otherwise. Read it before you read the batch counters: zero `batches_melted` alongside `"drains_only"` is the flag doing its job, not a stuck payout, and `batches_seen` is zero because nothing was even fetched.
+
+A one-shot `--drains-only` run exits non-zero unless it settled everything it owes, since settling is the whole point of the mode: `drain_state_unknown` when it never got to read the drain list, and `drains_unsettled` when `drains_failed`, `drains_manual` or `drains_queued` is non-zero — each has its own way out, and the hint names the one you hit. `drains_channel` is counted but never alarms: a channel-backed reclaim is settled by its own close on the caller's next poll, so there is nothing for you to do about one. Cron it and let the exit code speak. A plain sweep is deliberately not symmetric: there, an unsettled refund holds the melt back and retries on the next tick, and failing the daily melter over it would page you about a healthy DVM.
+
+A plain sweep does exit non-zero on the two things that will not fix themselves. `admin_bad_signature` — the DVM advertises a lock pubkey your mnemonic cannot derive, so every admin call it makes is rejected; retrying that forever is what a hold would otherwise do. And `drain_state_unknown_sustained` — the drain surface has been unreadable for longer than `--hold-alarm-after`, so the hold has stopped being a pause. A refund merely waiting on accumulation still exits 0 for as long as it takes: that DVM is working as designed.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `no_builder_mnemonic` | No mnemonic found — run `dvmctl lock create` first |
+| `dvm_not_initialized` | No `builder.json` entry for this handle |
+| `no_payout_destination` | No `--payout` flag and no default set via `dvmctl set-payout` (not required under `--drains-only`) |
+| `auth_required` | Not authenticated (needed to resolve endpoint via platform) |
+| `admin_bad_signature` | DVM's lock pubkey doesn't match the derived privkey — raised by whichever admin call hits it first, including the drain fetch |
+| `pending_batches_fetch_failed` | Failed to fetch pending batches from DVM admin endpoint |
+| `batches_failed` | One or more batches failed during the sweep (one-shot only) |
+| `drains_unsettled` | One or more credit drains went unsettled — failed, or awaiting manual settlement (one-shot `--drains-only` only) |
+| `drain_state_unknown` | The DVM's pending drains could not be read, so nothing beyond a recovered park was settled (one-shot `--drains-only` only) |
+| `drain_state_unknown_sustained` | The drain surface has been unreadable for longer than `--hold-alarm-after`, so the melt hold is a standstill rather than a pause (one-shot plain sweep only) |
+| `invalid_duration` | `--hold-alarm-after` is not one count and one unit (e.g. `6h`, `2d`) |
+| `dvm_url_unset` | DVM has no platform URL yet |
+
+---
+
+## melt-status
+
+Report when [`melt-pending`](#melt-pending) last completed cleanly for each DVM on this machine, and optionally exit non-zero when that was too long ago.
+
+`melt-pending` is almost always run by something: a cron, a launchd job, or a `--watch` daemon. All three die the same silent way: the process stops, and there is no exit code anyone reads, no growing log, and no next run to notice. The only symptom is revenue that quietly stops arriving and caller refunds that quietly stop parking. So every run that completes cleanly stamps `~/.dvmkit/melt-success.json`, keyed by the DVM's immutable id, and this command reads it back. Nothing here talks to the dvmkit platform. The record is a local file, so a DVM you host anywhere can be alarmed on however you like.
+
+A run that would have exited non-zero deliberately leaves the previous timestamp standing, in both one-shot and `--watch` mode. A daemon that is alive but failing every tick has not melted anything, and a liveness record saying otherwise is worse than none.
+
+Each DVM keeps **one clock per mode**, and only the sweep's counts. A `--drains-only` run settles refunds and sweeps nothing, so it is reported separately and never satisfies `--max-age`. Both are recommended together, and folding them into one clock would let an hourly drains-only cron vouch for a `--watch` sweep daemon that died weeks ago.
+
+`--max-age` watches **every** DVM on this machine, and one with no sweep on record is stale rather than exempt. That direction is deliberate: the record is best-effort in three independent ways, since an unwritable file is swallowed, a malformed entry is dropped on read, and the read-modify-write is not atomic against two `--watch` daemons. If a missing record meant "do not alarm", any partial loss of it would silently disarm the alarm for a DVM that is genuinely melting, which is the failure this whole command exists to prevent.
+
+So exemption is something you say, never something this infers. `--except <handle>` (repeatable) drops a DVM from the alarm, which is what you want for one with no Cashu rail that is never going to melt. The question that actually matters is "does this DVM have a Cashu rail", `builder.json` cannot answer it, and inferring it from melt history is exactly what produced silence for DVMs that needed watching.
+
+Install the melt job first and let it succeed once, **then** add the `--max-age` cron. Fail-closed means a fresh alarm is red until the first sweep lands. That is correct and clears itself, but a first-ever run that fires a false alarm is a good way to teach yourself to ignore the real one.
+
+```sh
+dvmctl melt-status                        # every DVM this machine knows about
+dvmctl melt-status my-dvm                 # just one
+dvmctl melt-status --max-age 30h          # exit non-zero on anything staler (this is the alarm)
+dvmctl melt-status --max-age 30h --except my-free-dvm   # …but never alarm on that one
+```
+
+| Flag | Description |
+|---|---|
+| `--max-age <duration>` | Exit non-zero when a DVM has not **swept** successfully within this window (e.g. `30h`, `2d`). Set it a little longer than your melt cadence so one late run is not an alarm. Every DVM is watched, a DVM that has never swept counts as stale, and a `--drains-only` run never satisfies it |
+| `--except <handle>` | Do not alarm on this DVM under `--max-age`. Repeatable. For a DVM with no Cashu rail, which never melts and would otherwise hold the alarm red forever |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "dvms": [
+    {
+      "handle": "my-dvm",
+      "dvm_id": "550e8400-e29b-41d4-a716-446655440000",
+      "last_success_at": "2026-08-21T06:00:12.000Z",
+      "age_seconds": 3612,
+      "stale": false,
+      "batches_melted": 3,
+      "sats_melted": 42000,
+      "drains_parked": 1,
+      "last_drains_only_at": "2026-08-21T06:30:04.000Z",
+      "drains_only_age_seconds": 1820
+    }
+  ],
+  "max_age_seconds": 108000,
+  "excepted": [],
+  "state_file": "/home/you/.dvmkit/melt-success.json"
+}
+```
+
+`last_success_at` and its counters describe the last clean **sweep**; `last_drains_only_at` is reported beside them and never counts toward `stale`. Both are `null`, and `stale` true under any `--max-age`, for a DVM that has never had a clean run **on this machine**, which is the right reading: a melt job that never once succeeded looks exactly like one with nothing to report, and treating that as healthy is the failure this command exists to prevent. `state_file` is the absolute path of the record itself, for alarming on the file directly rather than through the CLI.
+
+`excepted` lists the handles `--except` actually matched, so a misspelled flag shows up as an absence rather than as a DVM that quietly stopped being watched. A typo fails safe either way: the DVM stays in the alarm, which is also why a `--except` matching nothing is not an error: a DVM you retire should not break a working cron. What *is* refused is an `--except` on a handle two `builder.json` entries claim: dropping both would silently unwatch a live DVM alongside a retired one, so it errors exactly as naming that handle positionally does.
+
+A sweep stamped in the **future** counts as no sweep at all, so the DVM reads stale rather than fresh. A host that stamps before its clock syncs would otherwise be measured against a date years ahead and stay green until the clock caught up.
+
+`--max-age` refuses outright when there is nothing left for it to watch, whether this machine records no DVMs at all or every one was excepted. Reporting a green list and exiting 0 would be an alarm that can never fire. For the first case the usual cause is not a machine without DVMs but a cron or launchd job running in a minimal environment against the wrong `HOME`. Set `DVMKIT_CONFIG_DIR` explicitly in the job if that is what happened.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `melt_stale` | One or more DVMs have not swept successfully within `--max-age` |
+| `no_dvms_recorded` | `--max-age` was given but nothing is left to watch: this machine's `builder.json` records no DVMs, or every one was `--except`ed |
+| `invalid_duration` | `--max-age` is not one count and one unit (e.g. `30h`, `2d`) |
+| `invalid_except_handle` | An `--except` value is not a handle. Usually the next flag was swallowed as its value, e.g. `--except --max-age` |
+| `dvm_not_initialized` | A handle was named with no `builder.json` entry for it |
+| `ambiguous_dvm_handle` | Two `builder.json` entries claim that handle, either named positionally or passed to `--except` |
+
+---
+
+## credit blocked
+
+List the Lightning top-ups your DVM received but could never credit — the queue behind every `lightning_settlement_blocked` log line. A caller reused a `fund_id` on another rail after the invoice was minted, or named a `credit_id` someone else opened first, so their payment landed in your wallet with no balance able to take it.
+
+Read-only: the money is still in your wallet and nothing here moves it. Signed with the same builder lock key `melt-pending` uses, derived locally from your mnemonic.
+
+```sh
+dvmctl credit blocked my-dvm
+dvmctl credit blocked my-dvm --include-resolved
+dvmctl credit blocked my-dvm --limit 10 --after eyJ...
+```
+
+| Flag | Description |
+|---|---|
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--limit <n>` | Page size (default: 50, max 200) |
+| `--after <cursor>` | Continue from a previous run's `next_after` value |
+| `--include-resolved` | Also list rows you already reconciled or wrote off — the audit view |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_blocked",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "invoices": [
+    {
+      "payment_hash": "9a3f...",
+      "credit_id": "fnd:ab12...:topup-7",
+      "fund_id": "topup-7",
+      "caller_pubkey": "ab12...",
+      "currency": "usd",
+      "amount_micro": 500000,
+      "amount_msats": 500000,
+      "status": "blocked",
+      "blocked_reason": "funding_replayed_on_cashu",
+      "created_at": 1754000000000,
+      "settled_at": null,
+      "reconciled_credit_id": null,
+      "resolved_at": null,
+      "write_off_note": null
+    }
+  ],
+  "blocked_count": 1,
+  "display": "1 Lightning payment(s) landed in this DVM's wallet with no caller balance to put them on.",
+  "hint": "Credit one onto a credit the caller holds with `dvmctl credit reconcile <handle> <payment-hash> --credit-id <id>`, or close it with `dvmctl credit write-off`."
+}
+```
+
+`blocked_reason` names what the ledger refused on: `funding_replayed_on_<rail>` (the caller spent that `fund_id` elsewhere), `caller_mismatch` (someone else opened the credit first), `currency_mismatch`, `rail_mismatch`, or `invalid_basis`. `next_after` is present only when the page was full — pass it to `--after` to continue. Pagination is keyset-based rather than by page number, because a row you decline to act on stays at the head of the queue forever and would otherwise crowd out everything behind it.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `invalid_limit` | `--limit` outside 1..200 |
+| `admin_bad_signature` | The DVM's lock pubkey doesn't match the key derived from this mnemonic |
+| `admin_unreachable` | The DVM's admin endpoint didn't answer |
+| `dvm_url_unset` | No platform URL for this handle yet — pass `--endpoint` |
+
+---
+
+## credit reconcile
+
+Credit a blocked Lightning payment onto a credit the caller holds. **Idempotent** — running it twice credits once.
+
+You name only the target credit. The amount, currency, caller identity and rail basis all come off the invoice row your DVM recorded when it minted the bolt11, so this cannot credit more than arrived and cannot credit it to anyone but the caller who paid. Before moving anything the DVM re-confirms with its receive wallet that the invoice really settled, and the deposit is booked in the same transaction as the balance, so the platform's outstanding-liability view catches up on its own.
+
+Which credit is the one thing that isn't derivable from the failed row — ask the caller, or use the `credit_id` from `dvmctl credit blocked`, which is the top-up the invoice was minted for.
+
+```sh
+dvmctl credit blocked my-dvm
+dvmctl credit reconcile my-dvm 9a3f... --credit-id fnd:ab12...:topup-7
+```
+
+| Flag | Description |
+|---|---|
+| `--credit-id <id>` | Credit the payment should land on (required) |
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_reconcile",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "payment_hash": "9a3f...",
+  "credit_id": "fnd:ab12...:topup-7",
+  "fund_id": "9a3f...",
+  "amount_micro": 500000,
+  "currency": "usd",
+  "replayed": false,
+  "credit": {
+    "credit_id": "fnd:ab12...:topup-7",
+    "currency": "usd",
+    "balance_micro": 500000,
+    "remaining_micro": 500000,
+    "expiry_ms": 1756592000000
+  },
+  "display": "Credited 0.500000 USD to fnd:ab12...:topup-7. The caller can spend it now.",
+  "hint": "The deposit is reported to the platform on the DVM's own retry loop, so its liability view catches up without another command."
+}
+```
+
+`replayed: true` means this payment had already been credited to that credit and nothing moved. `fund_id` on the response is the payment hash, not the caller's original `fund_id` — that key is frequently the one that blocked the invoice in the first place, so the funding is recorded under the hash instead. The caller's next poll of their original `fund_id` returns a 200 naming the credit their balance actually landed on.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `missing_credit_id` | No `--credit-id` given |
+| `invoice_not_found` | No invoice for that payment hash |
+| `invoice_not_blocked` | The invoice is pending, settled or expired — nothing to reconcile |
+| `invoice_already_reconciled` | Already credited, to a *different* credit than the one named |
+| `funding_replayed` | Something else already holds `(named credit, payment hash)` — name a different credit |
+| `invoice_not_settled` | The receive wallet reports the invoice as unpaid |
+| `invoice_unknown_to_wallet` | The wallet has no record of that payment — you're pointed at a different wallet than the one that minted the invoice |
+| `wallet_unreachable` | Couldn't reach the receive wallet to confirm the payment |
+| `lightning_receive_not_configured` | The DVM has no `DVMKIT_NWC_RECEIVE_URI`, so it can't confirm anything |
+| `caller_mismatch` | That credit belongs to another caller |
+| `currency_mismatch` | That credit is denominated in a different currency |
+| `rail_mismatch` | That credit was funded on another rail |
+| `currency_drift` | The DVM's declared currency changed since the invoice was minted |
+| `credit_id_unavailable` | The named credit is in a namespace the provider derives and doesn't exist yet |
+
+---
+
+## credit write-off
+
+Record that you reviewed a blocked Lightning payment and are not crediting it.
+
+Moves no money: the sats stay in your wallet and no caller balance is created for them. dvmkit books nothing either way — there is no job to attribute the revenue to — so the note on the row and the `lightning_invoice_written_off` log are the only record of the amount. It exists so a row you've decided about leaves the queue without pretending it settled, and it is reversible: `dvmctl credit reconcile` still accepts a written-off invoice.
+
+```sh
+dvmctl credit write-off my-dvm 9a3f... --note "caller made whole on cashu"
+```
+
+| Flag | Description |
+|---|---|
+| `--note <text>` | Why you are not crediting it. Recorded on the invoice row |
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_write_off",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "payment_hash": "9a3f...",
+  "amount_micro": 500000,
+  "currency": "usd",
+  "note": "caller made whole on cashu",
+  "replayed": false,
+  "display": "Closed this payment without crediting it. The 0.500000 USD stays in your wallet and no caller balance was created for it.",
+  "hint": "Reversible: `dvmctl credit reconcile` still accepts a written-off invoice if you change your mind."
+}
+```
+
+`replayed: true` means the invoice was already written off and this call changed nothing — including the note, which stays whatever the first write-off recorded. `note` on the response is always the note on the row, so a replay shows you the reason already on file rather than the one you just passed.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `invoice_not_found` | No invoice for that payment hash |
+| `invoice_not_blocked` | The invoice isn't blocked — only a blocked one can be written off |
+
+---
+
+## credit x402-wedged
+
+List the x402 cooperative refunds that reached the chain but never cleared the caller's balance.
+
+An x402 drain pays out on chain and extinguishes the ledger liability in two steps, and the on-chain half is deliberately recorded before the ledger half so a crash can be recovered. When the ledger half refuses — most often because what the facilitator reported it settled doesn't match what the ledger is extinguishing — the refund is gone and the caller's balance is still sitting there, and every retry hits the same refusal. These are those settlements.
+
+Read-only. Each row carries what the chain itself says, which is what decides whether it can be finished or has to be closed. Those lookups are chunked log scans, so the page ceiling is low and `--no-evidence` skips them entirely.
+
+```sh
+dvmctl credit x402-wedged my-dvm
+dvmctl credit x402-wedged my-dvm --include-resolved
+dvmctl credit x402-wedged my-dvm --limit 10 --after eyJ... --no-evidence
+```
+
+| Flag | Description |
+|---|---|
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--limit <n>` | Page size (default: 20, max 50) |
+| `--after <cursor>` | Continue from a previous run's `next_after` value |
+| `--include-resolved` | Also list settlements you already wrote off — the audit view |
+| `--min-age-ms <ms>` | How long a settlement must have sat before it counts as stuck (default: 300000) |
+| `--no-evidence` | Skip the per-row chain lookups — a fast read of the queue itself |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_x402_wedged",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "settlements": [
+    {
+      "settlement_id": "5e2c...",
+      "channel_id": "0x7c1a...",
+      "operation": "refund",
+      "effect_id": "imp:x402:0xabc...:drain-7",
+      "credit_id": "imp:x402:0xabc...",
+      "drain_id": "drain-7",
+      "status": "settled",
+      "submission_block": "18420031",
+      "settled_amount": "999",
+      "settled_transaction": "0x9ff1...",
+      "created_at": 1754000000000,
+      "updated_at": 1754000000000,
+      "resolved_at": null,
+      "write_off_note": null,
+      "chain": { "chain": "found", "transaction": "0x9ff1...", "amount": "400000" }
+    }
+  ],
+  "wedged_count": 1,
+  "repairable_count": 1,
+  "display": "1 x402 refund(s) settled on chain without the caller's credit balance being cleared. 1 of them have a matching refund the chain can confirm.",
+  "hint": "Finish one with `dvmctl credit x402-reconcile <handle> <settlement-id>` — the amount comes off the chain, not from you. If the chain and the ledger disagree, close it with `dvmctl credit x402-write-off`."
+}
+```
+
+`chain` is the answer to "did this actually happen", and its four values are deliberately distinct. `found` carries the chain's own transaction and amount and is the only one `x402-reconcile` will act on. `absent` means the chain was read from the submission block to the head of the chain and this refund is not on it. `unreachable` means the RPC endpoint didn't answer and says nothing either way — retry, or point the DVM at a different endpoint first. `unbookmarked` means the settlement recorded no submission block, so there is no range to scan.
+
+`settled_amount` is what the facilitator claimed; the amount under `chain` is what the chain shows. A disagreement between those two is the usual reason a settlement is on this list at all. `next_after` is present only when the page was full.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `invalid_limit` | `--limit` outside 1..50 |
+| `x402_settlement_unavailable` | This DVM has no durable x402 batch-settlement store, so it holds no settlements to repair |
+| `admin_bad_signature` | The DVM's lock pubkey doesn't match the key derived from this mnemonic |
+| `admin_unreachable` | The DVM's admin endpoint didn't answer |
+| `dvm_url_unset` | No platform URL for this handle yet — pass `--endpoint` |
+
+---
+
+## credit x402-reconcile
+
+Finish the ledger leg of an x402 refund the chain already paid. **Idempotent** — running it twice books once.
+
+You name only the settlement. The DVM re-derives the refund amount from the chain's own logs and completes the drain against that figure, so this cannot extinguish a different amount than the chain actually returned, and the amount can't be supplied from here at all. The reclaim is reported to the platform in the same transaction as the drain's transition, so its liability view catches up without another command.
+
+If the chain's figure and the ledger's disagree, this refuses and names both. That refusal is the point: a real discrepancy still stops the drain, and `dvmctl credit x402-write-off` is how such a settlement gets closed with a reason on record.
+
+```sh
+dvmctl credit x402-wedged my-dvm
+dvmctl credit x402-reconcile my-dvm 5e2c...
+```
+
+| Flag | Description |
+|---|---|
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_x402_reconcile",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "settlement_id": "5e2c...",
+  "channel_id": "0x7c1a...",
+  "credit_id": "imp:x402:0xabc...",
+  "drain_id": "drain-7",
+  "transaction": "0x9ff1...",
+  "settled_amount": "400000",
+  "amount_micro": 400000,
+  "currency": "usd",
+  "replayed": false,
+  "display": "Cleared the caller's balance on imp:x402:0xabc... against the refund the chain already paid (0x9ff1...).",
+  "hint": "The reclaim is reported to the platform on the DVM's own retry loop, so its liability view catches up without another command."
+}
+```
+
+`settled_amount` is in the channel token's own atomic units (USDC micro-units); `amount_micro` is the fiat liability the ledger extinguished. `replayed: true` means the settlement was already booked and nothing moved.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `settlement_not_found` | No settlement with that id |
+| `settlement_not_wedged` | The settlement isn't stuck between chain and ledger — nothing to finish |
+| `settlement_not_repairable` | It's a deposit, not a cooperative refund. A wedged deposit recovers when the caller re-presents it |
+| `credit_not_bound` | No credit is bound to that channel any more, so there is no liability to extinguish |
+| `settlement_unbookmarked` | The settlement recorded no submission block, so the chain can't be scanned for it |
+| `settlement_not_on_chain` | The chain was read and carries no matching refund. Nothing was booked |
+| `chain_unreachable` | The RPC endpoint didn't answer. This says nothing about whether the money moved |
+| `settlement_raced` | Another repair, or a caller retry, moved this settlement mid-reconcile. Nothing was booked twice — re-read it with `x402-wedged` before acting again |
+| `drain_conflict` | The chain's figure and the ledger's don't match — the message names both |
+
+---
+
+## credit x402-write-off
+
+Record that you reviewed a wedged x402 settlement and are not booking it.
+
+Books nothing anywhere. If the refund did reach the chain, the caller already has it, and their matching credit balance stays on this ledger where they can reclaim it with a fresh drain — so the note on the row and the `x402_settlement_written_off` log are the only record. It exists so a settlement you've decided about leaves the queue without pretending it booked, and it is reversible: `dvmctl credit x402-reconcile` still accepts a written-off settlement.
+
+A caller who re-presents the same refund voucher after a write-off gets a terminal refusal telling them to reclaim under a new drain id — not a payment challenge, which an agent would answer by re-signing the same voucher and landing straight back on the write-off. A new drain id opens a fresh settlement against whatever the channel really has left.
+
+Reversing it is `x402-reconcile`, and a reconcile that then refuses leaves the write-off exactly as it found it — note, timestamp and all — so a settlement never sits in the queue advertising a decision that was undone.
+
+```sh
+dvmctl credit x402-write-off my-dvm 5e2c... --note "chain paid 250000, ledger owes 400000 — investigating"
+```
+
+| Flag | Description |
+|---|---|
+| `--note <text>` | Why you are not booking it. Recorded on the settlement row |
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_x402_write_off",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "settlement_id": "5e2c...",
+  "channel_id": "0x7c1a...",
+  "effect_id": "imp:x402:0xabc...:drain-7",
+  "note": "chain paid 250000, ledger owes 400000 — investigating",
+  "replayed": false,
+  "display": "Closed this settlement without booking it. No ledger row moved: if the refund did reach the chain, the caller still holds the matching credit balance here and can reclaim it with a new drain.",
+  "hint": "Reversible: `dvmctl credit x402-reconcile` still accepts a written-off settlement if you change your mind."
+}
+```
+
+`replayed: true` means it was already written off and this call changed nothing — including the note, which stays whatever the first write-off recorded.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `settlement_not_found` | No settlement with that id |
+| `settlement_not_wedged` | The settlement isn't stuck between chain and ledger — only a wedged one can be written off |
+| `settlement_not_repairable` | It's a deposit, not a cooperative refund |
+
+---
+
+## credit x402-exact-wedged
+
+Lists exact x402 authorizations that may have settled on chain but have not finished the credit, draw, or job effect they were created for. The output never includes the signed payment header or facilitator credential.
+
+```bash
+dvmctl credit x402-exact-wedged my-dvm
+dvmctl credit x402-exact-wedged my-dvm --include-resolved --limit 10
+```
+
+Options:
+
+| Flag | Description |
+| --- | --- |
+| `--endpoint <url>` | Call a self-hosted or local DVM directly |
+| `--org <handle>` | Target this org instead of the current switch context |
+| `--limit <n>` | Rows to return (default 20, maximum 50) |
+| `--include-resolved` | Include completed and definitively rejected intents |
+| `--human` | Human-readable output instead of JSON |
+
+```json
+{
+  "op": "credit_x402_exact_wedged",
+  "handle": "my-dvm",
+  "settlements": [
+    {
+      "settlement_intent_id": "8f3d...",
+      "status": "ambiguous",
+      "transaction": null,
+      "last_outcome": "missing_reference",
+      "credit_id": "credit-1",
+      "job_id": null
+    }
+  ],
+  "wedged_count": 1,
+  "display": "1 exact x402 payment(s) need an operator decision or local finalization.",
+  "hint": "Run `dvmctl credit x402-exact-reconcile <handle> <settlement-intent-id>` only after this queue shows the authorization; the DVM derives the transaction and amount from its own evidence."
+}
+```
+
+## credit x402-exact-reconcile
+
+Finishes the original local effect of an exact x402 authorization that the DVM can prove settled on chain. It accepts no transaction or amount flags: both come from the authorization's bookmarked chain evidence, and a replay books nothing again.
+
+```bash
+dvmctl credit x402-exact-reconcile my-dvm 8f3d...
+```
+
+Options:
+
+| Flag | Description |
+| --- | --- |
+| `--endpoint <url>` | Call a self-hosted or local DVM directly |
+| `--org <handle>` | Target this org instead of the current switch context |
+| `--human` | Human-readable output instead of JSON |
+
+```json
+{
+  "op": "credit_x402_exact_reconcile",
+  "handle": "my-dvm",
+  "status": "reconciled",
+  "settlement_intent_id": "8f3d...",
+  "transaction": "0xabc...",
+  "amount": "100000",
+  "credit_id": "credit-1",
+  "draw_id": null,
+  "job_id": null,
+  "replayed": false,
+  "display": "Finalized the original local effect for exact x402 transaction 0xabc....",
+  "hint": "The original credit funding is now recorded; the caller can read that credit without paying again."
+}
+```
+
+---
+
+## credit tempo-losses
+
+List the immutable audit records created when a Tempo channel finalized before the DVM collected value under its highest accepted voucher. The former nominal credit balance remains visible for incident review, alongside the on-chain settlement, highest voucher, consumed service value, channel, and observation time, but the credit is terminal and has no drawable or reclaimable value.
+
+This is deliberately read-only. There is no refund, mark-sent, retry, or repair action because the channel has already finalized and the missing backing cannot be collected.
+
+```sh
+dvmctl credit tempo-losses my-dvm
+dvmctl credit tempo-losses my-dvm --limit 50
+```
+
+| Flag | Description |
+|---|---|
+| `--limit <n>` | Rows to return (default: 20, max 50) |
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+The JSON response uses `op: "credit_tempo_losses"`. Each `losses[]` row carries `credit_id`, `channel_id`, `former_balance_micro`, `settled_on_chain_native`, `highest_voucher_native`, `consumed_service_micro`, `consumed_native`, `observed_at`, and terminal `status: "unbacked"`; `hint` states that no money-moving action exists.
+
+---
+
+## credit tempo-wedged
+
+List Tempo cooperative closes that landed on chain but never booked the caller's drain.
+
+A Tempo channel close debits the caller's credit balance when the close intent is reserved, then broadcasts, then checks that what the chain refunded covers what the ledger extinguished. When that last step refuses, the channel is closed, the balance is gone, and every retry — the caller's own poll included — lands on the same refusal, because a closed channel cannot pay a second time. This is that queue.
+
+Each row puts the two figures side by side: `amount_native` is the debit the refund has to cover, and `chain.refundedToPayer` is what the close receipt says it paid. Reading the chain costs an RPC round trip per row, so the page ceiling is 50 and `--no-evidence` skips the lookups entirely when you only want to see how many rows there are. A row whose RPC fails comes back `chain: "unreachable"` rather than failing the whole page — that says nothing about what the close paid, which is exactly why it is not the same answer as a close that names no receipt.
+
+Drains you have already written off are hidden by default; `--include-resolved` is the audit view.
+
+```sh
+dvmctl credit tempo-wedged my-dvm
+dvmctl credit tempo-wedged my-dvm --include-resolved --limit 50
+```
+
+| Flag | Description |
+|---|---|
+| `--limit <n>` | Page size (default: 20, max 50) |
+| `--after <cursor>` | Continue from a previous run's `next_after` value |
+| `--include-resolved` | Also list drains you already wrote off — the audit view |
+| `--min-age-ms <ms>` | How long a drain must have sat before it counts as stuck (default: 300000) |
+| `--no-evidence` | Skip the per-row chain lookups — a fast read of the queue itself |
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_tempo_wedged",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "drains": [
+    {
+      "credit_id": "imp:tempo:challenge-9",
+      "drain_id": "drain-7",
+      "channel_id": "0x3a1b...",
+      "amount_micro": 400000,
+      "amount_native": 400000,
+      "currency": "usd",
+      "caller_pubkey": "ab12...",
+      "status": "pending",
+      "created_at": 1755200000000,
+      "write_off_note": null,
+      "written_off_at": null,
+      "chain": {
+        "chain": "found",
+        "transaction": "0xb1c2...",
+        "refundedToPayer": "390000",
+        "settledToPayee": "110000"
+      }
+    }
+  ],
+  "wedged_count": 1,
+  "repairable_count": 0,
+  "short_refund_count": 1,
+  "awaiting_close_count": 0,
+  "display": "1 Tempo close(s) landed on chain without the caller's credit balance being booked as paid. 0 paid enough to cover the debit and can be finished. 1 refunded the caller less than was extinguished — those cannot be reconciled and need a decision.",
+  "hint": "Finish one with `dvmctl credit tempo-reconcile <handle> <credit-id> <drain-id>` — the amount comes off the close receipt, not from you. If the refund was genuinely short, close it with `dvmctl credit tempo-write-off`. Drains you have already written off are not counted here; re-run with `--include-resolved` to see those."
+}
+```
+
+`repairable_count` is the rows whose on-chain refund covers the debit — those finish with `tempo-reconcile`. `short_refund_count` is the rows where the chain named a figure and it fell short; a reconcile refuses those, and `tempo-write-off` is how one gets closed. `awaiting_close_count` is counted separately and excluded from `wedged_count`: those are pending drains whose channel has no confirmed close at all, so nothing landed on chain and no repair applies — the caller's own poll is what finishes them. `next_after` appears when the page was full.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `invalid_limit` | `--limit` outside 1..50, refused before the DVM is called |
+| `tempo_repair_unavailable` | The DVM has no durable Tempo session store, so it holds no closes to repair |
+| `admin_bad_signature` | The DVM advertises a lock pubkey your mnemonic cannot derive |
+
+---
+
+## credit tempo-reconcile
+
+Book a Tempo drain whose channel close already paid on chain.
+
+You name one thing — which drain. The DVM re-reads the `ChannelClosed` receipt the confirmed close already points at and books the drain against *that* figure, never one you supply, so this door cannot extinguish more or less than the chain returned. Any excess over the debit is the payer's uncredited channel surplus and is recorded on the drain alongside the settled amount.
+
+If the chain refunded less than the ledger is extinguishing it refuses and names both figures. That drain is not reconcilable — the channel is closed, so nothing can top the refund up — and `tempo-write-off` is how it gets closed out.
+
+Running it twice books once: the second call answers `replayed: true` off the drain's own recorded state, without paying for another chain read.
+
+```sh
+dvmctl credit tempo-reconcile my-dvm imp:tempo:challenge-9 drain-7
+```
+
+| Flag | Description |
+|---|---|
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_tempo_reconcile",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "credit_id": "imp:tempo:challenge-9",
+  "drain_id": "drain-7",
+  "channel_id": "0x3a1b...",
+  "transaction": "0xb1c2...",
+  "settled_amount": "400000",
+  "amount_micro": 400000,
+  "amount_native": 400000,
+  "currency": "usd",
+  "replayed": false,
+  "display": "Booked drain drain-7 on imp:tempo:challenge-9 against the refund the channel close already paid (0xb1c2...).",
+  "hint": "The reclaim is reported to the platform on the DVM's own retry loop, so its liability view catches up without another command."
+}
+```
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `drain_conflict` | The close refunded less than the ledger debited. The message names both figures |
+| `drain_not_found` | No drain with that id on that credit |
+| `drain_not_repairable` | The drain isn't a Tempo cooperative close — this verb repairs those only |
+| `drain_not_wedged` | The drain was released, so no close is waiting to be booked |
+| `close_not_confirmed` | No confirmed cooperative close on this drain, so there is no receipt to book against |
+| `close_refund_unreported` | The close reference names no transaction receipt, so the chain states no refund figure |
+| `chain_unreachable` | The Tempo RPC could not be read — retryable, and it says nothing about what the close paid |
+| `tempo_repair_unavailable` | The DVM has no durable Tempo session store |
+
+---
+
+## credit tempo-write-off
+
+Record that you reviewed a wedged Tempo close and are not booking it.
+
+Books nothing anywhere. The close paid the caller less than this ledger extinguished, and no dvmkit row can express that difference: the channel is closed, so there is nothing left to refund through it, and re-crediting the balance here would pay the caller twice for the part the chain *did* return. Making the shortfall good is an out-of-band decision — this verb records that you took it, so the row leaves the queue without pretending it booked.
+
+Reversing it is `tempo-reconcile`, and a reconcile that then refuses leaves the write-off exactly as it found it — note, timestamp and all — so a drain never sits in the queue advertising a decision that was undone.
+
+```sh
+dvmctl credit tempo-write-off my-dvm imp:tempo:challenge-9 drain-7 --note "chain refunded 390000 of 400000; made good by transfer 0x…"
+```
+
+| Flag | Description |
+|---|---|
+| `--note <text>` | Why you are not booking it. Recorded on the drain row |
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_tempo_write_off",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "credit_id": "imp:tempo:challenge-9",
+  "drain_id": "drain-7",
+  "channel_id": "0x3a1b...",
+  "amount_micro": 400000,
+  "amount_native": 400000,
+  "currency": "usd",
+  "note": "chain refunded 390000 of 400000; made good by transfer 0x…",
+  "replayed": false,
+  "display": "Closed this drain without booking it. No ledger row moved: the caller keeps the on-chain refund the close paid them, and the shortfall against what was extinguished is not expressible here — make it good out of band if you owe it.",
+  "hint": "Reversible: `dvmctl credit tempo-reconcile` still accepts a written-off drain if you change your mind."
+}
+```
+
+`replayed: true` means it was already written off and this call changed nothing — including the note, which stays whatever the first write-off recorded.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `drain_not_found` | No drain with that id on that credit |
+| `drain_not_repairable` | The drain isn't a Tempo cooperative close |
+| `drain_not_wedged` | The drain was released, or already booked as sent — either way there is nothing to decide about, and a write-off on a close that paid would say it didn't |
+
+---
+
+## credit liability
+
+Show the satoshis your DVMs owe callers, and how much of your hub balance is earnings you can sweep.
+
+Prepaid Bitcoin credit is a deposit. The caller can ask for it back at any moment, and what they get back is the Bitcoin they sent, pro rata to the share they never spent, rather than a dollar figure converted at whatever the rate is on the day. So your hub holds two pots in one balance: deposits, which are theirs, and earnings, which are yours. The sweep rule is to bank the second and never the first, and this command is that number.
+
+Every figure comes off the funding lots each deposit recorded, at the rate that funding actually landed at. Nothing here reads an exchange rate, because nothing about the obligation depends on one.
+
+Name every DVM your hub backs. One hub normally serves several, and a sweep netted against a single DVM's floor is wrong by all the others. Pass `--hub-sats` with your hub's spendable balance to get the sweepable figure directly instead of subtracting by hand.
+
+Read-only.
+
+```sh
+dvmctl credit liability scrape cast scribe narrate
+dvmctl credit liability scrape --hub-sats 250000 --human
+```
+
+| Flag | Description |
+|---|---|
+| `--hub-sats <sats>` | Your hub's spendable balance, in sats. Supply it to get the sweepable figure directly |
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_liability",
+  "handles": ["scrape"],
+  "dvms": [
+    {
+      "handle": "scrape",
+      "dvm_id": "550e8400-e29b-41d4-a716-446655440000",
+      "deposit_liability_sats": 1142,
+      "deposit_credits": 1,
+      "deposit_by_rail": [{ "rail": "lightning", "sats": 1142, "credits": 1 }],
+      "deposit_by_currency": [{ "currency": "usd", "micro": 1142000, "credits": 1 }],
+      "drain_liability_sats": 400,
+      "drain_count": 1,
+      "total_owed_sats": 1542,
+      "uncovered_credits": 0,
+      "uncovered_micro": 0,
+      "unbacked_credits": 0,
+      "unbacked_micro": 0,
+      "unpriced_drains": 0
+    }
+  ],
+  "deposit_liability_sats": 1142,
+  "drain_liability_sats": 400,
+  "total_owed_sats": 1542,
+  "hub_sats": 250000,
+  "sweepable_sats": 248458,
+  "solvent": true,
+  "display": "Callers are owed 1542 sats across 1 DVM(s): 1142 sats of prepaid balance nobody has drawn yet, and 400 sats already promised to reclaims in flight. The hub holds 250000 sats, so 248458 sats of it are earnings and the rest has to stay put.",
+  "hint": "Sweep no more than `sweepable_sats`. These are satoshis the DVMs owe back as satoshis, so the figure does not move with the exchange rate."
+}
+```
+
+`deposit_liability_sats` is undrawn prepaid balance: money with no reclaim registered against it yet, which is exactly the liability a payout sweep used to be blind to. `drain_liability_sats` is what a registered reclaim has already promised. Their sum is `total_owed_sats`, the floor your hub may never be banked below.
+
+A hub below that floor is an operational error to repair, not a routine state: `solvent` says so and `sweepable_sats` goes negative rather than clamping to zero. Nothing gates on it. Funding rails stay advertised whatever your treasury is doing, because a rail that appears and disappears with internal state is worse product than one that is honestly absent.
+
+Two counts describe balance the sats figures cannot speak for, published rather than folded into the totals. `unbacked_credits` is credit funded before dvmkit recorded a rail basis, whose reclaim still prices off a live rate. `uncovered_credits` is balance with no funding lot behind it at all, which is a defect: the DVM logs `credit_funding_lot_backfill` at boot and repairs it there, so a count that is not falling is worth investigating. When either is non-zero a `gap_note` field says how much ledger value is involved, so you can leave headroom for it.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `invalid_hub_balance` | `--hub-sats` was not a whole number of satoshis |
+| `admin_bad_signature` | The DVM's lock pubkey doesn't match the key derived from this mnemonic |
+| `admin_unreachable` | The DVM's admin endpoint didn't answer |
+| `dvm_url_unset` | No platform URL for this handle yet, so pass `--endpoint` |
+
+---
+
+## credit drains-owed
+
+List the stablecoin refunds your DVM owes callers that nothing will ever pay on its own — the queue behind every `drain_manual_settlement_required` log line.
+
+These are one-payment reclaims: a credit funded by a single x402 `exact` authorization or a Tempo charge. The caller named a payout address, the DVM debited their balance and countersigned the request, and the money is owed from that moment — but there is no builder-held on-chain send key anywhere in dvmkit, so nothing sends it.
+
+A channel-backed refund never appears here, even on the same rail. Its own cooperative close settles it, and one sitting `pending` is usually that close still reconciling — the DVM classifies it `settlement: "channel"` and names the channel on the row, so listing it would send you to pay a refund the channel is about to pay itself.
+
+That stays a person's job by decision rather than by omission. Automating the send means a chain spending key live on your `melt-pending` host with your whole stablecoin balance behind it.
+
+Read-only, and every figure comes off the drain row: `amount_micro` is what the caller was debited in your ledger's currency, `amount_native` is the same debit in the payout token's own units — that second one is what you send. These rows deliberately carry no sats figure, because nothing here prices or pays them.
+
+```sh
+dvmctl credit drains-owed my-dvm
+dvmctl credit drains-owed my-dvm --human
+```
+
+| Flag | Description |
+|---|---|
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_drains_owed",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "drains": [
+    {
+      "credit_id": "imp:x402:0xabc...",
+      "drain_id": "drain-7",
+      "method": "x402",
+      "payout": { "address": "0x1234567890abcdef1234567890abcdef12345678" },
+      "currency": "usd",
+      "amount_micro": 400000,
+      "amount_sats": null,
+      "amount_msats": null,
+      "sats_basis": null,
+      "amount_native": 400000,
+      "settlement": "manual",
+      "channel_id": null,
+      "created_at": 1754000000000,
+      "age_ms": 7200000
+    }
+  ],
+  "owed_count": 1,
+  "owed_totals": [{ "currency": "usd", "amount_micro": 400000, "count": 1 }],
+  "display": "1 stablecoin refund(s) are owed to callers and no job will pay them: 0.400000 USD. Each one was debited from the caller's balance already, so the money is owed whether or not it is sent.",
+  "hint": "Send each payout on its own rail (`method` names it, `payout.address` is the destination, `amount_native` is the figure in the token's own units), then record it with `dvmctl credit drain-settle <handle> <credit-id> <drain-id> --tx <hash>`."
+}
+```
+
+Rows come oldest first — a refund's age is the reason to act on it. `owed_totals` groups by currency rather than summing to one number, because the admin read is host-wide and a multi-mount host can hold credits in two denominations. `amount_native` is `null` only on a credit that records no rail basis, where the fiat figure is all the ledger knows.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `admin_bad_signature` | The DVM's lock pubkey doesn't match the key derived from this mnemonic |
+| `admin_unreachable` | The DVM's admin endpoint didn't answer |
+| `dvm_url_unset` | No platform URL for this handle yet — pass `--endpoint` |
+
+---
+
+## credit drain-settle
+
+Record that you settled an owed stablecoin refund on chain. **Idempotent** — running it twice records once.
+
+Moves no money. The payout happened in your own wallet; this is the ledger catching up with it. The drain flips `pending → sent`, the caller's next reclaim poll sees it settled with a countersigned receipt, and the reclaim is reported to the platform inside the same transaction as the transition — so its outstanding-liability view stops counting a debt you have paid, exactly once however many times you run this.
+
+Both ids are named because `(credit-id, drain-id)` is the ledger's key and the drain id is chosen by the caller, so it is not unique on its own. `dvmctl credit drains-owed` prints the pair side by side.
+
+`--tx` is required: it is the only evidence this row will ever carry, and no shape is enforced on it because an x402 payout settles on Base and a Tempo one does not — refusing an unfamiliar hash would refuse a real settlement.
+
+```sh
+dvmctl credit drains-owed my-dvm
+dvmctl credit drain-settle my-dvm imp:x402:0xabc... drain-7 --tx 0xfeed... --note "sent from ops wallet"
+```
+
+| Flag | Description |
+|---|---|
+| `--tx <hash>` | On-chain transaction that paid the refund (required) |
+| `--note <text>` | Recorded alongside the transaction, e.g. which wallet sent it |
+| `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_drain_settle",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "credit_id": "imp:x402:0xabc...",
+  "drain_id": "drain-7",
+  "transaction": "0xfeed...",
+  "replayed": false,
+  "display": "Recorded the payout for drain drain-7 on imp:x402:0xabc.... The caller's next reclaim poll sees it settled, with a countersigned receipt.",
+  "hint": "The reclaim is reported to the platform inside the same transaction as this transition, so its liability view catches up without another command — and exactly once, however many times this runs."
+}
+```
+
+`replayed: true` means the drain was already recorded as sent and this call changed nothing, including the settlement reference — which stays whatever was recorded first. On a payout you believe you just made, read that as "check the transaction on file before sending another": it may already have been paid.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `missing_transaction` | No `--tx` given |
+| `drain_not_found` | No drain with that id on that credit |
+| `drain_conflict` | The drain is `parked` or `picked_up` — a cashu refund, which `melt-pending` settles |
+| `channel_bound_drain` | The reclaim settles through a payment channel, not by hand — its cooperative close owns the transition, and recording it here would take the row out of the reconciliation that would have settled it |
+| `invalid_drain_state` | The drain is not `pending` (already released, or a cashu row still awaiting its park) |
+| `admin_bad_signature` | The DVM's lock pubkey doesn't match the key derived from this mnemonic |
+| `dvm_url_unset` | No platform URL for this handle yet — pass `--endpoint` |
+
+---
+
+## set-payout
+
+Persist the default Lightning payout address for a DVM. `dvmctl melt-pending` reads this when no `--payout` flag is supplied. Pre-flights the LNURL-pay metadata endpoint by default to catch typos.
+
+```sh
+dvmctl set-payout my-dvm builder@example.com
+dvmctl set-payout my-dvm builder@example.com --skip-preflight
+dvmctl set-payout my-dvm builder@example.com --self-hosted
+```
+
+| Flag | Description |
+|---|---|
+| `--skip-preflight` | Skip the LNURL pre-flight check (use when the provider is temporarily down) |
+| `--self-hosted` | Target local state created by `dvmctl init --self-hosted`; cannot be combined with `--org` |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "status": "set",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "payout_ln_address": "builder@example.com"
+}
+```
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `dvm_not_initialized` | No `builder.json` entry for this handle |
+
+---
+
+## feedback send
+
+Send a note to the dvmkit team. This command submits the message; an invitation from another command does not send anything by itself. Keep credentials, source files, and environment values out of the message.
+
+```sh
+dvmctl feedback send "The deploy failed after the image upload" --trace <trace-id>
+dvmctl feedback send --body @feedback.txt --org my-org
+printf 'The setup step was unclear' | dvmctl feedback send --body @-
+```
+
+| Flag | Description |
+|---|---|
+| `--body <text\|@path\|@->` | Read the message from text, a file, or standard input instead of the positional text |
+| `--trace <id>` | Attach a related platform trace ID |
+| `--org <handle>` | Send in this org context, overriding `dvmctl switch` |
+| `--human` | Prose output |
+
+Messages must be 1–4,096 UTF-8 bytes. A builder can send 20 messages in a rolling 24-hour window across all orgs; the `rate_limited` error says when to retry. The platform keeps these notes for its operators. They do not appear in a DVM's caller-feedback list.
+
+The CLI adds bounded context when it can verify it: its version, the installed SDK version in a DVM project, the operating system, the Node version, and a related DVM ID. After a feedback invitation it may also add the command, error code, and invitation trigger. It does not attach your project files or environment values. Check the text you write before sending.
+
+**JSON output:**
+
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "created_at": "2026-09-29T12:00:00.000Z",
+  "display": "Sent to the dvmkit team.",
+  "hint": "Feedback was sent to the dvmkit team."
+}
+```
+
+**Error anchors:** `feedback_body_required` for a missing message, `feedback_body_conflict` for both positional text and `--body`, `feedback_body_invalid` for an empty or oversized message, and `rate_limited` after 20 submissions in 24 hours.
+
+---
+
+## feedback posture
+
+Show or set how your agent should handle feedback invitations. The default is `ask`: the agent proposes a note and gets your agreement before it runs [`feedback send`](#feedback-send). `auto` tells the agent it may send its own short note without asking. Neither setting makes `dvmctl` submit feedback automatically. `off` hides invitations; you can still send a note explicitly.
+
+```sh
+dvmctl feedback posture
+dvmctl feedback posture off
+dvmctl feedback posture ask
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{ "posture": "ask", "source": "default", "display": "Feedback posture: ask (default)." }
+```
+
+The CLI may invite feedback after a failed platform command, the first deploy of a DVM, or a check-in after 14 days. It limits failure invitations to one per 24 hours, first-deploy invitations to one per DVM, and check-ins to one per 14 days. A 24-hour cooldown also prevents a check-in soon after another invitation. CI runs show no invitations.
+
+---
+
+## feedback list
+
+List caller-submitted feedback for a DVM in your current org context, newest-first. Cursor-paginated.
+
+```sh
+dvmctl feedback list my-dvm
+dvmctl feedback list my-dvm --since 7d --limit 100
+dvmctl feedback list my-dvm --cursor <next_cursor>
+dvmctl feedback list my-dvm --org my-org
+```
+
+| Flag | Description |
+|---|---|
+| `--org <handle>` | Read as this org, overriding the `dvmctl switch` context |
+| `--verdict <up\|down>` | Filter by job verdict |
+| `--since <duration>` | Look-back window (`24h`, `7d`, or ISO 8601 timestamp) |
+| `--cursor <c>` | Opaque cursor from a prior page's `next_cursor` |
+| `--limit <n>` | Max rows per page (1–100, default 50) |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "feedback": [
+    {
+      "id": "b41e7a52-9d38-4f6b-a0c7-2e58d3f1c964",
+      "dvm_id": "dvm-my-dvm",
+      "slug": "my-dvm",
+      "owner_handle": "my-org",
+      "job_id": null,
+      "trace_id": null,
+      "caller_pubkey": "9b01215ba08abbd9c3048ea7bf233776043369dbd4b45abc6627c03111c85c0e",
+      "body": "Search ranks recency too low",
+      "created_at": "2026-05-27T12:00:00.000Z"
+    }
+  ],
+  "next_cursor": null,
+  "org": {
+    "id": "acffd753-105a-4958-9f37-243ac032f332",
+    "handle": "my-org",
+    "role": "admin",
+    "personal": false
+  }
+}
+```
+
+`verdict` is `up`, `down`, or `null` for note-only feedback. `tier` is `receipt_verified`, `claimed` (router claim without a receipt), or `null` for non-job notes. Accepted feedback and its revisions, including text, trace links and necessary attribution/proof, have no age-only purge. Personal-field purpose is reviewed annually. The platform response includes `submission_id` for the current revision and `is_current_ranking_vote` for the latest eligible vote. Restriction hides the affected contribution from these reads; erasure or permanent service removal deletes its proof.
+
+`caller_pubkey` is the x-only BIP-340 key from the caller's signed-request envelope (64 hex chars). Age alone does not clear this key or delete the row. `job_id`/`trace_id` are populated when the caller anchored their feedback to a specific job or trace, else `null`. Page forward by passing the returned `next_cursor` back via `--cursor`; `next_cursor` is `null` on the last page. `org` is the context the page was read from — see [`list`](#list).
+
+---
+
+Ordinary claimed job feedback returns `feedback_expired` after its 90-day collection limit while its retained record remains. Receipt-backed verdicts have no age-only collection limit. To change an existing verified verdict, the caller must include its stored original signed receipt. A claimed-only replacement returns `receipt_required` (409). A text-only edit leaves the verified verdict and proof unchanged.
+
+## feedback enable
+
+`--org <handle>` selects the owning org for this one command.
+
+Enable free-text feedback notes for one of your DVMs (default on creation). When enabled, callers can submit `dvm feedback --dvm <dvm-id>` rows; the platform stores them against your DVM for `dvmctl feedback list`.
+
+```sh
+dvmctl feedback enable my-dvm
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{ "dvm_id": "dvm-my-dvm", "dvmId": "550e8400-e29b-41d4-a716-446655440000", "slug": "my-dvm", "settings": { "feedback_enabled": true } }
+```
+
+---
+
+## feedback disable
+
+`--org <handle>` selects the owning org for this one command.
+
+Disable free-text feedback notes for one of your DVMs. Note-only submissions get a `feedback_disabled` error. Job verdicts remain enabled in both eligibility tiers; the platform records the verdict and drops its note.
+
+```sh
+dvmctl feedback disable my-dvm
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{ "dvm_id": "dvm-my-dvm", "dvmId": "550e8400-e29b-41d4-a716-446655440000", "slug": "my-dvm", "settings": { "feedback_enabled": false } }
+```
+
+---
+
+## trace get
+
+Fetch a forensic trace by ID. Traces capture cross-component spans (router → platform → SDK → payment rail) for a single request; useful when reconstructing a money-flow incident or debugging a specific job.
+
+```sh
+dvmctl trace get 4bf92f3577b34da6a3ce929d0e0e4736
+dvmctl trace get 4bf92f3577b34da6a3ce929d0e0e4736 --human
+dvmctl trace get 4bf92f3577b34da6a3ce929d0e0e4736 --human --no-color
+```
+
+| Flag | Description |
+|---|---|
+| `--org <handle>` | Read as this org, overriding the `dvmctl switch` context |
+| `--human` | Render as a waterfall instead of JSON |
+| `--no-color` | Disable ANSI colors in human output |
+
+Only isolate-dataset spans are visible, and only for DVMs in your current org context. Default JSON output is the raw span list; `--human` is the waterfall you'd read at a glance during an incident. A miss names the scope it searched (`No trace <id> in org "my-org"`), so a bad trace ID reads differently from the right ID under the wrong org.
+
+**JSON output:**
+
+```json
+{
+  "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+  "status": "ok",
+  "duration_ms": 842,
+  "started_at_ms": 1747785600000,
+  "ended_at_ms": 1747785600842,
+  "dimensions": { "dvm_id": "4bf92f3577b34da6a3ce929d0e0e4736", "dvm_slug": "my-dvm" },
+  "span_count": 1,
+  "truncated": false,
+  "spans": [
+    {
+      "span_id": "00f067aa0ba902b7",
+      "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "parent_span_id": null,
+      "name": "POST /v1/job",
+      "dataset": "isolate",
+      "level": "info",
+      "status": "ok",
+      "started_at_ms": 1747785600000,
+      "ended_at_ms": 1747785600842,
+      "duration_ms": 842,
+      "service": "dvmkit-platform",
+      "service_version": "0.1.0",
+      "host": "dvmkit-3f2b1c88-5a4d-4e6f-9b0a-7c1d2e3f4a5b",
+      "dimensions": { "dvm_id": "4bf92f3577b34da6a3ce929d0e0e4736", "dvm_slug": "my-dvm" },
+      "attributes": { "http.status_code": 200 },
+      "error_message": null,
+      "error_stack": null
+    }
+  ]
+}
+```
+
+A trace whose spans were capped adds `truncation_hint` (a string) alongside `truncated: true`; it is absent otherwise. This is the one payload that carries its own `trace_id` rather than the injected one.
+
+---
+
+## db connect
+
+`--org <handle>` selects the owning org for this one command.
+
+Open an interactive `psql` session against a DVM's per-DVM Postgres. Requires local `psql` on `PATH`. The platform brokers credentials through a chosen running machine — pass `--machine` to target a specific one.
+
+```sh
+dvmctl db connect my-dvm
+dvmctl db connect my-dvm --machine 1234abcd
+```
+
+| Flag | Description |
+|---|---|
+| `--machine <id>` | Broker through a specific Fly machine (default: first running machine) |
+| `--human` | Print connection status to stderr while `psql` runs |
+
+No JSON output — relays the interactive `psql` session to your terminal and exits with `psql`'s exit code.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `psql_not_found` | `psql` not installed locally |
+| `no_running_machine` | DVM has no running machine to broker through |
+
+---
+
+## db proxy
+
+`--org <handle>` selects the owning org for this one command.
+
+Bind a **local TCP port** to a DVM's per-DVM Postgres and hold it open until Ctrl-C, so any Postgres client can connect — `pg_dump`, drizzle-kit, Prisma, TablePlus, pgAdmin. Unlike [`db connect`](#db-connect) it needs no local `psql`, and unlike `fly proxy` it needs no Fly credential: the platform brokers the tunnel and enforces the same ownership gate.
+
+```sh
+dvmctl db proxy my-dvm
+dvmctl db proxy my-dvm --port 15433
+dvmctl db proxy my-dvm --human
+```
+
+| Flag | Description |
+|---|---|
+| `--port <n>` | Local port to bind (default: an OS-assigned free port) |
+| `--machine <id>` | Broker through a specific Fly machine (default: first running machine) |
+| `--human` | Human-readable output instead of JSON |
+
+**JSON output** (one line, then the command blocks until interrupted):
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "host": "127.0.0.1",
+  "port": 15433,
+  "user": "postgres",
+  "database": "my_dvm",
+  "database_url": "postgres://postgres:pw@127.0.0.1:15433/my_dvm?sslmode=disable",
+  "display": "Postgres proxy for my-dvm listening on 127.0.0.1:15433.",
+  "hint": "Point any Postgres client at database_url (psql, pg_dump, drizzle-kit, a GUI client). The proxy stays up until it is interrupted."
+}
+```
+
+Then, from another shell:
+
+```sh
+pg_dump "postgres://postgres:pw@127.0.0.1:15433/my_dvm?sslmode=disable" > backup.sql
+```
+
+`sslmode=disable` is required and already present in `database_url`: the hop to your loopback port is plaintext, while the leg to the platform is the encrypted WebSocket. In JSON output the password appears only inside `database_url` — never as its own field, and never in a log line or span. (`--human` does print it as a labelled field, since GUI clients ask for the parts separately.)
+
+If a client connection can't get a tunnel, the proxy stays up and reports it on stderr rather than dying — `{"event":"connection_error","code":"…","message":"…"}` in JSON mode, a `Connection failed:` line under `--human`.
+
+Two consequences of the platform relaying **one Postgres connection per tunnel**:
+
+- **Every client connection opens its own tunnel**, so concurrent clients (a GUI opening a pool) work — but each new connection pays one platform round-trip before the Postgres handshake begins.
+- **A tunnel is reaped after 60 minutes.** A long-lived pooled client will see that connection dropped and must reconnect; a fresh connection gets a fresh hour.
+
+**Error anchors:**
+
+| Code | Trigger |
+|---|---|
+| `invalid_port` | `--port` is not an integer in 1–65535 |
+| `local_listener_failed` | The local port is already in use (or otherwise unbindable) |
+| `no_running_machine` | DVM has no running machine to broker through |
+| `db_not_provisioned` | DVM has no managed Postgres |
+| `not_found` | Unknown slug, or you don't own the DVM |
+
+---
+
+## secrets list
+
+`--org <handle>` selects the owning org for this one command.
+
+List secret names and last-applied timestamps for a DVM. Never returns values; platform-injected keys are excluded.
+
+```sh
+dvmctl secrets list cast
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "cast",
+  "secrets": [
+    {
+      "name": "SPOTIFY_CLIENT_ID",
+      "last_applied_at": "2026-05-10T09:12:00Z",
+      "digest_hash": "31160254d1297393d2ad00e1c01851aec834361e02c524b89fe06aff2879ce6a"
+    }
+  ]
+}
+```
+
+`digest_hash` is the opaque digest the host reports for the secret, never the value itself — compare it across DVMs to tell whether they share a secret, but don't parse it (the format is the host's, not ours).
+
+---
+
+## transfer
+
+`--org <handle>` selects the source org for this one command.
+
+Transfer ownership of a DVM to an org (by handle) or back to personal. The new owner picks up the DVM's revenue ledger, payment-rail config, and `dvmctl env` access from this point forward.
+
+```sh
+dvmctl transfer my-dvm acme                     # transfer to existing org "acme"
+dvmctl transfer my-dvm acme --create-org \
+  --display-name "Acme Inc"                     # create the org first, then transfer
+dvmctl transfer my-dvm personal                 # transfer back to personal ownership
+```
+
+| Flag | Description |
+|---|---|
+| `--create-org` | Create the target org if it doesn't exist (`to` becomes the desired handle) |
+| `--display-name <name>` | Display name for the new org (with `--create-org`) |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "status": "transferred",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "to": "acme",
+  "org": { "id": "acffd753-105a-4958-9f37-243ac032f332", "handle": "acme" },
+  "treasuryRekeyPending": true
+}
+```
+
+`org` is present when transferring to an org (omitted when transferring back to `personal`). `treasuryRekeyPending` is `true` when the DVM's Cashu treasury must be re-keyed to the new owner before payouts resume.
+
+---
+
+## revenue summary
+
+Show revenue totals and a by-rail breakdown for a date range, for your current org context.
+
+```sh
+dvmctl revenue summary --from 2026-05-01 --to 2026-05-27
+dvmctl revenue summary --from 2026-05-01 --to 2026-05-27 --currency eur
+dvmctl revenue summary --from 2026-05-01 --to 2026-05-27 --org my-org
+```
+
+| Flag | Description |
+|---|---|
+| `--org <handle>` | Read as this org, overriding the `dvmctl switch` context |
+| `--from <date>` | Start date (`YYYY-MM-DD`, required) |
+| `--to <date>` | End date (`YYYY-MM-DD`, required) |
+| `--currency <c>` | Reporting currency (`gbp`, `eur`, `usd`, `chf`) |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "summary": {
+    "fiat_currency": "usd",
+    "period": { "from": "2026-05-01", "to": "2026-05-27" },
+    "by_source_type_rail": [
+      { "source_type": "job", "rail": "cashu", "gross_fiat_minor": 8010, "count": 240 },
+      { "source_type": "job", "rail": "lightning", "gross_fiat_minor": 4122, "count": 95 }
+    ],
+    "total_gross_fiat_minor": 14237,
+    "total_count": 372
+  },
+  "series": {
+    "monthly_by_rail": [],
+    "monthly_by_source_type": [],
+    "cumulative_net_by_date": []
+  },
+  "stale_fx_warnings": [],
+  "org": {
+    "id": "acffd753-105a-4958-9f37-243ac032f332",
+    "handle": "my-org",
+    "role": "admin",
+    "personal": false
+  }
+}
+```
+
+Aggregates need `member` role in a shared org; the raw [`revenue events`](#revenue-events) and [`revenue csv`](#revenue-csv) exports need `admin`. All amounts are integer minor units (`gross_fiat_minor: 14237` = $142.37). Revenue is bucketed by `source_type` + `rail` tuples, not a fixed rail map. `stale_fx_warnings` lists any FX conversions that used a stale rate, and `summary.cross_rate_note` — a string, **absent** from the payload rather than `null` when it doesn't apply — appears only when an amount had to be derived through a cross rate. The `series` arrays back the dashboard charts.
+
+---
+
+## revenue events
+
+List individual revenue events for your current org context, optionally filtered by rail and date range. Requires `admin` role in a shared org.
+
+```sh
+dvmctl revenue events
+dvmctl revenue events --from 2026-05-01 --to 2026-05-27 --rail cashu --limit 100
+dvmctl revenue events --org my-org
+```
+
+| Flag | Description |
+|---|---|
+| `--org <handle>` | Read as this org, overriding the `dvmctl switch` context |
+| `--from <date>` | Start date (`YYYY-MM-DD`) |
+| `--to <date>` | End date (`YYYY-MM-DD`) |
+| `--rail <r>` | Filter by payment rail (`cashu`, `lightning`, `tempo`, `x402`) |
+| `--limit <n>` | Max events to return (default 50) |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "events": [
+    {
+      "date": "2026-05-15",
+      "source_type": "job",
+      "rail": "cashu",
+      "dvm_slug": "my-dvm",
+      "line_description": "Job completion",
+      "fiat_amount_minor": 100,
+      "fiat_currency": "usd",
+      "net_fiat_minor": 100
+    }
+  ],
+  "total": 50,
+  "org": {
+    "id": "acffd753-105a-4958-9f37-243ac032f332",
+    "handle": "my-org",
+    "role": "admin",
+    "personal": false
+  }
+}
+```
+
+Amounts are integer minor units, which round each event on its own: a $0.003 job shows `0`. Each event also carries `fiat_amount_micro`, `processor_fee_fiat_micro`, and `net_fiat_micro` in millionths, and those are the fields to add up. It carries the same `valued_by`, `credit_amount_micro`, `credit_currency`, `credit_fx_rate`, `fx_rate_currency`, and `cross_fx_rate` fields as a [`revenue csv`](#revenue-csv) row, with `credit_amount_micro` `null` on an event that is not a credit draw. `total` is the number of events returned (capped by `--limit`). `org` is the context the events were read from — see [`list`](#list).
+
+---
+
+## revenue csv
+
+Export revenue events for your current org context as CSV. Useful for spreadsheets, accounting, or downstream reporting tools. Requires `admin` role in a shared org.
+
+```sh
+dvmctl revenue csv --from 2026-05-01 --to 2026-05-27
+dvmctl revenue csv --from 2026-05-01 --to 2026-05-27 --rail cashu --out cashu-may.csv
+dvmctl revenue csv --from 2026-05-01 --to 2026-05-27 --org my-org
+```
+
+| Flag | Description |
+|---|---|
+| `--org <handle>` | Read as this org, overriding the `dvmctl switch` context |
+| `--from <date>` | Start date (`YYYY-MM-DD`, required) |
+| `--to <date>` | End date (`YYYY-MM-DD`, required) |
+| `--currency <c>` | Reporting currency (`gbp`, `eur`, `usd`, `chf`) |
+| `--rail <r>` | Filter by payment rail |
+| `--out <path>` | Write CSV to file instead of stdout |
+
+Output is raw CSV (no JSON envelope) so the `--out` flag and shell redirection both work cleanly. The `fiat_amount_micro`, `processor_fee_fiat_micro`, and `net_fiat_micro` columns repeat each row's amounts in millionths; sum those rather than the minor-unit columns, which round every row on its own. The summary rows at the bottom already do. The org the export was scoped to is printed to stderr as `Org: <handle>` (or `Org: personal`) and echoed on the response's `X-Org` header — stdout stays pure CSV, and an empty export still says which org it was empty for.
+
+Each row's `valued_by` column says how its amount was reached. A `native_at_rate` row was priced from its `native_amount` at that day's exchange rate. A `credit_obligation` row is a draw on a prepaid credit, and it counts the credit it used, not the payment that funded the credit. Its native columns still show that payment, so they won't add up to its amount. Instead `credit_amount_micro` (millionths of `credit_currency`) times `credit_fx_rate`, rounded to a whole millionth, is its `fiat_amount_micro`. The three credit columns are empty on every other row.
+
+A row's `fx_rate` is the rate stored when the payment landed, and it prices the native asset in `fx_rate_currency`, the currency the platform keeps its books in. That can differ from the export's `fiat_currency`, so `cross_fx_rate` is the number of `fiat_currency` units per unit of `fx_rate_currency` on `fx_rate_snapshot_date`, and it is `1` when the two match. For a `native_at_rate` row, `native_amount / 10^native_decimals × fx_rate × 1,000,000 × cross_fx_rate`, rounded to a whole number, is its `fiat_amount_micro`.
+
+---
+
+## api-keys list
+
+List your builder API keys. Each key carries an `id`, `label`, `key_prefix`, `created_at`, and `last_used_at`. Secrets are write-only — they're returned exactly once at creation; this listing surfaces metadata only.
+
+```sh
+dvmctl api-keys list
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "keys": [
+    {
+      "id": "ak_0e4220d396ef48c8",
+      "label": "ci-runner",
+      "key_prefix": "dvmk_9f8",
+      "created_at": 1746057600000,
+      "last_used_at": 1748347200000
+    }
+  ],
+  "count": 1,
+  "limit": 10
+}
+```
+
+`created_at`/`last_used_at` are epoch-millisecond numbers (`last_used_at` is `null` if never used); `--human` renders them as dates. `count` is the number of keys returned, `limit` your plan's per-account key cap.
+
+---
+
+## api-keys create
+
+Create a new builder API key. The secret is returned exactly once in the response — store it immediately; you can't recover it later. To rotate, create a new key, swap your CI / scripts, then `revoke` the old one.
+
+```sh
+dvmctl api-keys create
+dvmctl api-keys create --label ci-runner
+```
+
+| Flag | Description |
+|---|---|
+| `--label <text>` | Optional label to identify the key in `dvmctl api-keys list` |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "id": "ak_0e4220d396ef48c8",
+  "label": "ci-runner",
+  "key": "dvmk_9f86d081884c7d659a2feaa0c55ad015",
+  "created_at": 1748347200000
+}
+```
+
+The `key` field is the full secret and is **never** returned again. Treat the response object as do-not-log material. `created_at` is an epoch-millisecond number.
+
+---
+
+## api-keys revoke
+
+Revoke (delete) an API key by ID. Any further request using the revoked secret returns `auth_required`. Irreversible.
+
+```sh
+dvmctl api-keys revoke ak_0e4220d396ef48c8
+```
+
+| Flag | Description |
+|---|---|
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{ "deleted": true, "id": "ak_0e4220d396ef48c8" }
+```

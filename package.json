@@ -1,0 +1,85 @@
+{
+  "name": "@dvmkit/dvmctl",
+  "version": "0.5.0-rc.5",
+  "description": "Build and deploy Digital Vending Machines: pay-per-use HTTPS services that AI agents can find, pay, and call with no account or API key",
+  "author": "DVM Technologies Ltd",
+  "homepage": "https://dvmkit.com/docs/cli-dvmctl",
+  "bugs": "https://github.com/dvmkit/dvmctl/issues",
+  "keywords": [
+    "dvm",
+    "digital-vending-machine",
+    "dvmkit",
+    "cli",
+    "ai-agents",
+    "agent-skill",
+    "agent-payments",
+    "pay-per-use",
+    "x402",
+    "cashu",
+    "lightning"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dvmkit/dvmctl.git"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "type": "module",
+  "bin": {
+    "dvmctl": "dist/dvmctl.js"
+  },
+  "files": [
+    "dist",
+    "skills",
+    "LICENSE",
+    "NOTICE",
+    "README.md"
+  ],
+  "exports": {
+    "./skill": "./skills/build-dvm/SKILL.md"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "node scripts/check-source-boundary.mjs && node scripts/check-bundled-skills.mjs && tsup --metafile && node scripts/check-bundled-notices.mjs",
+    "lint": "eslint . --max-warnings 0",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run test:source && npm run test:package",
+    "verify": "node scripts/public-safety.mjs && npm run build && npm run lint && npm run typecheck && npm test",
+    "test:source": "vitest run",
+    "test:package": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@dvmkit/sdk": "0.7.0-rc.7"
+  },
+  "optionalDependencies": {
+    "pg": "8.20.0",
+    "tsx": "^4"
+  },
+  "devDependencies": {
+    "@cashu/cashu-ts": "4.10.2",
+    "@scure/bip39": "2.0.1",
+    "commander": "^14",
+    "mppx": "0.8.15",
+    "proper-lockfile": "4.1.2",
+    "viem": "2.55.11",
+    "ws": "8.21.0",
+    "@types/node": "25.3.4",
+    "@types/pg": "8.18.0",
+    "@types/proper-lockfile": "4.1.4",
+    "@types/ws": "8.18.1",
+    "pg": "8.20.0",
+    "tsup": "8.5.1",
+    "tsx": "4.21.0",
+    "typescript": "5.9.3",
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.0.2",
+    "globals": "^17.7.0",
+    "typescript-eslint": "^8.56.1",
+    "vitest": "5.0.2"
+  }
+}

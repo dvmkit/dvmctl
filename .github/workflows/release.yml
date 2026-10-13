@@ -1,0 +1,263 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing signed vX.Y.Z or vX.Y.Z-rc.N tag to verify or recover without publishing
+        required: true
+        type: string
+      github_release_recovery:
+        description: Create or verify notes and labels only after the exact registry artifact exists
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    permissions:
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      dist-tag: ${{ steps.release.outputs.dist-tag }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: release
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="${REF_NAME}"; test "$EVENT_NAME" = workflow_dispatch && tag="$INPUT_TAG"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]] || { echo "only stable and RC tags are publishable" >&2; exit 1; }
+          git show-ref --verify --quiet "refs/tags/$tag"
+          git config gpg.format ssh
+          git config gpg.ssh.allowedSignersFile "$GITHUB_WORKSPACE/.github/release-signers"
+          git verify-tag "$tag"
+          commit="$(git rev-parse "$tag^{commit}")"
+          git checkout --detach "$commit"
+          git merge-base --is-ancestor "$commit" origin/master
+          version="$(node -e 'console.log(require("./package.json").version)')"
+          test "$tag" = "v$version"
+          channel="$(node scripts/release-channel.mjs "$version")"
+          gh api "repos/$REPOSITORY/commits/$commit/pulls" --jq '[.[] | select(.merged_at != null and .base.ref == "master" and .merge_commit_sha == "'"$commit"'" and any(.labels[]?; .name == "autorelease: pending" or .name == "autorelease: tagged"))] | if length == 1 then .[0].number else error("expected one merged release PR") end'
+          test "$(node -e 'console.log(require("./.release-please-manifest.json")["."])')" = "$version"
+          printf 'commit=%s\ntag=%s\nversion=%s\ndist-tag=%s\n' "$commit" "$tag" "$version" "$channel" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.commit }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.23.2
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm run build && npm run lint && npm run typecheck && npm test
+      - run: npx --no-install tsc --strict --allowJs --checkJs --noEmit --target es2022 --module nodenext --moduleResolution nodenext scripts/*.mjs
+      - run: node scripts/public-safety.mjs
+      - name: Pack twice and bind immutable release artifact
+        shell: bash
+        env:
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DIST_TAG: ${{ needs.prepare.outputs.dist-tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/first" "$RUNNER_TEMP/second" "$RUNNER_TEMP/output"
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP/first" > "$RUNNER_TEMP/first/pack.json"
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP/second" > "$RUNNER_TEMP/second/pack.json"
+          first="$RUNNER_TEMP/first/$(node -e 'console.log(require(process.argv[1])[0].filename)' "$RUNNER_TEMP/first/pack.json")"
+          second="$RUNNER_TEMP/second/$(node -e 'console.log(require(process.argv[1])[0].filename)' "$RUNNER_TEMP/second/pack.json")"
+          node scripts/release-artifact.mjs create --first "$first" --second "$second" --output "$RUNNER_TEMP/output/release-digest.json" --tag "$TAG" --version "$VERSION" --dist-tag "$DIST_TAG" --commit "$COMMIT"
+          cp "$first" "$RUNNER_TEMP/output/"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dvmctl-release-${{ needs.prepare.outputs.tag }}
+          path: ${{ runner.temp }}/output
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [prepare, build, smoke]
+    runs-on: ubuntu-latest
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.commit }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.23.2
+          package-manager-cache: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: dvmctl-release-${{ needs.prepare.outputs.tag }}
+          path: ${{ runner.temp }}/release
+      - name: Verify same-run archive before trusted publishing
+        shell: bash
+        env:
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DIST_TAG: ${{ needs.prepare.outputs.dist-tag }}
+        run: node scripts/release-artifact.mjs verify --directory "$RUNNER_TEMP/release" --tag "$TAG" --version "$VERSION" --dist-tag "$DIST_TAG" --commit "$COMMIT" > "$RUNNER_TEMP/archive-path"
+      - name: Publish exact reviewed archive or recover an exact existing publication
+        shell: bash
+        env:
+          DIST_TAG: ${{ needs.prepare.outputs.dist-tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          REPOSITORY: ${{ github.repository }}
+        run: node scripts/pinned-publish-npm.mjs node scripts/publish-release.mjs --archive "$(cat "$RUNNER_TEMP/archive-path")" --dist-tag "$DIST_TAG" --repository "$REPOSITORY" --tag "$TAG" --commit "$COMMIT"
+
+  smoke:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: dvmctl_smoke
+          POSTGRES_USER: dvmctl_smoke
+          POSTGRES_PASSWORD: dvmctl_smoke
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready --username dvmctl_smoke --dbname dvmctl_smoke"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.commit }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: dvmctl-release-${{ needs.prepare.outputs.tag }}
+          path: ${{ runner.temp }}/release
+      - name: Install the reviewed pre-publish archive in a clean no-OIDC consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(find "$RUNNER_TEMP/release" -name '*.tgz' -type f -print -quit)"
+          mkdir "$RUNNER_TEMP/consumer" && cd "$RUNNER_TEMP/consumer"
+          npm init --yes
+          npm install --ignore-scripts --no-audit --no-fund "$archive" "@dvmkit/sdk@$(node "$GITHUB_WORKSPACE/scripts/sdk-version.mjs")"
+          DATABASE_URL=postgresql://dvmctl_smoke:dvmctl_smoke@localhost:5432/dvmctl_smoke node "$GITHUB_WORKSPACE/scripts/consumer-smoke.mjs" "$PWD/node_modules/@dvmkit/dvmctl/dist/dvmctl.js" --full
+
+  registry-smoke:
+    needs: [prepare, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: dvmctl_smoke
+          POSTGRES_USER: dvmctl_smoke
+          POSTGRES_PASSWORD: dvmctl_smoke
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready --username dvmctl_smoke --dbname dvmctl_smoke"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.commit }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Install exact registry version
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DIST_TAG: ${{ needs.prepare.outputs.dist-tag }}
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/consumer" && cd "$RUNNER_TEMP/consumer"
+          npm init --yes
+          node "$GITHUB_WORKSPACE/scripts/install-published-release.mjs" --version "$VERSION" --prefix "$PWD"
+          DATABASE_URL=postgresql://dvmctl_smoke:dvmctl_smoke@localhost:5432/dvmctl_smoke node "$GITHUB_WORKSPACE/scripts/consumer-smoke.mjs" "$PWD/node_modules/@dvmkit/dvmctl/dist/dvmctl.js" --full
+
+  github-release:
+    if: >-
+      always() && ((github.event_name == 'push' && needs.registry-smoke.result == 'success') ||
+      (github.event_name == 'workflow_dispatch' && inputs.github_release_recovery == true && needs.prepare.result == 'success' && needs.build.result == 'success'))
+    needs: [prepare, build, publish, registry-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.commit }}
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.23.2
+          package-manager-cache: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: dvmctl-release-${{ needs.prepare.outputs.tag }}
+          path: ${{ runner.temp }}/release
+      - name: Require an exact registry artifact before recovering notes or labels
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DIST_TAG: ${{ needs.prepare.outputs.dist-tag }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          COMMIT: ${{ needs.prepare.outputs.commit }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          archive="$(find "$RUNNER_TEMP/release" -name '*.tgz' -type f -print -quit)"
+          test -n "$archive"
+          node scripts/pinned-publish-npm.mjs node scripts/verify-published-release.mjs --archive "$archive" --dist-tag "$DIST_TAG" --repository "$REPOSITORY" --tag "$TAG" --commit "$COMMIT"
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          args=(--repo "$REPOSITORY" --verify-tag --generate-notes)
+          [[ "$TAG" == *-rc.* ]] && args+=(--prerelease)
+          gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" "${args[@]}"
+          pr="$(gh api "repos/$REPOSITORY/commits/$TAG/pulls" --jq '[.[] | select(.merged_at != null and any(.labels[]?; .name == "autorelease: pending" or .name == "autorelease: tagged"))] | if length == 1 then .[0].number else error("expected one merged release PR") end')"
+          gh api --method POST "repos/$REPOSITORY/issues/$pr/labels" --raw-field 'labels[]=autorelease: tagged' --silent
+          gh api --method DELETE "repos/$REPOSITORY/issues/$pr/labels/autorelease%3A%20pending" --silent || true
