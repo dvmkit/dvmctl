@@ -8,7 +8,7 @@ import { describe, expect, it } from "vitest";
 const script = resolve(import.meta.dirname, "../../../scripts/check-commit-identity.mjs");
 const approved = "265668992+aioli3@users.noreply.github.com";
 const privateEmail = "person@example.com";
-const builderReleaseAutomation = "326342320+dvmkit-dvmctl-release-automation[bot]@users.noreply.github.com";
+const retiredReleaseAutomation = "326342320+dvmkit-dvmctl-release-automation[bot]@users.noreply.github.com";
 const releaseAutomation = "319907686+dvmkit-release-automation[bot]@users.noreply.github.com";
 
 function repository() {
@@ -47,19 +47,28 @@ describe("public commit identity", () => {
     expect(repo.check(head).stdout).toContain("3 commits");
   }));
 
-  it("accepts the builder release bot as author and committer", () => withRepository((repo) => {
-    const release = repo.commit([repo.base], builderReleaseAutomation, "noreply@github.com");
-    const head = repo.commit([release], approved, builderReleaseAutomation);
+  it("accepts the shared release bot as author and committer", () => withRepository((repo) => {
+    const release = repo.commit([repo.base], releaseAutomation, "noreply@github.com");
+    const head = repo.commit([release], approved, releaseAutomation);
     const result = repo.check(head);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain("2 commits");
   }));
 
+  it.each(["author", "committer"])("rejects the retired release bot as %s", (role) => withRepository((repo) => {
+    const head = repo.commit([repo.base], role === "author" ? retiredReleaseAutomation : approved,
+      role === "committer" ? retiredReleaseAutomation : releaseAutomation);
+    const result = repo.check(head);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(`unapproved ${role} on ${head}`);
+    expect(result.stderr).not.toContain(retiredReleaseAutomation);
+  }));
+
   it.each([
-    "326342321+dvmkit-dvmctl-release-automation[bot]@users.noreply.github.com",
-    "326342320+dvmkit-release-automation[bot]@users.noreply.github.com",
-    "326342320+dvmkit-dvmctl-release-automation[bot]@users.noreply.github.com.example.com",
-  ])("rejects a near-match to the builder release bot: %s", (email) => withRepository((repo) => {
+    "319907687+dvmkit-release-automation[bot]@users.noreply.github.com",
+    "319907686+dvmkit-dvmctl-release-automation[bot]@users.noreply.github.com",
+    "319907686+dvmkit-release-automation[bot]@users.noreply.github.com.example.com",
+  ])("rejects a near-match to the shared release bot: %s", (email) => withRepository((repo) => {
     const head = repo.commit([repo.base], email);
     const result = repo.check(head);
     expect(result.status).toBe(1);
