@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.8.0](https://github.com/dvmkit/dvmctl/compare/v0.8.0...v0.8.0) (2026-10-14)
+
+
+### Bug Fixes
+
+* **release:** retain the prepared pull request identity ([3b5f3d4](https://github.com/dvmkit/dvmctl/commit/3b5f3d43a243e0ed33ca18e0bddd8e01adb1eac3))
+* verify notices with linked dependencies ([a638f2b](https://github.com/dvmkit/dvmctl/commit/a638f2bfd2bab9c7ea974e0dac8b99fbb6899089))
+
+
+### Miscellaneous Chores
+
+* configure the first stable release ([#1](https://github.com/dvmkit/dvmctl/issues/1)) ([d9787d2](https://github.com/dvmkit/dvmctl/commit/d9787d26cba495b2be57771d696b0f6e9c49db0c))
+
+
+### Tests
+
+* verify dev subprocesses against fresh CLI builds ([#6](https://github.com/dvmkit/dvmctl/issues/6)) ([d1fd26d](https://github.com/dvmkit/dvmctl/commit/d1fd26d19c0af26da49524e27010a5def42b6b57))
+* wait for a recorded worker before asserting cleanup ([a0e7b8b](https://github.com/dvmkit/dvmctl/commit/a0e7b8babe8d1998c0d114fe0070c662aeb0f2fa))
+
+
+### Build System
+
+* **deps:** admit sdk 0.8.0 ([130e99b](https://github.com/dvmkit/dvmctl/commit/130e99b74b28df0317584eaa743051426bf97f04))
+
 ## 0.8.0 (2026-10-14)
 
 This is the first release on npm's `latest` channel from this new repository. dvmctl remains a pre-1.0 alpha.
