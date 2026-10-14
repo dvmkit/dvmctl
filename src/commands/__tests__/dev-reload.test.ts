@@ -1,18 +1,18 @@
 import type * as NodeFs from "node:fs";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
   watch,
   writeFileSync,
 } from "node:fs";
-import { createRequire } from "node:module";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -29,15 +29,8 @@ vi.mock("node:fs", async (importOriginal) => {
   return { ...actual, watch: vi.fn(actual.watch) };
 });
 
-// The real CLI entry under tsx, so each instance runs the same worker path an
-// installed `dvmctl dev` spawns. tsx is resolved here because a bare `--import`
-// resolves from the worker's cwd, which one test moves into the tmp project.
-const CLI = [
-  process.execPath,
-  "--import",
-  pathToFileURL(createRequire(__filename).resolve("tsx")).href,
-  resolve(__dirname, "../../cli/dvmctl.ts"),
-];
+// Keep the session and watcher assertions against source while exercising shipped workers.
+const CLI = [process.execPath, resolve(__dirname, "../../../dist/dvmctl.js")];
 
 const suiteCwd = process.cwd();
 let project: string;
@@ -69,11 +62,36 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  await session?.close();
+  await closeDev();
   process.chdir(suiteCwd);
   vi.restoreAllMocks();
   rmSync(project, { recursive: true, force: true });
 });
+
+it("collects a worker abandoned during initial boot before a session is returned", async () => {
+  const ready = join(project, "boot.pid");
+  writeFileSync(
+    join(project, "handler.ts"),
+    `import { writeFileSync } from "node:fs";
+    export default { config: { name: "Blocked boot", tags: ["text"],
+      async onBoot() { writeFileSync(${JSON.stringify(ready)}, String(process.pid)); await new Promise(() => {}); },
+      onJob() {} } };`
+  );
+  const startup = start(0).then(() => null, (error: unknown) => error);
+  let workerPid: number | undefined;
+  try {
+    await waitFor(() => existsSync(ready));
+    workerPid = Number(readFileSync(ready, "utf8"));
+    expect(session).toBeNull();
+    await closeDev();
+    expect(alive(workerPid)).toBe(false);
+    await expect(startup).resolves.toBeInstanceOf(Error);
+  } finally {
+    // A failed regression assertion must not itself abandon the blocked worker.
+    if (workerPid && alive(workerPid)) process.kill(workerPid, "SIGKILL");
+    await startup;
+  }
+}, 30_000);
 
 describe("dvmctl dev reload", () => {
   it("serves an edited helper after a reload triggered only by the helper", async () => {
@@ -267,6 +285,42 @@ describe("dvmctl dev reload watcher", () => {
     }
   }, 30_000);
 });
+
+async function closeDev(): Promise<void> {
+  try {
+    await session?.close();
+  } finally {
+    // Starting events arrive before initial boot resolves and before session is assigned.
+    await Promise.all(startedPids().map(collectWorker));
+  }
+}
+
+async function collectWorker(pid: number): Promise<void> {
+  if (!Number.isSafeInteger(pid) || pid <= 0 || !alive(pid)) return;
+  signalWorker(pid, "SIGTERM");
+  if (await workerExited(pid, 1_000)) return;
+  signalWorker(pid, "SIGKILL");
+  if (!(await workerExited(pid, 1_000))) {
+    throw new Error(`owned dev worker ${String(pid)} did not stop`);
+  }
+}
+
+function signalWorker(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(pid, signal);
+  } catch (error) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ESRCH")) throw error;
+  }
+}
+
+async function workerExited(pid: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (alive(pid)) {
+    if (Date.now() >= deadline) return false;
+    await delay(20);
+  }
+  return true;
+}
 
 async function start(port: number): Promise<void> {
   session = await startReloadingSession({

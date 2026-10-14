@@ -1,20 +1,28 @@
-import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { spawn, type ChildProcess } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-// The real CLI under tsx, so the error reaches the same boundary an installed
-// `dvmctl dev` prints through.
-const CLI = [
-  "--import",
-  pathToFileURL(createRequire(__filename).resolve("tsx")).href,
-  resolve(__dirname, "../../cli/dvmctl.ts"),
-];
+import {
+  observeProcess,
+  stopProcess,
+  waitForProcessClose,
+} from "../../../scripts/consumer-process.mjs";
+
+const CLI = [resolve(__dirname, "../../../dist/dvmctl.js")];
+const children = new Set<ChildProcess>();
+const collections = new WeakMap<ChildProcess, Promise<void>>();
 
 let project: string;
 
@@ -33,9 +41,70 @@ beforeEach(() => {
   );
 });
 
-afterEach(() => {
+afterEach(async () => {
+  await collectOwnedChildren();
   rmSync(project, { recursive: true, force: true });
 });
+
+async function collectOwnedChildren(): Promise<void> {
+  await Promise.all([...children].map(collectChild));
+}
+
+function ownChild(child: ChildProcess): void {
+  observeProcess(child);
+  children.add(child);
+}
+
+function collectChild(child: ChildProcess): Promise<void> {
+  const existing = collections.get(child);
+  if (existing) return existing;
+  const collecting = (async () => {
+    // Retain ownership after the leader exits: its worker may still hold pipes or a port.
+    if (!(await stopProcess(child)) || !(await waitForProcessClose(child, 1_000))) {
+      throw new Error(`dev process tree ${String(child.pid)} did not stop`);
+    }
+    children.delete(child);
+  })();
+  collections.set(child, collecting);
+  return collecting;
+}
+
+it.each([
+  { name: "abandoned leader", exitLeader: false },
+  ...(process.platform === "win32" ? [] : [{ name: "worker after leader exit", exitLeader: true }]),
+])("collects an owned $name", async ({ exitLeader }) => {
+  const ready = join(project, "worker.pid");
+  const workerCode = `process.on("SIGTERM", () => {});
+    require("node:fs").writeFileSync(process.argv[1], String(process.pid));
+    setInterval(() => {}, 1_000);`;
+  const leaderCode = `const child = require("node:child_process").spawn(process.execPath,
+    ["-e", ${JSON.stringify(workerCode)}, ${JSON.stringify(ready)}], { stdio: "ignore" });
+    ${exitLeader ? "child.unref();" : "setInterval(() => {}, 1_000);"}`;
+  const child = spawn(process.execPath, ["-e", leaderCode], {
+    detached: process.platform !== "win32",
+    stdio: "ignore",
+  });
+  ownChild(child);
+  let workerPid: number | undefined;
+  try {
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(ready)) {
+      if (Date.now() >= deadline) throw new Error("owned worker did not start");
+      await new Promise((done) => setTimeout(done, 20));
+    }
+    workerPid = Number(readFileSync(ready, "utf8"));
+    if (exitLeader) expect(await waitForProcessClose(child, 1_000)).toBe(true);
+    await collectOwnedChildren();
+    expect(() => process.kill(workerPid!, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    expect(() => process.kill(child.pid!, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+  } finally {
+    // The failure control must not itself abandon the deliberately stubborn worker.
+    await collectChild(child);
+    if (workerPid) {
+      try { process.kill(workerPid, "SIGKILL"); } catch { /* Already collected. */ }
+    }
+  }
+}, 15_000);
 
 const modes = [
   { name: "reload", flags: [] },
@@ -221,21 +290,25 @@ function dev(flags: readonly string[], port = "0", nodeArgs: readonly string[] =
   return new Promise((done, fail) => {
     const child = spawn(process.execPath, [...nodeArgs, ...CLI, "dev", "handler.ts", "--port", port, ...flags], {
       cwd: project,
+      detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     });
+    ownChild(child);
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk: Buffer) => (stdout += chunk.toString()));
     child.stderr.on("data", (chunk: Buffer) => (stderr += chunk.toString()));
     child.once("error", fail);
     child.once("exit", (code) => {
-      let error: DevRun["error"];
-      try {
-        error = (JSON.parse(stdout) as { error?: DevRun["error"] }).error;
-      } catch {
-        error = undefined;
-      }
-      done({ code, stdout, stderr, error });
+      void collectChild(child).then(() => {
+        let error: DevRun["error"];
+        try {
+          error = (JSON.parse(stdout) as { error?: DevRun["error"] }).error;
+        } catch {
+          error = undefined;
+        }
+        done({ code, stdout, stderr, error });
+      }, fail);
     });
   });
 }
@@ -244,13 +317,14 @@ function devUntilStarted(flags: readonly string[]): Promise<string> {
   return new Promise((done, fail) => {
     const child = spawn(process.execPath, [...CLI, "dev", "handler.ts", "--port", "0", ...flags], {
       cwd: project,
+      detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     });
+    ownChild(child);
     let stdout = "";
     let stderr = "";
     let started = false;
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
       fail(new Error(`dev did not finish starting: ${stdout}\n${stderr}`));
     }, 20_000);
     child.stdout.on("data", (chunk: Buffer) => {
@@ -267,8 +341,10 @@ function devUntilStarted(flags: readonly string[]): Promise<string> {
     });
     child.once("exit", (code) => {
       clearTimeout(timer);
-      if (started) done(stdout);
-      else fail(new Error(`dev exited before startup (${String(code)}): ${stdout}\n${stderr}`));
+      void collectChild(child).then(() => {
+        if (started) done(stdout);
+        else fail(new Error(`dev exited before startup (${String(code)}): ${stdout}\n${stderr}`));
+      }, fail);
     });
   });
 }
