@@ -80,8 +80,13 @@ it("collects a worker abandoned during initial boot before a session is returned
   const startup = start(0).then(() => null, (error: unknown) => error);
   let workerPid: number | undefined;
   try {
-    await waitFor(() => existsSync(ready));
+    await waitFor(() => {
+      if (!existsSync(ready)) return false;
+      const pid = Number(readFileSync(ready, "utf8"));
+      return Number.isSafeInteger(pid) && pid > 0 && startedPids().includes(pid);
+    });
     workerPid = Number(readFileSync(ready, "utf8"));
+    expect(startedPids()).toContain(workerPid);
     expect(session).toBeNull();
     await closeDev();
     expect(alive(workerPid)).toBe(false);
