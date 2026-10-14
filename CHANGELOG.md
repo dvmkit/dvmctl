@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/dvmkit/dvmctl/compare/v0.8.0...v0.8.0) (2026-10-14)
+
+
+### Miscellaneous Chores
+
+* configure the first stable release ([fb66494](https://github.com/dvmkit/dvmctl/commit/fb664945c946aa125b6f9f57fb89515346f6dc87))
+
 ## 0.8.0 (2026-10-14)
 
 This is the first release on npm's `latest` channel from this new repository. dvmctl remains a pre-1.0 alpha.
