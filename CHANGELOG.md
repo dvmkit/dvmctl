@@ -1,6 +1,12 @@
 # Changelog
 
-## [0.8.0](https://github.com/dvmkit/dvmctl/compare/v0.5.0-rc.5...v0.8.0) (2026-10-14)
+## 0.8.0 (2026-10-14)
+
+This is the first release on npm's `latest` channel from this new repository. dvmctl remains a pre-1.0 alpha.
+
+The CLI uses the exact registry dependency `@dvmkit/sdk` `0.8.0`, and newly created projects declare the same SDK version. Existing projects keep their declared SDK dependency until you update it.
+
+Upgrade the globally installed CLI with `npm update --global @dvmkit/dvmctl`, then copy the complete bundled `build-dvm` skill directory again using the [README instructions](https://github.com/dvmkit/dvmctl#for-agents).
 
 
 ### Bug Fixes
