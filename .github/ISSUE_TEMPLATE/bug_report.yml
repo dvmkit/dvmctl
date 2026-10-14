@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a reproducible dvmctl CLI defect.
+title: "Bug: "
+labels: [bug]
+body:
+  - type: input
+    id: cli-version
+    attributes:
+      label: CLI version
+      description: Output of `dvmctl --version`.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and Node.js version
+      description: Include architecture and `node --version`.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command and minimal reproduction
+      description: Use synthetic values. Do not include credentials or real payment data.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety checks
+      options:
+        - label: I removed credentials, wallet material, real payment data, and customer data.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true

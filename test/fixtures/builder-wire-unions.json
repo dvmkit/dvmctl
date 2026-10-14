@@ -1,0 +1,38 @@
+{
+  "DeployStatus": [
+    "building",
+    "deployed",
+    "failed",
+    "pending",
+    "recovering",
+    "release_accepted",
+    "superseded"
+  ],
+  "DvmStatus": [
+    "created",
+    "deploy_failed",
+    "deployed",
+    "deploying",
+    "destroyed",
+    "suspended"
+  ],
+  "DvmRuntime": [
+    "container",
+    "isolate"
+  ],
+  "DomainStatus": [
+    "failed",
+    "pending",
+    "revoked",
+    "verified"
+  ],
+  "SuspensionReason": [
+    "admin_org_suspend",
+    "behaviour",
+    "builder_pause",
+    "dvm_limit",
+    "free_tier_idle",
+    "request_limit",
+    "withdrawn"
+  ]
+}

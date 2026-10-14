@@ -1,0 +1,28 @@
+name: Close unsolicited pull requests
+
+on:
+  pull_request_target:
+    # Reopening lets a maintainer accept an invited pull request the automation cannot recognise.
+    types: [opened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  close:
+    if: >-
+      github.event.pull_request.head.repo.full_name != github.repository
+      && github.event.pull_request.user.type != 'Bot'
+      && !contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Comment and close without executing pull request content
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          gh pr comment "$NUMBER" --repo "$REPOSITORY" --body "This repository closes all unsolicited pull requests, including typo and documentation changes. Please file a reproducible bug issue, start a feature discussion, or report a suspected vulnerability privately through SECURITY.md. Maintainer and release-bot branches are not affected."
+          gh pr close "$NUMBER" --repo "$REPOSITORY"

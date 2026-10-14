@@ -1,0 +1,127 @@
+name: Verify
+
+on:
+  pull_request: {}
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  build:
+    name: build and package (Node 22.23.2)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # Outside-fork PRs use their submitted head; other events retain the default checkout.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.event.pull_request.head.sha || '' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify outside-fork head checkout
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 22.23.2
+          package-manager-cache: false
+      - run: npm ci
+      - run: npm run build
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: node scripts/public-safety.mjs
+      - name: Check release scripts with strict JavaScript checking
+        run: npx --no-install tsc --strict --allowJs --checkJs --noEmit --target es2022 --module nodenext --moduleResolution nodenext scripts/*.mjs
+      - name: Check the packed file shape and deterministic archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/first" "$RUNNER_TEMP/second" "$RUNNER_TEMP/output"
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP/first" > "$RUNNER_TEMP/first/pack.json"
+          npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP/second" > "$RUNNER_TEMP/second/pack.json"
+          first="$RUNNER_TEMP/first/$(node -e 'console.log(require(process.argv[1])[0].filename)' "$RUNNER_TEMP/first/pack.json")"
+          second="$RUNNER_TEMP/second/$(node -e 'console.log(require(process.argv[1])[0].filename)' "$RUNNER_TEMP/second/pack.json")"
+          commit="$(git rev-parse HEAD)"
+          version="$(node -e 'console.log(require("./package.json").version)')"
+          node scripts/release-artifact.mjs create --first "$first" --second "$second" --output "$RUNNER_TEMP/output/release-digest.json" --tag "v$version" --version "$version" --dist-tag "$(node scripts/release-channel.mjs "$version")" --commit "$commit"
+          cp "$first" "$RUNNER_TEMP/output/"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: dvmctl-package-${{ github.sha }}
+          path: ${{ runner.temp }}/output
+          if-no-files-found: error
+          retention-days: 1
+
+  runtime-matrix:
+    name: installed CLI (Node ${{ matrix.node }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # A macOS minute bills at ten Linux minutes and a Windows minute at two,
+        # and this matrix ran all three platforms on every pull request revision.
+        # Pull requests now take the Linux column only; the master push and a
+        # manual dispatch still run every platform, so a platform-only break is
+        # caught minutes after merge instead of paid for on each revision.
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-latest"]' || '["ubuntu-latest", "macos-latest", "windows-latest"]') }}
+        node: ["22.0.0", "22", "24", "26"]
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && github.event.pull_request.head.sha || '' }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify outside-fork head checkout
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        shell: bash
+        env:
+          EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_HEAD_SHA"
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: dvmctl-package-${{ github.sha }}
+          path: ${{ runner.temp }}/release
+      - name: Install exactly the reviewed archive without lifecycle hooks
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/engine-matrix.mjs
+          archive="$(find "$RUNNER_TEMP/release" -name '*.tgz' -type f -print -quit)"
+          test -n "$archive"
+          mkdir "$RUNNER_TEMP/consumer"
+          cd "$RUNNER_TEMP/consumer"
+          npm init --yes
+          npm install --ignore-scripts --no-audit --no-fund "$archive" "@dvmkit/sdk@$(node "$GITHUB_WORKSPACE/scripts/sdk-version.mjs")"
+      - name: Run installed CLI smoke fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/consumer-smoke.mjs "$RUNNER_TEMP/consumer/node_modules/@dvmkit/dvmctl/dist/dvmctl.js"
+
+  verify:
+    name: verify
+    if: always()
+    needs: [build, runtime-matrix]
+    runs-on: ubuntu-latest
+    steps:
+      - run: test '${{ needs.build.result }}' = success && test '${{ needs.runtime-matrix.result }}' = success
