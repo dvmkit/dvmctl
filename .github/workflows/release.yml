@@ -29,6 +29,7 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
       dist-tag: ${{ steps.release.outputs.dist-tag }}
+      pr-number: ${{ steps.release.outputs.pr-number }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -56,9 +57,10 @@ jobs:
           version="$(node -e 'console.log(require("./package.json").version)')"
           test "$tag" = "v$version"
           channel="$(node scripts/release-channel.mjs "$version")"
-          gh api "repos/$REPOSITORY/commits/$commit/pulls" --jq '[.[] | select(.merged_at != null and .base.ref == "master" and .merge_commit_sha == "'"$commit"'" and any(.labels[]?; .name == "autorelease: pending" or .name == "autorelease: tagged"))] | if length == 1 then .[0].number else error("expected one merged release PR") end'
+          pr="$(gh api "repos/$REPOSITORY/commits/$commit/pulls" --jq '[.[] | select(.merged_at != null and .base.ref == "master" and .merge_commit_sha == "'"$commit"'" and any(.labels[]?; .name == "autorelease: pending" or .name == "autorelease: tagged"))] | if length == 1 then .[0].number else error("expected one merged release PR") end')"
+          [[ "$pr" =~ ^[1-9][0-9]*$ ]] || { echo "invalid prepared release PR number" >&2; exit 1; }
           test "$(node -e 'console.log(require("./.release-please-manifest.json")["."])')" = "$version"
-          printf 'commit=%s\ntag=%s\nversion=%s\ndist-tag=%s\n' "$commit" "$tag" "$version" "$channel" >> "$GITHUB_OUTPUT"
+          printf 'commit=%s\ntag=%s\nversion=%s\ndist-tag=%s\npr-number=%s\n' "$commit" "$tag" "$version" "$channel" "$pr" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -252,12 +254,13 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.prepare.outputs.tag }}
+          PR_NUMBER: ${{ needs.prepare.outputs.pr-number }}
           REPOSITORY: ${{ github.repository }}
         run: |
           set -euo pipefail
+          [[ "${PR_NUMBER:-}" =~ ^[1-9][0-9]*$ ]] || { echo "invalid prepared release PR number" >&2; exit 1; }
           args=(--repo "$REPOSITORY" --verify-tag --generate-notes)
           [[ "$TAG" == *-rc.* ]] && args+=(--prerelease)
           gh release view "$TAG" --repo "$REPOSITORY" >/dev/null 2>&1 || gh release create "$TAG" "${args[@]}"
-          pr="$(gh api "repos/$REPOSITORY/commits/$TAG/pulls" --jq '[.[] | select(.merged_at != null and any(.labels[]?; .name == "autorelease: pending" or .name == "autorelease: tagged"))] | if length == 1 then .[0].number else error("expected one merged release PR") end')"
-          gh api --method POST "repos/$REPOSITORY/issues/$pr/labels" --raw-field 'labels[]=autorelease: tagged' --silent
-          gh api --method DELETE "repos/$REPOSITORY/issues/$pr/labels/autorelease%3A%20pending" --silent || true
+          gh api --method POST "repos/$REPOSITORY/issues/$PR_NUMBER/labels" --raw-field 'labels[]=autorelease: tagged' --silent
+          gh api --method DELETE "repos/$REPOSITORY/issues/$PR_NUMBER/labels/autorelease%3A%20pending" --silent || true
