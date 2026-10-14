@@ -50,6 +50,7 @@
     "typecheck": "tsc --noEmit",
     "test": "npm run test:source && npm run test:package",
     "verify": "node scripts/public-safety.mjs && npm run build && npm run lint && npm run typecheck && npm test",
+    "pretest:source": "npm run build",
     "test:source": "vitest run",
     "test:package": "node --test test/*.test.mjs"
   },
