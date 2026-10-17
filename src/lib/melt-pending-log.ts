@@ -43,6 +43,25 @@ export interface PostMeltEntry {
 }
 
 /**
+ * An operator's statement that an unresolved melt is known to be stuck. It
+ * changes nothing about the pre-melt it names: the rows stay held and recovery
+ * keeps checking the quote. It only stops the in-flight alarm failing the run.
+ *
+ * The quote is named in `acknowledged_quote_id`, never `quote_id`. Releases
+ * before this entry existed treat every non-`pre_melt` line carrying a
+ * matching `quote_id` as the pair's resolution, which would release the held
+ * rows to a fresh melt and stop recovering the quote. Without `quote_id` those
+ * readers match it to no pre-melt and keep alarming instead.
+ */
+export interface MeltAcknowledgedEntry {
+  kind: "melt_acknowledged";
+  ts: number;
+  dvm_id: string;
+  acknowledged_quote_id: string;
+  reason: string;
+}
+
+/**
  * Union of records that appear in `~/.dvmkit/melt-pending.log`.
  *
  * The JSONL file is an append-only recovery and audit journal. This module
@@ -50,7 +69,7 @@ export interface PostMeltEntry {
  * arbitrary restart gaps, and retention is an operator policy rather than a
  * safe inference the writer can make.
  */
-export type MeltPendingEntry = PreMeltEntry | PostMeltEntry;
+export type MeltPendingEntry = PreMeltEntry | PostMeltEntry | MeltAcknowledgedEntry;
 
 /**
  * An in-flight melt — a pre-melt record without a matching post-melt. The
@@ -65,7 +84,15 @@ export interface InFlightMelt {
   quoteId: string;
   lockPubkey: string;
   totalSats: number;
+  /** Latest operator acknowledgement for this quote, when one was recorded. */
+  acknowledged?: { ts: number; reason: string };
 }
+
+/** What the journal knows about one quote — see {@link lookupMeltQuote}. */
+export type MeltQuoteLookup =
+  | { state: "unknown" }
+  | { state: "resolved" }
+  | { state: "in_flight"; entry: InFlightMelt };
 
 /**
  * Append a pre-melt entry to the JSONL log at `~/.dvmkit/melt-pending.log`.
@@ -82,6 +109,26 @@ export function appendPostMelt(entry: Omit<PostMeltEntry, "kind" | "ts">): void 
 }
 
 /**
+ * Append an acknowledgement for one unresolved quote. The caller validates the
+ * quote against {@link lookupMeltQuote} first; this only writes the record.
+ */
+export function appendAcknowledgement(
+  entry: Omit<MeltAcknowledgedEntry, "kind" | "ts">
+): MeltAcknowledgedEntry {
+  const record: MeltAcknowledgedEntry = { ...entry, kind: "melt_acknowledged", ts: Date.now() };
+  appendEntry(record);
+  return record;
+}
+
+/** Classify one quote as never journalled, resolved, or still in flight for `dvmId`. */
+export function lookupMeltQuote(dvmId: string, quoteId: string): MeltQuoteLookup {
+  const journal = scanJournal(dvmId);
+  if (!journal.pre.has(quoteId)) return { state: "unknown" };
+  if (journal.done.has(quoteId)) return { state: "resolved" };
+  return { state: "in_flight", entry: toInFlight(journal, quoteId) };
+}
+
+/**
  * Scan the log and return entries with a `pre_melt` record but no matching
  * `post_melt`. Pairs are matched on `(dvm_id, quote_id)`. Scoped to `dvmId`
  * so a multi-DVM operator running `melt-pending` per DVM only sees the
@@ -90,10 +137,30 @@ export function appendPostMelt(entry: Omit<PostMeltEntry, "kind" | "ts">): void 
  * removed from the audit trail.
  */
 export function readInFlight(dvmId: string): InFlightMelt[] {
-  if (!existsSync(MELT_PENDING_LOG_FILE)) return [];
+  const journal = scanJournal(dvmId);
+  const out: InFlightMelt[] = [];
+  for (const quoteId of journal.pre.keys()) {
+    if (journal.done.has(quoteId)) continue;
+    out.push(toInFlight(journal, quoteId));
+  }
+  return out;
+}
+
+interface ScannedJournal {
+  pre: Map<string, PreMeltEntry>;
+  done: Set<string>;
+  acknowledged: Map<string, MeltAcknowledgedEntry>;
+}
+
+/**
+ * One DVM's journal keyed by quote. Only a `post_melt` resolves a pair: an
+ * unknown `kind` written by a newer release is ignored, which keeps its quote
+ * held rather than releasing rows that may still be paying out.
+ */
+function scanJournal(dvmId: string): ScannedJournal {
+  const journal: ScannedJournal = { pre: new Map(), done: new Set(), acknowledged: new Map() };
+  if (!existsSync(MELT_PENDING_LOG_FILE)) return journal;
   const raw = readFileSync(MELT_PENDING_LOG_FILE, "utf-8");
-  const pre = new Map<string, PreMeltEntry>();
-  const done = new Set<string>();
   for (const line of raw.split("\n")) {
     if (!line) continue;
     let entry: MeltPendingEntry;
@@ -103,27 +170,28 @@ export function readInFlight(dvmId: string): InFlightMelt[] {
       continue;
     }
     if (entry.dvm_id !== dvmId) continue;
-    const key = `${entry.dvm_id}|${entry.quote_id}`;
-    if (entry.kind === "pre_melt") {
-      pre.set(key, entry);
-    } else {
-      done.add(key);
+    if (entry.kind === "pre_melt") journal.pre.set(entry.quote_id, entry);
+    else if (entry.kind === "post_melt") journal.done.add(entry.quote_id);
+    else if (entry.kind === "melt_acknowledged") {
+      journal.acknowledged.set(entry.acknowledged_quote_id, entry);
     }
   }
-  const out: InFlightMelt[] = [];
-  for (const [key, entry] of pre) {
-    if (done.has(key)) continue;
-    out.push({
-      ts: entry.ts,
-      dvmId: entry.dvm_id,
-      rowIds: entry.row_ids,
-      mintUrl: entry.mint_url,
-      quoteId: entry.quote_id,
-      lockPubkey: entry.lock_pubkey,
-      totalSats: entry.total_sats,
-    });
-  }
-  return out;
+  return journal;
+}
+
+function toInFlight(journal: ScannedJournal, quoteId: string): InFlightMelt {
+  const entry = journal.pre.get(quoteId) as PreMeltEntry;
+  const ack = journal.acknowledged.get(quoteId);
+  return {
+    ts: entry.ts,
+    dvmId: entry.dvm_id,
+    rowIds: entry.row_ids,
+    mintUrl: entry.mint_url,
+    quoteId: entry.quote_id,
+    lockPubkey: entry.lock_pubkey,
+    totalSats: entry.total_sats,
+    ...(ack ? { acknowledged: { ts: ack.ts, reason: ack.reason } } : {}),
+  };
 }
 
 /** Append one record without rewriting, rotating, or pruning earlier history. */

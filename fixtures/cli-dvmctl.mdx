@@ -1742,6 +1742,7 @@ dvmctl melt-pending my-dvm --watch --interval 120
 dvmctl melt-pending my-dvm --endpoint http://localhost:3000
 dvmctl melt-pending my-dvm --drains-only
 dvmctl melt-pending my-dvm --refund-nwc 'nostr+walletconnect://…'
+dvmctl melt-pending my-dvm --acknowledge-stuck <quote-id> --reason "mint support ticket open"
 ```
 
 | Flag | Description |
@@ -1755,6 +1756,8 @@ dvmctl melt-pending my-dvm --refund-nwc 'nostr+walletconnect://…'
 | `--hold-alarm-after <duration>` | How long this DVM's drain surface may stay unreadable before a one-shot sweep exits non-zero instead of holding the melt again (default: `24h`; e.g. `6h`, `2d`). Nothing melts and no refund parks while it is held, so this is the ceiling on a silent stall |
 | `--refund-nwc <uri>` | Send-capable NWC connection used to buy a caller's refund when no accumulator batch covers it (env: `DVMKIT_REFUND_NWC_URL`). Keep it separate from the receive-only connection your DVM funds credit over, and hold it here rather than on the DVM |
 | `--payout-nwc <uri>` | Mint the payout invoice from this NWC wallet instead of resolving `--payout` over LNURL (env: `DVMKIT_MELT_PAYOUT_NWC_URL`). Use when the melt destination is a node with no Lightning address of its own |
+| `--acknowledge-stuck <quote-id>` | Record that this in-flight melt quote is stuck at the mint, then exit without melting. Only a quote past the 24h in-flight alarm qualifies. Requires `--reason`; cannot be combined with `--watch` or `--drains-only` |
+| `--reason <text>` | Why the acknowledged quote is stuck (for example, a mint support ticket). Kept in the melt journal and logged on every later sweep |
 | `--human` | Prose output |
 
 **JSON output — one-shot (and each tick in `--watch` mode):**
@@ -1783,7 +1786,9 @@ dvmctl melt-pending my-dvm --refund-nwc 'nostr+walletconnect://…'
   "drain_state_known": true,
   "drain_state_unknown_since": null,
   "melt_held": false,
-  "melt_skipped": null
+  "melt_skipped": null,
+  "acknowledged_melts": 0,
+  "acknowledged_sats": 0
 }
 ```
 
@@ -1800,6 +1805,38 @@ Read `drain_state_known` before any of them. It is false when the tick could not
 `melt_skipped` says the batch sweep never ran because you told it not to — `"drains_only"` under `--drains-only`, `null` otherwise. Read it before you read the batch counters: zero `batches_melted` alongside `"drains_only"` is the flag doing its job, not a stuck payout, and `batches_seen` is zero because nothing was even fetched.
 
 A one-shot `--drains-only` run exits non-zero unless it settled everything it owes, since settling is the whole point of the mode: `drain_state_unknown` when it never got to read the drain list, and `drains_unsettled` when `drains_failed`, `drains_manual` or `drains_queued` is non-zero — each has its own way out, and the hint names the one you hit. `drains_channel` is counted but never alarms: a channel-backed reclaim is settled by its own close on the caller's next poll, so there is nothing for you to do about one. Cron it and let the exit code speak. A plain sweep is deliberately not symmetric: there, an unsettled refund holds the melt back and retries on the next tick, and failing the daily melter over it would page you about a healthy DVM.
+
+**Acknowledging a stuck melt:**
+
+Every melt is journalled in `~/.dvmkit/melt-pending.log` before it is submitted. While the mint reports a submitted quote as `PENDING`, its rows are held out of new melts so the same ecash is never offered for a second payment, and each sweep asks the mint about the quote again. Once that melt has been in flight for 24 hours, the sweep logs `melt_pending_batch_in_flight` with a `hint` and exits `batches_failed`.
+
+When the mint will not resolve the quote, and you have already taken it up with the mint, acknowledge it so the daily run stops failing on it and can report new failures again:
+
+```sh
+dvmctl melt-pending my-dvm --acknowledge-stuck <quote-id> --reason "mint support ticket open"
+```
+
+This appends one entry to the journal and exits. Nothing melts, and no mint or DVM admin call is made. It does not write anything off. The rows stay held, and every later sweep still checks the quote: `PAID` with a preimage marks the rows melted, and `UNPAID` releases them to a fresh melt. Until then the sweep logs `melt_pending_batch_acknowledged` (with `quote_id`, `age_ms` and your `reason`) in place of the alarm, and counts the melt in `acknowledged_melts` and `acknowledged_sats`, so held money stays visible in the summary. The acknowledgement only covers the mint answering `PENDING`: if a sweep cannot reach the mint, gets `PAID` without a preimage, or cannot hand the preimage to the DVM, the alarm returns and the run fails, because sats may have left without the rows being marked melted. Acknowledging again replaces the logged reason. Run it on the host that runs the sweep, because the journal is local.
+
+Releases from before this flag ignore the acknowledgement and keep alarming on that quote. They never release its rows.
+
+**JSON output — `--acknowledge-stuck`:**
+
+```json
+{
+  "acknowledged": true,
+  "dvm_id": "550e8400-e29b-41d4-a716-446655440000",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "quote_id": "q-7f3a",
+  "mint_url": "https://mint.example",
+  "row_ids": ["row-1", "row-2"],
+  "total_sats": 1200,
+  "age_ms": 190800000,
+  "reason": "mint support ticket open",
+  "acknowledged_at": "2026-05-16T05:00:00.000Z"
+}
+```
 
 A plain sweep does exit non-zero on the two things that will not fix themselves. `admin_bad_signature` — the DVM advertises a lock pubkey your mnemonic cannot derive, so every admin call it makes is rejected; retrying that forever is what a hold would otherwise do. And `drain_state_unknown_sustained` — the drain surface has been unreadable for longer than `--hold-alarm-after`, so the hold has stopped being a pause. A refund merely waiting on accumulation still exits 0 for as long as it takes: that DVM is working as designed.
 
@@ -1819,6 +1856,11 @@ A plain sweep does exit non-zero on the two things that will not fix themselves.
 | `drain_state_unknown_sustained` | The drain surface has been unreadable for longer than `--hold-alarm-after`, so the melt hold is a standstill rather than a pause (one-shot plain sweep only) |
 | `invalid_duration` | `--hold-alarm-after` is not one count and one unit (e.g. `6h`, `2d`) |
 | `dvm_url_unset` | DVM has no platform URL yet |
+| `acknowledge_reason_required` | `--acknowledge-stuck` or `--reason` was passed without the other, or with an empty value |
+| `acknowledge_conflicting_flags` | `--acknowledge-stuck` was combined with `--watch` or `--drains-only` |
+| `melt_quote_not_found` | No melt for that quote is journalled for this DVM on this machine |
+| `melt_quote_resolved` | The melt for that quote is already resolved, so there is nothing to acknowledge |
+| `melt_quote_too_young` | The melt has been in flight for less than 24 hours |
 
 ---
 

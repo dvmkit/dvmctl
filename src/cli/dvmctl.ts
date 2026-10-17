@@ -817,6 +817,14 @@ export function buildProgram(): Command {
       "--payout-nwc <uri>",
       "Mint the payout invoice from this NWC wallet instead of resolving --payout over LNURL (env: DVMKIT_MELT_PAYOUT_NWC_URL). Use when the melt destination is a node with no Lightning address of its own"
     )
+    .option(
+      "--acknowledge-stuck <quote-id>",
+      "Record that this in-flight melt quote is stuck at the mint, then exit without melting. Only a quote past the 24h in-flight alarm qualifies. Its rows stay held and later sweeps keep checking the quote, but it no longer fails the run. Requires --reason"
+    )
+    .option(
+      "--reason <text>",
+      "Why the quote passed to --acknowledge-stuck is stuck (e.g. a mint support ticket); kept in the melt journal and logged on every sweep"
+    )
     .option("--human", "Human-readable output instead of JSON")
     .action((handle: string, opts: MeltPendingOptions) => {
       catchErrors(() => meltPending(handle, opts), opts.human);

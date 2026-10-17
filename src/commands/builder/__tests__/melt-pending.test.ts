@@ -62,6 +62,8 @@ vi.mock("@dvmkit/sdk/internal", async (importOriginal) => ({
 vi.mock("../../../lib/melt-pending-log", () => ({
   appendPreMelt: vi.fn(),
   appendPostMelt: vi.fn(),
+  appendAcknowledgement: vi.fn((entry: object) => ({ ...entry, kind: "melt_acknowledged", ts: 0 })),
+  lookupMeltQuote: vi.fn(() => ({ state: "unknown" })),
   readInFlight: vi.fn(() => []),
 }));
 
@@ -287,6 +289,7 @@ describe("dvmctl melt-pending", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(meltLog.readInFlight).mockReturnValue([]);
+    vi.mocked(meltLog.lookupMeltQuote).mockReturnValue({ state: "unknown" });
     // `clearMocks` clears calls, not queued return values — a seeded park log
     // would otherwise recover into every test declared after it.
     vi.mocked(drainParkLog.readUnparked).mockReturnValue([]);
@@ -1427,6 +1430,243 @@ describe("dvmctl melt-pending", () => {
     });
     // No misleading `batches_failed: 1` summary surfaces.
     expect(output.json).not.toHaveBeenCalled();
+  });
+
+  describe("--acknowledge-stuck", () => {
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const BATCH: AdminBatch = {
+      mint_url: "https://mint",
+      lock_pubkey: PUBKEY,
+      row_ids: ["r1"],
+      proofs: [{ id: "k", amount: 60, secret: "s", C: "c" }],
+      total_sats: 60,
+      t_expire: null,
+    };
+    function stuck(ageMs: number, acknowledged = true) {
+      return {
+        ts: Date.now() - ageMs,
+        dvmId: "dvm-fixture-1",
+        rowIds: ["r1"],
+        mintUrl: "https://mint",
+        quoteId: "q1",
+        lockPubkey: PUBKEY,
+        totalSats: 60,
+        ...(acknowledged ? { acknowledged: { ts: Date.now() - 1000, reason: "mint ticket open" } } : {}),
+      };
+    }
+    function loggedLevels(spy: { mock: { calls: unknown[][] } }): string[] {
+      return spy.mock.calls.map(([line]) => (JSON.parse(String(line)) as { level: string }).level);
+    }
+
+    it("holds an acknowledged stale melt without failing the run or re-melting its rows", async () => {
+      const { getPendingBatches } = setHappyPath();
+      getPendingBatches.mockResolvedValue({ batches: [BATCH] });
+      vi.mocked(meltLog.readInFlight).mockReturnValue([stuck(3 * DAY_MS)]);
+      vi.mocked(melt.checkMeltQuoteState).mockResolvedValue({ state: "PENDING" } as never);
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+
+      expect(melt.checkMeltQuoteState).toHaveBeenCalledWith("https://mint", "q1");
+      expect(melt.fetchMeltQuote).not.toHaveBeenCalled();
+      expect(wallet.getWallet).not.toHaveBeenCalled();
+      expect(loggedLevels(log)).toContain("melt_pending_batch_acknowledged");
+      expect(loggedLevels(log)).not.toContain("melt_pending_batch_in_flight");
+      const ackLine = log.mock.calls
+        .map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+        .find((line) => line.level === "melt_pending_batch_acknowledged");
+      expect(ackLine).toMatchObject({ quote_id: "q1", reason: "mint ticket open" });
+      expect(ackLine?.age_ms).toBeGreaterThanOrEqual(3 * DAY_MS);
+      expect(vi.mocked(output.json).mock.calls[0][0]).toMatchObject({
+        batches_failed: 0,
+        acknowledged_melts: 1,
+        acknowledged_sats: 60,
+      });
+      expect(meltSuccessState.recordMeltSuccess).toHaveBeenCalled();
+    });
+
+    it("still fails the run for an unacknowledged melt past the alarm beside an acknowledged one", async () => {
+      const { getPendingBatches } = setHappyPath();
+      getPendingBatches.mockResolvedValue({
+        batches: [BATCH, { ...BATCH, row_ids: ["r2"], proofs: [{ id: "k", amount: 60, secret: "s2", C: "c" }] }],
+      });
+      vi.mocked(meltLog.readInFlight).mockReturnValue([
+        stuck(3 * DAY_MS),
+        { ...stuck(2 * DAY_MS, false), rowIds: ["r2"], quoteId: "q2" },
+      ]);
+      vi.mocked(melt.checkMeltQuoteState).mockResolvedValue({ state: "PENDING" } as never);
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+
+      await expect(meltPending("dvm", { endpoint: "https://dvm.example" })).rejects.toMatchObject({
+        code: "batches_failed",
+      });
+      expect(melt.fetchMeltQuote).not.toHaveBeenCalled();
+    });
+
+    it("keeps alarming on an acknowledged quote the mint paid while mark-melted keeps failing", async () => {
+      const { getPendingBatches, markMelted } = setHappyPath();
+      getPendingBatches.mockResolvedValue({ batches: [BATCH] });
+      markMelted.mockRejectedValue(new Error("DVM unreachable"));
+      vi.mocked(meltLog.readInFlight).mockReturnValue([stuck(3 * DAY_MS)]);
+      vi.mocked(melt.checkMeltQuoteState).mockResolvedValue({
+        state: "PAID",
+        payment_preimage: "pre123",
+      } as never);
+      const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+      await expect(meltPending("dvm", { endpoint: "https://dvm.example" })).rejects.toMatchObject({
+        code: "batches_failed",
+      });
+      expect(loggedLevels(log)).not.toContain("melt_pending_batch_acknowledged");
+      expect(melt.fetchMeltQuote).not.toHaveBeenCalled();
+      expect(vi.mocked(output.json).mock.calls[0][0]).toMatchObject({ acknowledged_melts: 0 });
+    });
+
+    it("keeps alarming on an acknowledged quote once the mint stops answering", async () => {
+      const { getPendingBatches } = setHappyPath();
+      getPendingBatches.mockResolvedValue({ batches: [BATCH] });
+      vi.mocked(meltLog.readInFlight).mockReturnValue([stuck(3 * DAY_MS)]);
+      vi.mocked(melt.checkMeltQuoteState).mockRejectedValue(new Error("mint unreachable"));
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+      await expect(meltPending("dvm", { endpoint: "https://dvm.example" })).rejects.toMatchObject({
+        code: "batches_failed",
+      });
+      expect(melt.fetchMeltQuote).not.toHaveBeenCalled();
+    });
+
+    it("recovers an acknowledged quote the mint later reports PAID", async () => {
+      const { getPendingBatches, markMelted } = setHappyPath();
+      getPendingBatches.mockResolvedValue({ batches: [] });
+      markMelted.mockResolvedValue({ melted: 1 });
+      vi.mocked(meltLog.readInFlight).mockReturnValue([stuck(3 * DAY_MS)]);
+      vi.mocked(melt.checkMeltQuoteState).mockResolvedValue({
+        state: "PAID",
+        payment_preimage: "pre123",
+      } as never);
+
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+
+      expect(markMelted).toHaveBeenCalledWith({
+        row_ids: ["r1"],
+        melt_quote_id: "q1",
+        payment_preimage: "pre123",
+      });
+      expect(vi.mocked(output.json).mock.calls[0][0]).toMatchObject({
+        recovered: 1,
+        acknowledged_melts: 0,
+        acknowledged_sats: 0,
+      });
+    });
+
+    it("abandons an acknowledged quote the mint later reports UNPAID and melts its rows afresh", async () => {
+      const { getPendingBatches, markMelted } = setHappyPath();
+      getPendingBatches.mockResolvedValue({ batches: [BATCH] });
+      markMelted.mockResolvedValue({ melted: 1 });
+      vi.mocked(meltLog.readInFlight).mockReturnValue([stuck(3 * DAY_MS)]);
+      vi.mocked(melt.checkMeltQuoteState).mockResolvedValue({
+        state: "UNPAID",
+        payment_preimage: null,
+      } as never);
+      vi.mocked(lnurl.fetchLnurlPayInvoice).mockResolvedValue("lnbc...");
+      vi.mocked(melt.fetchMeltQuote).mockResolvedValue({
+        amountSats: 60,
+        feeReserveSats: 0,
+        rawQuote: { quote: "q-new" } as never,
+      });
+      vi.mocked(wallet.getWallet).mockResolvedValue({
+        meltProofsBolt11: vi.fn().mockResolvedValue({
+          quote: { state: "PAID", payment_preimage: "fresh" },
+          change: [],
+        }),
+      } as never);
+
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+
+      expect(meltLog.appendPostMelt).toHaveBeenCalledWith(
+        expect.objectContaining({ quote_id: "q1", status: "failed", error: "ln_unpaid_on_recovery" })
+      );
+      expect(markMelted).toHaveBeenCalledExactlyOnceWith({
+        row_ids: ["r1"],
+        melt_quote_id: "q-new",
+        payment_preimage: "fresh",
+      });
+      expect(vi.mocked(output.json).mock.calls[0][0]).toMatchObject({
+        batches_melted: 1,
+        acknowledged_melts: 0,
+      });
+    });
+
+    it("appends an acknowledgement for a stale in-flight quote without sweeping", async () => {
+      const { getPendingBatches } = setHappyPath();
+      vi.mocked(meltLog.lookupMeltQuote).mockReturnValue({
+        state: "in_flight",
+        entry: stuck(2 * DAY_MS, false),
+      });
+
+      await meltPending("dvm", {
+        endpoint: "https://dvm.example",
+        acknowledgeStuck: "q1",
+        reason: "  mint ticket open  ",
+      });
+
+      expect(meltLog.lookupMeltQuote).toHaveBeenCalledWith("dvm-fixture-1", "q1");
+      expect(meltLog.appendAcknowledgement).toHaveBeenCalledExactlyOnceWith({
+        dvm_id: "dvm-fixture-1",
+        acknowledged_quote_id: "q1",
+        reason: "mint ticket open",
+      });
+      expect(output.json).toHaveBeenCalledWith(
+        expect.objectContaining({ acknowledged: true, quote_id: "q1", total_sats: 60 })
+      );
+      expect(clientCtorSpy).not.toHaveBeenCalled();
+      expect(getPendingBatches).not.toHaveBeenCalled();
+      expect(melt.checkMeltQuoteState).not.toHaveBeenCalled();
+      expect(meltSuccessState.recordMeltSuccess).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ["an unknown quote", { state: "unknown" }, "melt_quote_not_found"],
+      ["a resolved quote", { state: "resolved" }, "melt_quote_resolved"],
+      [
+        "a quote younger than the alarm window",
+        { state: "in_flight", entry: stuck(DAY_MS - 60_000, false) },
+        "melt_quote_too_young",
+      ],
+    ] as const)("refuses to acknowledge %s and leaves the journal alone", async (_label, found, code) => {
+      setHappyPath();
+      vi.mocked(meltLog.lookupMeltQuote).mockReturnValue(found as never);
+
+      await expect(
+        meltPending("dvm", { endpoint: "https://dvm.example", acknowledgeStuck: "q1", reason: "stuck" })
+      ).rejects.toMatchObject({ code, hint: expect.stringMatching(/\S/) });
+      expect(meltLog.appendAcknowledgement).not.toHaveBeenCalled();
+    });
+
+    it("refuses an acknowledgement combined with --watch before reading the journal", async () => {
+      setHappyPath();
+      await expect(
+        meltPending("dvm", {
+          endpoint: "https://dvm.example",
+          acknowledgeStuck: "q1",
+          reason: "stuck",
+          watch: true,
+        })
+      ).rejects.toMatchObject({ code: "acknowledge_conflicting_flags" });
+      expect(meltLog.lookupMeltQuote).not.toHaveBeenCalled();
+      expect(meltLog.appendAcknowledgement).not.toHaveBeenCalled();
+    });
+
+    it("refuses an acknowledgement without a reason before reading the journal", async () => {
+      setHappyPath();
+      await expect(
+        meltPending("dvm", { endpoint: "https://dvm.example", acknowledgeStuck: "q1", reason: "  " })
+      ).rejects.toMatchObject({ code: "acknowledge_reason_required" });
+      expect(meltLog.lookupMeltQuote).not.toHaveBeenCalled();
+      expect(meltLog.appendAcknowledgement).not.toHaveBeenCalled();
+    });
   });
 
   /**
