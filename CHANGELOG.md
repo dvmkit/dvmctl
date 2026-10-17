@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.9.0](https://github.com/dvmkit/dvmctl/compare/v0.8.0...v0.9.0) (2026-10-17)
+
+
+### Features
+
+* let melt-pending acknowledge a stuck melt quote ([#14](https://github.com/dvmkit/dvmctl/issues/14)) ([af60e26](https://github.com/dvmkit/dvmctl/commit/af60e263c48dc2be8f25beda37445d02eed9594c))
+
+
+### Bug Fixes
+
+* adapt payout melts to mint proof limits ([12cfd34](https://github.com/dvmkit/dvmctl/commit/12cfd34aec51e249075a2184b86503e46ede49db))
+* decouple serve receipt attestation from Cashu recovery ([1032e82](https://github.com/dvmkit/dvmctl/commit/1032e82f1678e2533904bfc296b599139af4374b))
+
 ## 0.8.0 (2026-10-14)
 
 This is the first release on npm's `latest` channel from this new repository. dvmctl remains a pre-1.0 alpha.
