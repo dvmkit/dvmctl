@@ -1,7 +1,9 @@
 import type * as SdkInternal from "@dvmkit/sdk/internal";
+import { MintOperationError } from "@cashu/cashu-ts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type * as adminCashuClientModule from "../../../lib/admin-cashu-client";
+import type { AdminBatch } from "../../../lib/admin-cashu-client";
 import type * as drainHoldStateModule from "../../../lib/drain-hold-state";
 
 vi.mock("../../../lib/builder-mnemonic", () => ({
@@ -294,6 +296,222 @@ describe("dvmctl melt-pending", () => {
 
   afterEach(() => {
     vi.unstubAllGlobals();
+  });
+
+  describe("chunked melts", () => {
+    function setupChunks(count: number, limit = 200, errorCode = 11014) {
+      const { getPendingBatches, markMelted } = setHappyPath();
+      const batch: AdminBatch = {
+        mint_url: "https://mint",
+        lock_pubkey: PUBKEY,
+        row_ids: Array.from({ length: count }, (_, i) => `r${i}`),
+        proofs: Array.from({ length: count }, (_, i) => ({
+          id: "k", amount: 8, secret: `s${i}`, C: "c",
+        })),
+        total_sats: count * 8,
+        t_expire: null,
+      };
+      getPendingBatches.mockResolvedValue({ batches: [batch] });
+      markMelted.mockResolvedValue({ melted: 1 });
+      vi.mocked(lnurl.fetchLnurlPayInvoice).mockImplementation(async (_address, msats) =>
+        `invoice:${msats}`
+      );
+      let quoteId = 0;
+      vi.mocked(melt.fetchMeltQuote).mockImplementation(async (_mint, invoice) => ({
+        amountSats: Number(invoice.split(":")[1]) / 1000,
+        feeReserveSats: 0,
+        rawQuote: { quote: `q${++quoteId}` } as never,
+      }));
+      const meltProofsBolt11 = vi.fn(async (_quote: unknown, proofs: AdminBatch["proofs"]) => {
+        if (proofs.length > limit) throw new MintOperationError(errorCode, "Request limit");
+        return { quote: { state: "PAID", payment_preimage: "paid" }, change: [] };
+      });
+      vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
+      vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const stdout = vi.spyOn(console, "log").mockImplementation(() => undefined);
+      return { batch, getPendingBatches, markMelted, meltProofsBolt11, stdout };
+    }
+
+    it("caps default requests at 200 and marks all 600 rows exactly once", async () => {
+      const { batch, markMelted, meltProofsBolt11 } = setupChunks(600);
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+      expect(meltProofsBolt11.mock.calls.map(([, proofs]) => proofs.length)).toEqual([200, 200, 200]);
+      expect(markMelted.mock.calls.flatMap(([body]) => body.row_ids)).toEqual(batch.row_ids);
+      expect(meltLog.appendPreMelt).toHaveBeenCalledTimes(3);
+      expect(meltLog.appendPostMelt).toHaveBeenCalledTimes(3);
+      expect(output.json).toHaveBeenCalledWith(expect.objectContaining({
+        batches_seen: 1, batches_melted: 1, batches_failed: 0, sats_melted: 4800,
+      }));
+    });
+
+    it.each([11014, 11015])("halves on mint error %i and settles every row", async (code) => {
+      const { batch, markMelted, meltProofsBolt11, stdout } = setupChunks(150, 50, code);
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+      expect(meltProofsBolt11.mock.calls.map(([, proofs]) => proofs.length)).toEqual([
+        150, 75, 37, 37, 37, 37, 2,
+      ]);
+      expect(markMelted.mock.calls.flatMap(([body]) => body.row_ids)).toEqual(batch.row_ids);
+      expect(new Set(markMelted.mock.calls.map(([body]) => body.melt_quote_id)).size).toBe(5);
+      expect(meltLog.appendPreMelt).toHaveBeenCalledTimes(7);
+      expect(meltLog.appendPostMelt).toHaveBeenCalledTimes(7);
+      for (const [entry] of vi.mocked(meltLog.appendPreMelt).mock.calls) {
+        expect(meltLog.appendPostMelt).toHaveBeenCalledWith(expect.objectContaining({
+          quote_id: entry.quote_id, row_ids: entry.row_ids,
+        }));
+      }
+      expect(stdout.mock.calls.map(([line]) => JSON.parse(line as string))).toContainEqual(
+        expect.objectContaining({ level: "melt_pending_input_cap_reduced", input_cap: 37 })
+      );
+    });
+
+    it("reuses a reduced cap for the same mint without applying it to other mints", async () => {
+      const { batch, getPendingBatches, meltProofsBolt11 } = setupChunks(150, 50);
+      const sibling = {
+        ...batch,
+        row_ids: batch.row_ids.map((id) => `other-${id}`),
+        proofs: batch.proofs.map((proof) => ({ ...proof, secret: `other-${proof.secret}` })),
+      };
+      getPendingBatches.mockResolvedValue({ batches: [
+        batch, sibling, { ...sibling, mint_url: "https://another-mint" },
+      ] });
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+      expect(meltProofsBolt11.mock.calls.map(([, proofs]) => proofs.length)).toEqual([
+        150, 75, 37, 37, 37, 37, 2,
+        37, 37, 37, 37, 2,
+        150, 75, 37, 37, 37, 37, 2,
+      ]);
+    });
+
+    it("sums proof values for each invoice and records the corresponding row subset", async () => {
+      const { batch } = setupChunks(201);
+      batch.proofs[200].amount = 64;
+      batch.total_sats = 1664;
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+      expect(vi.mocked(lnurl.fetchLnurlPayInvoice).mock.calls.map(([, amount]) => amount))
+        .toEqual([1600000, 64000]);
+      expect(meltLog.appendPreMelt).toHaveBeenNthCalledWith(1, expect.objectContaining({
+        row_ids: batch.row_ids.slice(0, 200), quote_id: "q1", total_sats: 1600,
+      }));
+      expect(meltLog.appendPreMelt).toHaveBeenNthCalledWith(2, expect.objectContaining({
+        row_ids: ["r200"], quote_id: "q2", total_sats: 64,
+      }));
+    });
+
+    it("refuses mismatched row and proof counts before spending", async () => {
+      const { batch, markMelted, meltProofsBolt11 } = setupChunks(3);
+      batch.row_ids.pop();
+      await expect(meltPending("dvm", { endpoint: "https://dvm.example" }))
+        .rejects.toMatchObject({ code: "batches_failed" });
+      expect(meltProofsBolt11).not.toHaveBeenCalled();
+      expect(markMelted).not.toHaveBeenCalled();
+      expect(lnurl.fetchLnurlPayInvoice).not.toHaveBeenCalled();
+    });
+
+    it("keeps a small batch in one melt", async () => {
+      const { batch, markMelted, meltProofsBolt11 } = setupChunks(3);
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+      expect(meltProofsBolt11).toHaveBeenCalledTimes(1);
+      expect(markMelted).toHaveBeenCalledExactlyOnceWith({
+        row_ids: batch.row_ids, melt_quote_id: "q1", payment_preimage: "paid",
+      });
+    });
+
+    it("stops reducing at one proof without marking rejected rows", async () => {
+      const { markMelted, meltProofsBolt11 } = setupChunks(3, 0);
+      await expect(meltPending("dvm", { endpoint: "https://dvm.example" }))
+        .rejects.toMatchObject({ code: "batches_failed" });
+      expect(meltProofsBolt11.mock.calls.map(([, proofs]) => proofs.length)).toEqual([3, 1, 1, 1]);
+      expect(markMelted).not.toHaveBeenCalled();
+      expect(meltLog.appendPostMelt).toHaveBeenCalledTimes(4);
+    });
+
+    it("continues siblings after failure and retries only the failed rows next run", async () => {
+      const { batch, getPendingBatches, markMelted, meltProofsBolt11 } = setupChunks(450);
+      meltProofsBolt11.mockImplementationOnce(async () => {
+        throw new MintOperationError(11000, "Rejected");
+      });
+      await expect(meltPending("dvm", { endpoint: "https://dvm.example" }))
+        .rejects.toMatchObject({ code: "batches_failed" });
+      expect(markMelted.mock.calls.flatMap(([body]) => body.row_ids)).toEqual(batch.row_ids.slice(200));
+      expect(output.json).toHaveBeenCalledWith(expect.objectContaining({
+        batches_failed: 1, sats_melted: 2000,
+      }));
+      getPendingBatches.mockResolvedValue({ batches: [{
+        ...batch, row_ids: batch.row_ids.slice(0, 200), proofs: batch.proofs.slice(0, 200), total_sats: 1600,
+      }] });
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+      const marked = markMelted.mock.calls.flatMap(([body]) => body.row_ids);
+      expect(marked).toHaveLength(450);
+      expect(new Set(marked)).toEqual(new Set(batch.row_ids));
+    });
+
+    it("sizes invoices and two-pass reserves from each chunk's proofs", async () => {
+      setupChunks(201);
+      vi.mocked(melt.getInputFeesForProofs).mockImplementation(async (_mint, proofs) => proofs.length);
+      vi.mocked(melt.fetchMeltQuote).mockImplementation(async (_mint, invoice) => ({
+        amountSats: Number(invoice.split(":")[1]) / 1000,
+        feeReserveSats: 2,
+        rawQuote: { quote: invoice } as never,
+      }));
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+      expect(vi.mocked(melt.getInputFeesForProofs).mock.calls.map(([, proofs]) => proofs.length))
+        .toEqual([200, 1]);
+      expect(vi.mocked(lnurl.fetchLnurlPayInvoice).mock.calls.map(([, amount]) => amount))
+        .toEqual([1400000, 1398000, 7000, 5000]);
+    });
+
+    it("skips a fee-starved chunk while its sibling pays out", async () => {
+      const { batch, markMelted } = setupChunks(201);
+      vi.mocked(melt.getInputFeesForProofs).mockImplementation(async (_mint, proofs) =>
+        proofs.length === 1 ? 8 : 0
+      );
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+      expect(markMelted.mock.calls.flatMap(([body]) => body.row_ids)).toEqual(batch.row_ids.slice(0, 200));
+      expect(output.json).toHaveBeenCalledWith(expect.objectContaining({
+        batches_skipped: 1, sats_melted: 1600,
+      }));
+    });
+
+    it("holds pending rows individually while melting fresh siblings", async () => {
+      const { batch, markMelted, meltProofsBolt11 } = setupChunks(201);
+      vi.mocked(meltLog.readInFlight).mockReturnValue([{
+        ts: Date.now(), dvmId: "dvm-fixture-1", rowIds: batch.row_ids.slice(0, 200),
+        mintUrl: "https://mint", quoteId: "pending", lockPubkey: PUBKEY, totalSats: 1600,
+      }]);
+      vi.mocked(melt.checkMeltQuoteState).mockResolvedValue({ state: "PENDING" } as never);
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+      expect(meltProofsBolt11.mock.calls.map(([, proofs]) => proofs.map((p) => p.secret)))
+        .toEqual([["s200"]]);
+      expect(markMelted).toHaveBeenCalledExactlyOnceWith({
+        row_ids: ["r200"], melt_quote_id: "q1", payment_preimage: "paid",
+      });
+      expect(output.json).toHaveBeenCalledWith(expect.objectContaining({
+        batches_skipped: 1, sats_melted: 8,
+      }));
+    });
+
+    it("recovers only a paid chunk after marking failed, without spending it again", async () => {
+      const { batch, getPendingBatches, markMelted, meltProofsBolt11 } = setupChunks(201);
+      markMelted.mockRejectedValueOnce(new Error("DVM unreachable"));
+      await expect(meltPending("dvm", { endpoint: "https://dvm.example" }))
+        .rejects.toMatchObject({ code: "batches_failed" });
+      expect(meltLog.appendPostMelt).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ quote_id: "q2", row_ids: ["r200"], status: "success" })
+      );
+      vi.mocked(meltLog.readInFlight).mockReturnValue([{
+        ts: Date.now(), dvmId: "dvm-fixture-1", rowIds: batch.row_ids.slice(0, 200),
+        mintUrl: "https://mint", quoteId: "q1", lockPubkey: PUBKEY, totalSats: 1600,
+      }]);
+      vi.mocked(melt.checkMeltQuoteState).mockResolvedValue({
+        state: "PAID", payment_preimage: "paid",
+      } as never);
+      getPendingBatches.mockResolvedValue({ batches: [] });
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
+      expect(meltProofsBolt11).toHaveBeenCalledTimes(2);
+      expect(markMelted).toHaveBeenLastCalledWith({
+        row_ids: batch.row_ids.slice(0, 200), melt_quote_id: "q1", payment_preimage: "paid",
+      });
+    });
   });
 
   it("errors when no builder mnemonic exists", async () => {

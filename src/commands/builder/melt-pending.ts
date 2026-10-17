@@ -140,6 +140,7 @@ export interface TickSummary {
   melt_skipped: "drains_only" | null;
 }
 
+const DEFAULT_MELT_INPUT_CAP = 200;
 const DEFAULT_INTERVAL_SECONDS = 60;
 const MIN_INTERVAL_SECONDS = 10;
 const MAX_INTERVAL_SECONDS = 3600;
@@ -413,29 +414,16 @@ async function runTick(ctx: MeltContext): Promise<TickSummary> {
   let skipped = 0;
   let failed = 0;
   let satsMelted = 0;
+  const inputCapsByMint = new Map<string, number>();
   const unresolvedByRow = new Map(
     recovery.unresolved.flatMap((entry) => entry.rowIds.map((rowId) => [rowId, entry] as const))
   );
   for (const batch of res.batches) {
-    const unresolved = batch.row_ids.map((rowId) => unresolvedByRow.get(rowId)).find(Boolean);
-    if (unresolved) {
-      const ageMs = Math.max(0, Date.now() - unresolved.ts);
-      logEvent(ctx, "melt_pending_batch_in_flight", {
-        mint_url: unresolved.mintUrl,
-        quote_id: unresolved.quoteId,
-        row_ids: batch.row_ids,
-        age_ms: ageMs,
-      });
-      if (ageMs >= IN_FLIGHT_MELT_ALARM_AFTER_MS) failed++;
-      else skipped++;
-      continue;
-    }
-    const outcome = await meltBatch(ctx, batch);
-    if (outcome === "melted") {
-      melted++;
-      satsMelted += batch.total_sats;
-    } else if (outcome === "skipped") skipped++;
+    const result = await meltBatchChunks(ctx, batch, unresolvedByRow, inputCapsByMint);
+    if (result.outcome === "melted") melted++;
+    else if (result.outcome === "skipped") skipped++;
     else failed++;
+    satsMelted += result.satsMelted;
   }
 
   return {
@@ -451,7 +439,79 @@ async function runTick(ctx: MeltContext): Promise<TickSummary> {
 
 type BatchOutcome = "melted" | "skipped" | "failed";
 
-async function meltBatch(ctx: MeltContext, batch: AdminBatch): Promise<BatchOutcome> {
+/** Keep summary counters per server batch, even when only some chunks settle. */
+async function meltBatchChunks(
+  ctx: MeltContext,
+  batch: AdminBatch,
+  unresolvedByRow: Map<string, InFlightMelt>,
+  inputCapsByMint: Map<string, number>
+): Promise<{ outcome: BatchOutcome; satsMelted: number }> {
+  // Slicing by position is safe only with the admin API's one-row-per-proof contract.
+  if (batch.row_ids.length !== batch.proofs.length) {
+    logErr(ctx, "melt_pending_invalid_batch", new Error("Row and proof counts differ"), {
+      mint_url: batch.mint_url,
+    });
+    return { outcome: "failed", satsMelted: 0 };
+  }
+
+  let failed = false;
+  let skipped = false;
+  let satsMelted = 0;
+  const availableIndices: number[] = [];
+  const heldEntries = new Set<InFlightMelt>();
+  batch.row_ids.forEach((rowId, index) => {
+    const unresolved = unresolvedByRow.get(rowId);
+    if (unresolved) heldEntries.add(unresolved);
+    else availableIndices.push(index);
+  });
+  for (const entry of heldEntries) {
+    const ageMs = Math.max(0, Date.now() - entry.ts);
+    logEvent(ctx, "melt_pending_batch_in_flight", {
+      mint_url: entry.mintUrl,
+      quote_id: entry.quoteId,
+      row_ids: entry.rowIds,
+      age_ms: ageMs,
+    });
+    if (ageMs >= IN_FLIGHT_MELT_ALARM_AFTER_MS) failed = true;
+    else skipped = true;
+  }
+
+  let offset = 0;
+  while (offset < availableIndices.length) {
+    const cap = inputCapsByMint.get(batch.mint_url) ?? DEFAULT_MELT_INPUT_CAP;
+    const indices = availableIndices.slice(offset, offset + cap);
+    const proofs = indices.map((i) => batch.proofs[i]);
+    const chunk: AdminBatch = {
+      ...batch,
+      proofs,
+      row_ids: indices.map((i) => batch.row_ids[i]),
+      total_sats: proofs.reduce((sum, proof) => sum + proof.amount, 0),
+    };
+    const outcome = await meltBatch(ctx, chunk);
+    if (outcome === "input_cap_exceeded" && indices.length > 1) {
+      const reducedCap = Math.max(1, Math.floor(indices.length / 2));
+      inputCapsByMint.set(batch.mint_url, reducedCap);
+      logEvent(ctx, "melt_pending_input_cap_reduced", {
+        mint_url: batch.mint_url,
+        previous_input_cap: cap,
+        input_cap: reducedCap,
+      });
+      // A definitive size rejection spent nothing. Retry these rows with a fresh quote.
+      continue;
+    }
+    if (outcome === "melted") satsMelted += chunk.total_sats;
+    else if (outcome === "skipped") skipped = true;
+    else failed = true;
+    offset += indices.length;
+  }
+
+  return { outcome: failed ? "failed" : skipped ? "skipped" : "melted", satsMelted };
+}
+
+async function meltBatch(
+  ctx: MeltContext,
+  batch: AdminBatch
+): Promise<BatchOutcome | "input_cap_exceeded"> {
   const batchKeypair = ctx.keypairsByPubkey.get(toLockPubkey(batch.lock_pubkey));
   if (!batchKeypair) {
     // No matching privkey in `0..current_rotation_index` — either the batch
@@ -610,6 +670,15 @@ async function meltBatch(ctx: MeltContext, batch: AdminBatch): Promise<BatchOutc
       status: "failed",
       error: err instanceof Error ? err.message : String(err),
     });
+    // SDK wallets may carry a separate cashu-ts copy; inspect the protocol code
+    // rather than relying on error constructor identity across package boundaries.
+    if (
+      batch.proofs.length > 1 &&
+      typeof err === "object" && err !== null && "code" in err &&
+      (err.code === 11014 || err.code === 11015)
+    ) {
+      return "input_cap_exceeded";
+    }
     logErr(ctx, "melt_pending_melt_failed", err, {
       mint_url: batch.mint_url,
       row_ids: batch.row_ids,
