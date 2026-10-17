@@ -16,7 +16,7 @@ import {
 } from "../../lib/deploy-attestation.ts";
 import { blockUntilShutdown } from "../../lib/keep-alive.ts";
 import { loadDescriptor } from "../../lib/load-handler.ts";
-import { loadIdentityPubkey } from "../../shared/builder-store.ts";
+import { loadIdentityPubkey, requireBuilderDvmByHandle } from "../../shared/builder-store.ts";
 
 export interface BuilderServeOptions {
   port?: string;
@@ -26,7 +26,8 @@ export interface BuilderServeOptions {
    *
    * - the **lock identity** — the DVM advertises the Cashu pubkey derived from
    *   the builder's recovery mnemonic, and `dvmctl melt-pending <handle>`
-   *   derives the matching privkey;
+   *   derives the matching privkey. Without configured mints, a missing
+   *   mnemonic leaves this axis unset;
    * - the **receipt identity** — the DVM signs receipts under the key
    *   `dvmctl deploy` would derive for this canonical DVM ID, and serves the attestation
    *   binding it, so a caller can chain a receipt to the builder's cold key.
@@ -41,12 +42,13 @@ export interface BuilderServeOptions {
 export async function builderServe(handlerPath: string, opts: BuilderServeOptions): Promise<void> {
   const absPath = resolve(process.cwd(), handlerPath);
   const descriptor = await loadDescriptor(absPath);
-  const identity = opts.dvm ? resolveBuilderLockIdentity(opts.dvm) : undefined;
+  const dvm = opts.dvm ? requireBuilderDvmByHandle(opts.dvm) : undefined;
+  const identity = opts.dvm ? resolveServeLockIdentity(opts.dvm, process.env) : undefined;
   const attestation = opts.dvm
     ? resolveServeAttestation(
         process.cwd(),
         opts.dvm,
-        identity?.canonicalDvmId,
+        dvm?.canonical_dvm_id,
         process.env as Record<string, string>
       )
     : undefined;
@@ -74,6 +76,22 @@ export async function builderServe(handlerPath: string, opts: BuilderServeOption
 
   // Keep serving until Ctrl-C / SIGTERM.
   await blockUntilShutdown(() => ({ close }));
+}
+
+function resolveServeLockIdentity(
+  handle: string,
+  env: NodeJS.ProcessEnv
+): BuilderLockIdentity | undefined {
+  try {
+    return resolveBuilderLockIdentity(handle);
+  } catch (err) {
+    // Receipt attestation needs the durable DVM ID, not Cashu recovery words.
+    // Match the SDK's mint-configured gate so a Cashu boot still refuses.
+    if (err instanceof DvmError && err.code === "no_builder_mnemonic" && !env.DVMKIT_CASHU_MINTS) {
+      return undefined;
+    }
+    throw err;
+  }
 }
 
 /**

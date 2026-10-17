@@ -1,11 +1,14 @@
-import { deriveReceiptKeypair, generateIdentity, verifyAttestation } from "@dvmkit/sdk/internal";
+import type * as SdkInternal from "@dvmkit/sdk/internal";
+import { deriveBuilderLockKeypair, deriveReceiptKeypair, DvmError, generateIdentity, loadIdentitySecret, receiptPubkeyFromSecret, verifyAttestation } from "@dvmkit/sdk/internal";
 import type * as SdkServerModule from "@dvmkit/sdk/server";
 import { serve as sdkServe } from "@dvmkit/sdk/server";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { readBuilderMnemonic } from "../../../lib/builder-mnemonic";
 import type { BuilderLockIdentity } from "../../../lib/cashu/builder-lock-identity";
-import { signDeployAttestation } from "../../../lib/deploy-attestation";
+import { ATTESTATION_ENV_KEYS, signDeployAttestation } from "../../../lib/deploy-attestation";
 import { loadDescriptor } from "../../../lib/load-handler";
+import { loadIdentityPubkey, requireBuilderDvmByHandle } from "../../../shared/builder-store";
 import {
   assertProductionDatabase,
   attestationEnvOccupied,
@@ -19,6 +22,106 @@ vi.mock("@dvmkit/sdk/server", async (importOriginal) => ({
 }));
 
 vi.mock("../../../lib/load-handler", () => ({ loadDescriptor: vi.fn() }));
+vi.mock("../../../lib/keep-alive", () => ({ blockUntilShutdown: vi.fn() }));
+vi.mock("../../../lib/builder-mnemonic", () => ({ readBuilderMnemonic: vi.fn() }));
+vi.mock("../../../shared/builder-store", () => ({
+  loadIdentityPubkey: vi.fn(),
+  requireBuilderDvmByHandle: vi.fn(),
+}));
+vi.mock("@dvmkit/sdk/internal", async (importOriginal) => ({
+  ...(await importOriginal<typeof SdkInternal>()),
+  loadIdentitySecret: vi.fn(),
+}));
+
+describe("builderServe identity resolution", () => {
+  const builder = generateIdentity();
+
+  beforeEach(() => {
+    for (const key of [...ATTESTATION_ENV_KEYS, "DVMKIT_CASHU_MINTS", "DVMKIT_CASHU_LOCK_PUBKEY"]) {
+      vi.stubEnv(key, undefined);
+    }
+    vi.stubEnv("DATABASE_URL", "postgres://localhost/dvm");
+    vi.mocked(loadDescriptor).mockResolvedValue({ name: "example" } as never);
+    vi.mocked(sdkServe).mockResolvedValue({ url: "http://localhost:8080", close: vi.fn(), paymentModes: [] });
+    vi.mocked(readBuilderMnemonic).mockReturnValue(null);
+    vi.mocked(loadIdentitySecret).mockReturnValue(builder.secret);
+    vi.mocked(loadIdentityPubkey).mockReturnValue(builder.pubkey);
+    vi.mocked(requireBuilderDvmByHandle).mockReturnValue({
+      handle: "my-dvm",
+      canonical_dvm_id: identityFixture.canonicalDvmId,
+      current_rotation_index: 0,
+      self_hosted: true,
+      updated_at: "2026-07-30T00:00:00.000Z",
+    });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.resetAllMocks();
+  });
+
+  it("attests the durable receipt identity without a Cashu mnemonic", async () => {
+    await builderServe("handler.ts", { dvm: "my-dvm" });
+
+    expect(sdkServe).toHaveBeenCalledOnce();
+    const env = envOf(vi.mocked(sdkServe).mock.calls[0][1]!);
+    const payload = JSON.parse(env.DVMKIT_BUILDER_ATTESTATION);
+    expect(payload.dvm_id).toBe(identityFixture.canonicalDvmId);
+    expect(payload.slug).toBe("my-dvm");
+    expect(env.DVMKIT_DVM_ID).toBe(identityFixture.canonicalDvmId);
+    expect(env.DVMKIT_CANONICAL_DVM_ID).toBe(identityFixture.canonicalDvmId);
+    expect(env.DVMKIT_BUILDER_PUBKEY).toBe(builder.pubkey);
+    expect(verifyAttestation(payload, env.DVMKIT_BUILDER_SIGNATURE, builder.pubkey)).toBe(true);
+    expect(receiptPubkeyFromSecret(env.DVMKIT_RECEIPT_KEY)).toBe(payload.receipt_pubkey);
+    expect(env.DVMKIT_CASHU_LOCK_PUBKEY).toBeUndefined();
+    expect(Object.values(env)).not.toContain(builder.secret);
+  });
+
+  it.each(["https://mint.example", " "])("refuses missing recovery words when mints are configured as %j", async (mints) => {
+    vi.stubEnv("DVMKIT_CASHU_MINTS", mints);
+    await expect(builderServe("handler.ts", { dvm: "my-dvm" })).rejects.toMatchObject({
+      code: "no_builder_mnemonic",
+      hint: expect.stringContaining("dvmctl lock create"),
+    });
+    expect(sdkServe).not.toHaveBeenCalled();
+  });
+
+  it("still derives the lock identity when recovery words exist", async () => {
+    const mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    vi.mocked(readBuilderMnemonic).mockReturnValue(mnemonic);
+    vi.stubEnv("DVMKIT_CASHU_MINTS", "https://mint.example");
+    await builderServe("handler.ts", { dvm: "my-dvm" });
+    const env = envOf(vi.mocked(sdkServe).mock.calls[0][1]!);
+    expect(env.DVMKIT_CASHU_LOCK_PUBKEY).toBe(
+      deriveBuilderLockKeypair(mnemonic, identityFixture.canonicalDvmId, 0).pubkey
+    );
+    expect(JSON.parse(env.DVMKIT_BUILDER_ATTESTATION).dvm_id).toBe(env.DVMKIT_DVM_ID);
+  });
+
+  it.each(["dvm_not_initialized", "ambiguous_dvm_handle"])("preserves the store's %s refusal without recovery words", async (code) => {
+    const failure = new DvmError(code, "No unique durable DVM identity.");
+    vi.mocked(requireBuilderDvmByHandle).mockImplementation(() => { throw failure; });
+    await expect(builderServe("handler.ts", { dvm: "my-dvm" })).rejects.toBe(failure);
+    expect(sdkServe).not.toHaveBeenCalled();
+  });
+
+  it.each(ATTESTATION_ENV_KEYS)("leaves the entire attestation overlay alone when %s is set", async (key) => {
+    vi.stubEnv(key, "operator-supplied");
+    await builderServe("handler.ts", { dvm: "my-dvm" });
+    const env = envOf(vi.mocked(sdkServe).mock.calls[0][1]!);
+    for (const field of ATTESTATION_ENV_KEYS) {
+      expect(env[field]).toBe(field === key ? "operator-supplied" : undefined);
+    }
+  });
+
+  it("does not suppress unexpected recovery-material read failures", async () => {
+    const failure = new Error("cannot read recovery material");
+    vi.mocked(readBuilderMnemonic).mockImplementation(() => { throw failure; });
+    await expect(builderServe("handler.ts", { dvm: "my-dvm" })).rejects.toBe(failure);
+    expect(sdkServe).not.toHaveBeenCalled();
+  });
+});
 
 describe("buildServeOpts", () => {
   it("maps port, database, and mints while preserving the manual environment", () => {
