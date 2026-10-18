@@ -18,7 +18,7 @@ Keep the refund and payout roles separate. The worker can use `DVMKIT_REFUND_NWC
 
 If caller refunds remain or drain state cannot be read, preserve the payout hold and use [recovery](recovery.md). Do not treat an unavailable liability query as a zero balance.
 
-For stablecoins, verify the configured network and recipient, then inspect the transfer or channel settlement evidence. Keep required close observers running. For opted-in one-payment credit refunds, inspect `dvmctl credit drains-owed`, perform only the authorized transfer, and record the real transaction with `credit drain-settle`. Never record a payment merely to clear the queue.
+For stablecoins, verify the configured network and recipient, then inspect the transfer or channel settlement evidence. Keep required close observers running. For opted-in one-payment credit refunds, inspect `dvmctl credit drains-owed`, perform only the authorized transfer, and record the real transaction with `credit drain-settle`. Never record a payment merely to clear the queue. For hosted Tempo builder payout reports, inspect `dvmctl credit tempo-close-reports`; follow the [close-report reference](references/tempo-close-reports.md) for retry or write-off.
 
 ## Change the service
 

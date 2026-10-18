@@ -86,9 +86,9 @@ export interface TempoWriteOffOptions {
  * — a channel close that landed on chain while its ledger leg
  * refused because the refund did not cover the debit.
  *
- * Read-only. Each row puts the chain's own refund figure beside the rail-native
- * debit it has to cover, which is what decides whether it can be reconciled or
- * has to be written off.
+ * Read-only. Chain evidence determines whether a drain can be reconciled,
+ * whether a pending drain has a short refund that can be written off, or
+ * whether an exit_required drain still needs caller recovery.
  */
 export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Promise<void> {
   const limit = resolveLimit(opts.limit);
@@ -108,8 +108,25 @@ export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Pro
   // the caller simply never came back to finish it, and nothing has landed on
   // chain to book. Counting those as stuck closes would put an operator in
   // front of rows no repair applies to.
-  const awaitingClose = unresolved.filter((d) => d.chain?.chain === "unconfirmed");
-  const wedged = unresolved.filter((d) => d.chain?.chain !== "unconfirmed");
+  const exitRequired = unresolved.filter((d) => d.status === "exit_required");
+  const awaitingClose = unresolved.filter((d) => d.status !== "exit_required" && d.chain?.chain === "unconfirmed");
+  const wedged = unresolved.filter((d) => d.status === "exit_required"
+    ? coversDebit(d)
+    : d.chain?.chain !== "unconfirmed");
+  const exitShort = exitRequired.filter((d) => isShortRefund(d));
+  const timedExit = exitRequired.filter((d) => d.chain?.chain === "unconfirmed");
+  const evidenceUnavailable = exitRequired.filter((d) =>
+    d.chain?.chain !== "unconfirmed" && compareRefund(d) === "incomparable");
+  const evidenceHint = "Re-run with chain lookups (omit --no-evidence), or check the channel before choosing an action.";
+  const evidenceNotice = evidenceUnavailable.length > 0
+    ? ` ${evidenceUnavailable.length} exit_required drain(s): chain evidence unavailable. ${evidenceHint}`
+    : "";
+  const exitNotice = timedExit.length > 0
+    ? ` ${timedExit.length} drain(s): cooperative close is unavailable; the caller must recover the funds with the timed exit.`
+    : "";
+  const shortExitNotice = exitShort.length > 0
+    ? ` ${exitShort.length} exit_required drain(s): a close landed with a short refund. No command can repair these drains yet; their status prevents a drain write-off.`
+    : "";
   // Counted over the unresolved rows only: under `--include-resolved` the page
   // also carries drains an operator has already closed out, and a chain figure
   // on one of those is not work anybody is waiting on.
@@ -133,15 +150,24 @@ export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Pro
           (drain.written_off_at === null ? "" : `  written-off${noteSuffix(drain.write_off_note)}`)
       );
     }
-    info(
-      `${wedged.length} awaiting a decision, ${repairable.length} whose on-chain refund covers the debit. ` +
-        `Finish one with \`dvmctl credit tempo-reconcile ${handle} <credit-id> <drain-id>\`.`
-    );
+    if (wedged.length > 0) {
+      info(
+        `${wedged.length} awaiting a decision, ${repairable.length} whose on-chain refund covers the debit. ` +
+          `Finish one with \`dvmctl credit tempo-reconcile ${handle} <credit-id> <drain-id>\`.`
+      );
+    }
     if (short.length > 0) {
       info(
         `${short.length} refunded the caller less than the ledger extinguished. A reconcile refuses those; \`dvmctl credit tempo-write-off\` is how one is closed.`
       );
     }
+    for (const drain of exitShort) {
+      info(`${drain.credit_id} ${drain.drain_id}: close landed with a short refund. No command can repair it yet; its status prevents a drain write-off.`);
+    }
+    for (const drain of evidenceUnavailable) {
+      info(`${drain.credit_id} ${drain.drain_id}: chain evidence unavailable. ${evidenceHint}`);
+    }
+    if (exitNotice) info(exitNotice.trim());
     if (awaitingClose.length > 0) {
       info(
         `${awaitingClose.length} more have no confirmed close on chain yet — those are the caller's to finish, not yours, and are not counted above.`
@@ -166,9 +192,13 @@ export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Pro
     repairable_count: repairable.length,
     short_refund_count: short.length,
     awaiting_close_count: awaitingClose.length,
+    exit_required_count: exitRequired.length,
+    exit_required_short_refund_count: exitShort.length,
+    timed_exit_count: timedExit.length,
+    exit_required_evidence_unavailable_count: evidenceUnavailable.length,
     ...(res.next_after ? { next_after: res.next_after } : {}),
     display:
-      wedged.length === 0
+      (wedged.length === 0
         ? awaitingClose.length === 0
           ? "No Tempo channel closes are waiting on an operator decision."
           : `No Tempo close is waiting on an operator decision. ${awaitingClose.length} pending drain(s) have no confirmed close on chain yet, which is the caller's to finish rather than yours.`
@@ -178,12 +208,18 @@ export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Pro
             : "") +
           (awaitingClose.length > 0
             ? ` A further ${awaitingClose.length} pending drain(s) have no confirmed close on chain yet and are not counted here.`
-            : ""),
-    hint:
-      "Finish one with `dvmctl credit tempo-reconcile <handle> <credit-id> <drain-id>` — the amount comes off the close receipt, not from you. If the refund was genuinely short, close it with `dvmctl credit tempo-write-off`." +
-      (opts.includeResolved
+            : "")) + shortExitNotice + exitNotice + evidenceNotice,
+    hint: [
+      wedged.length > 0
+        ? "Finish a repairable drain with `dvmctl credit tempo-reconcile <handle> <credit-id> <drain-id>` — the amount comes off the close receipt, not from you. If a pending drain's refund was genuinely short, close it with `dvmctl credit tempo-write-off`."
+        : "",
+      shortExitNotice.trim(),
+      exitNotice.trim(),
+      evidenceNotice.trim(),
+      opts.includeResolved
         ? ""
-        : " Drains you have already written off are not counted here; re-run with `--include-resolved` to see those."),
+        : "Drains you have already written off are not counted here; re-run with `--include-resolved` to see those.",
+    ].filter(Boolean).join(" "),
   });
 }
 
@@ -193,8 +229,9 @@ export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Pro
  * The DVM decides everything: it re-reads the `ChannelClosed` receipt the close
  * already recorded and books the drain against that figure. You name one thing
  * — which drain. If the chain refunded less than the ledger is extinguishing it
- * refuses, naming both figures; that drain is not reconcilable and the write-off
- * is how it gets closed. Running this twice books once.
+ * refuses, naming both figures. A pending drain can be written off; an
+ * exit_required drain with a short refund has no repair command yet.
+ * Running this twice books once.
  */
 export async function tempoReconcile(
   handle: string,

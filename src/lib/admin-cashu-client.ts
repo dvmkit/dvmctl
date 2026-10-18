@@ -447,7 +447,7 @@ export interface AdminTempoDrain {
   amount_native: number | null;
   currency: string;
   caller_pubkey: string;
-  status: "pending" | "parked" | "picked_up" | "sent" | "released";
+  status: "pending" | "parked" | "picked_up" | "sent" | "released" | "exit_required";
   created_at: number;
   /** An operator's recorded decision not to book this one; `null` while it is live. */
   write_off_note: string | null;
@@ -476,6 +476,51 @@ export interface AdminTempoCreditLoss {
   consumed_native: string;
   observed_at: number;
   status: "unbacked";
+}
+
+export interface AdminTempoCloseReport {
+  obligation_id: string;
+  channel_id: string;
+  /** Potential builder payout, as a decimal string in native token units. */
+  amount_native: string;
+  status: "unmatched" | "no_report";
+  created_at_ms: number;
+  updated_at_ms: number;
+  delivered_at_ms: number | null;
+  retryable: boolean;
+  write_off_allowed: boolean;
+  /** A retained write-off decision can remain true after an explicit retry. */
+  written_off: boolean;
+  write_off_note: string | null;
+  written_off_at_ms: number | null;
+}
+
+export interface AdminTempoCloseReportsResponse {
+  reports: AdminTempoCloseReport[];
+  next_after?: string;
+}
+
+export interface AdminRetryTempoCloseReportRequest {
+  obligation_id: string;
+}
+
+export interface AdminRetryTempoCloseReportResponse {
+  status: "reserved";
+  obligation_id: string;
+}
+
+export interface AdminWriteOffTempoCloseReportRequest {
+  obligation_id: string;
+  note: string;
+}
+
+export interface AdminWriteOffTempoCloseReportResponse {
+  status: "written_off";
+  obligation_id: string;
+  channel_id: string;
+  /** Builder payout abandoned, as a decimal string in native token units. */
+  amount_forgone_native: string;
+  note: string;
 }
 
 /** Response body from `GET /admin/credit/tempo-losses`. */
@@ -819,6 +864,37 @@ export class AdminCashuClient {
       "/admin/credit/tempo-drains",
       undefined,
       params.size === 0 ? undefined : `?${params.toString()}`
+    );
+  }
+
+  async getTempoCloseReports(opts?: {
+    limit?: number;
+    after?: string;
+    all?: boolean;
+  }): Promise<AdminTempoCloseReportsResponse> {
+    const params = new URLSearchParams();
+    if (opts?.limit !== undefined) params.set("limit", String(opts.limit));
+    if (opts?.after !== undefined) params.set("after", opts.after);
+    if (opts?.all) params.set("all", "1");
+    return this.requestJson<AdminTempoCloseReportsResponse>(
+      "GET", "/admin/credit/tempo-close-reports", undefined,
+      params.size === 0 ? undefined : `?${params.toString()}`
+    );
+  }
+
+  async retryTempoCloseReport(
+    body: AdminRetryTempoCloseReportRequest
+  ): Promise<AdminRetryTempoCloseReportResponse> {
+    return this.requestJson<AdminRetryTempoCloseReportResponse>(
+      "POST", "/admin/credit/retry-tempo-close-report", body
+    );
+  }
+
+  async writeOffTempoCloseReport(
+    body: AdminWriteOffTempoCloseReportRequest
+  ): Promise<AdminWriteOffTempoCloseReportResponse> {
+    return this.requestJson<AdminWriteOffTempoCloseReportResponse>(
+      "POST", "/admin/credit/write-off-tempo-close-report", body
     );
   }
 
