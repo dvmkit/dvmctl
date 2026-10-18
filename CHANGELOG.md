@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/dvmkit/dvmctl/compare/v0.9.0...v0.10.0) (2026-10-18)
+
+
+### Features
+
+* add Tempo close-report commands ([#15](https://github.com/dvmkit/dvmctl/issues/15)) ([5344d76](https://github.com/dvmkit/dvmctl/commit/5344d769cbe65a5477e41cf35a98aec6b1aabdec))
+
 ## [0.9.0](https://github.com/dvmkit/dvmctl/compare/v0.8.0...v0.9.0) (2026-10-17)
 
 
