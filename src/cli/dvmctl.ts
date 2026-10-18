@@ -114,6 +114,13 @@ import {
   tempoWedged,
   tempoWriteOff,
 } from "../commands/builder/tempo-drains.ts";
+import {
+  tempoCloseReports,
+  tempoCloseReportRetry,
+  tempoCloseReportWriteOff,
+  type TempoCloseReportsOptions,
+  type TempoCloseReportActionOptions,
+} from "../commands/builder/tempo-close-reports.ts";
 import type { TraceGetOptions } from "../commands/builder/trace-get.ts";
 import { traceGet } from "../commands/builder/trace-get.ts";
 import type { TransferOptions } from "../commands/builder/transfer.ts";
@@ -1107,6 +1114,40 @@ export function buildProgram(): Command {
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArg: string, opts: TempoWedgedOptions) => {
       catchErrors(() => tempoWedged(handleArg, opts), opts.human);
+    });
+
+  creditCmd
+    .command("tempo-close-reports <handle>")
+    .description("List hosted Tempo close reports and the builder payout at stake; retry searches again, while write-off gives up the payout report")
+    .option("--endpoint <url>", "DVM admin endpoint URL (skips the platform getDvm lookup)")
+    .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
+    .option("--limit <n>", "Page size (default: 20, max 50)", (v) => Number(v))
+    .option("--after <cursor>", "Continue from next_after using the same --all setting")
+    .option("--all", "Include terminal no_report rows and rows without available actions")
+    .option("--human", "Human-readable output instead of JSON")
+    .action((handleArg: string, opts: TempoCloseReportsOptions) => {
+      catchErrors(() => tempoCloseReports(handleArg, opts), opts.human);
+    });
+
+  creditCmd
+    .command("tempo-close-report-retry <handle> <obligation-id>")
+    .description("Reopen the search for a Tempo close so the builder's payout report can still be sent")
+    .option("--endpoint <url>", "DVM admin endpoint URL (skips the platform getDvm lookup)")
+    .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
+    .option("--human", "Human-readable output instead of JSON")
+    .action((handleArg: string, obligationId: string, opts: TempoCloseReportActionOptions) => {
+      catchErrors(() => tempoCloseReportRetry(handleArg, obligationId, opts), opts.human);
+    });
+
+  creditCmd
+    .command("tempo-close-report-write-off <handle> <obligation-id>")
+    .description("Permanently give up the builder's payout report for a missing Tempo close; does not refund the caller")
+    .requiredOption("--note <text>", "Reason for giving up this payout report (1 to 2000 characters after trimming)")
+    .option("--endpoint <url>", "DVM admin endpoint URL (skips the platform getDvm lookup)")
+    .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
+    .option("--human", "Human-readable output instead of JSON")
+    .action((handleArg: string, obligationId: string, opts: TempoCloseReportActionOptions) => {
+      catchErrors(() => tempoCloseReportWriteOff(handleArg, obligationId, opts), opts.human);
     });
 
   creditCmd

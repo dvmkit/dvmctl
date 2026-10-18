@@ -2410,6 +2410,8 @@ Each row puts the two figures side by side: `amount_native` is the debit the ref
 
 Drains you have already written off are hidden by default; `--include-resolved` is the audit view.
 
+A drain with `status: "exit_required"` is classified using its chain evidence. If a close landed and its refund covers the debit, it counts in `wedged_count` and `repairable_count` and can be finished with `tempo-reconcile`. If a close landed with a short refund, no command can repair it yet: `tempo-write-off` refuses this status. These short terminal rows are counted separately in `exit_required_short_refund_count`, outside `short_refund_count` and `wedged_count`. A confirmed no-close result (`chain: "unconfirmed"`) means cooperative close is unavailable, and the caller must recover the funds with the timed exit; these rows appear in `timed_exit_count`. Unchecked, failed, or unknown chain reads, a missing close receipt, and a landed close with an unknown debit or unreadable refund instead get a "chain evidence unavailable" explanation. Re-run with chain lookups (omit `--no-evidence`), or check the channel before choosing an action. Those rows appear in `exit_required_evidence_unavailable_count`. `exit_required_count` counts unresolved rows with that status. All action counts exclude written-off drains, including under `--include-resolved`; the audit rows remain visible with their recorded notes and timestamps. Human output and JSON explanations distinguish all four cases. Builder payout reports are separate: inspect them with [`credit tempo-close-reports`](#credit-tempo-close-reports).
+
 ```sh
 dvmctl credit tempo-wedged my-dvm
 dvmctl credit tempo-wedged my-dvm --include-resolved --limit 50
@@ -2459,12 +2461,16 @@ dvmctl credit tempo-wedged my-dvm --include-resolved --limit 50
   "repairable_count": 0,
   "short_refund_count": 1,
   "awaiting_close_count": 0,
+  "exit_required_count": 0,
+  "exit_required_short_refund_count": 0,
+  "timed_exit_count": 0,
+  "exit_required_evidence_unavailable_count": 0,
   "display": "1 Tempo close(s) landed on chain without the caller's credit balance being booked as paid. 0 paid enough to cover the debit and can be finished. 1 refunded the caller less than was extinguished — those cannot be reconciled and need a decision.",
-  "hint": "Finish one with `dvmctl credit tempo-reconcile <handle> <credit-id> <drain-id>` — the amount comes off the close receipt, not from you. If the refund was genuinely short, close it with `dvmctl credit tempo-write-off`. Drains you have already written off are not counted here; re-run with `--include-resolved` to see those."
+  "hint": "Finish a repairable drain with `dvmctl credit tempo-reconcile <handle> <credit-id> <drain-id>` — the amount comes off the close receipt, not from you. If a pending drain's refund was genuinely short, close it with `dvmctl credit tempo-write-off`. Drains you have already written off are not counted here; re-run with `--include-resolved` to see those."
 }
 ```
 
-`repairable_count` is the rows whose on-chain refund covers the debit — those finish with `tempo-reconcile`. `short_refund_count` is the rows where the chain named a figure and it fell short; a reconcile refuses those, and `tempo-write-off` is how one gets closed. `awaiting_close_count` is counted separately and excluded from `wedged_count`: those are pending drains whose channel has no confirmed close at all, so nothing landed on chain and no repair applies — the caller's own poll is what finishes them. `next_after` appears when the page was full.
+`repairable_count` is the rows whose on-chain refund covers the debit — those finish with `tempo-reconcile`. `short_refund_count` counts pending drains where the chain named a figure and it fell short; a reconcile refuses those, and `tempo-write-off` is how one gets closed. Landed short refunds on `exit_required` drains are separate and have no repair command yet. `awaiting_close_count` is counted separately and excluded from `wedged_count`: those are pending drains whose channel has no confirmed close at all, so nothing landed on chain and no repair applies — the caller's own poll is what finishes them. `next_after` appears when the page was full.
 
 **Error anchors:**
 
@@ -2482,7 +2488,7 @@ Book a Tempo drain whose channel close already paid on chain.
 
 You name one thing — which drain. The DVM re-reads the `ChannelClosed` receipt the confirmed close already points at and books the drain against *that* figure, never one you supply, so this door cannot extinguish more or less than the chain returned. Any excess over the debit is the payer's uncredited channel surplus and is recorded on the drain alongside the settled amount.
 
-If the chain refunded less than the ledger is extinguishing it refuses and names both figures. That drain is not reconcilable — the channel is closed, so nothing can top the refund up — and `tempo-write-off` is how it gets closed out.
+If the chain refunded less than the ledger is extinguishing it refuses and names both figures. That drain is not reconcilable: the channel is closed, so nothing can top the refund up. `tempo-write-off` can close out a pending drain; an `exit_required` drain with a short refund has no repair command yet.
 
 Running it twice books once: the second call answers `replayed: true` off the drain's own recorded state, without paying for another chain read.
 
@@ -2582,6 +2588,164 @@ dvmctl credit tempo-write-off my-dvm imp:tempo:challenge-9 drain-7 --note "chain
 | `drain_not_found` | No drain with that id on that credit |
 | `drain_not_repairable` | The drain isn't a Tempo cooperative close |
 | `drain_not_wedged` | The drain was released, or already booked as sent — either way there is nothing to decide about, and a write-off on a close that paid would say it didn't |
+
+---
+
+## credit tempo-close-reports
+
+List hosted Tempo close-report obligations: records that track whether the builder's payout report can be sent after a channel closes. Requires hosted settlement reports on the target DVM with `@dvmkit/sdk` 0.10.0 or later. These commands use the same signed admin authentication as the Tempo drain commands.
+
+The default action queue contains owned, unsubmitted `unmatched` rows with an available action. `--all` also shows terminal `no_report` rows, including retired attempts, resolved payer exits, completed write-offs, submitted rows, and rows without an available action. It does not list every report state. `retryable` and `write_off_allowed` are server snapshots; a concurrent change can still refuse an action.
+
+```sh
+dvmctl credit tempo-close-reports my-dvm
+dvmctl credit tempo-close-reports my-dvm --all --limit 50 --human
+dvmctl credit tempo-close-reports my-dvm --all --after <next_after>
+```
+
+| Flag | Description |
+|---|---|
+| `--limit <n>` | Page size (default: 20, max 50) |
+| `--after <cursor>` | Continue from `next_after`, keeping the same `--all` setting |
+| `--all` | Audit view, including terminal `no_report` rows and rows without available actions |
+| `--endpoint <url>` | DVM admin endpoint URL, skipping the platform lookup |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Human-readable output instead of JSON |
+
+Each row's `amount_native` is a decimal string in native token units, preserved without floating-point conversion. It is the reserved highest voucher less the amount already settled: the builder payout at stake. Timestamps ending in `_ms` are Unix milliseconds. `delivered_at_ms` is nullable and does not prove delivery of a terminal report. `written_off` records a retained decision and can remain true after an explicit retry; `write_off_note` and `written_off_at_ms` retain its details. Human output shows the amount, unit, action flags, and write-off details. `next_after` is omitted on a page shorter than the limit.
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_tempo_close_reports",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "reports": [
+    {
+      "obligation_id": "close-test",
+      "channel_id": "0x1234",
+      "amount_native": "9007199254740993",
+      "status": "unmatched",
+      "created_at_ms": 1755200000000,
+      "updated_at_ms": 1755200001000,
+      "delivered_at_ms": null,
+      "retryable": true,
+      "write_off_allowed": true,
+      "written_off": false,
+      "write_off_note": null,
+      "written_off_at_ms": null
+    }
+  ],
+  "report_count": 1,
+  "amount_unit": "native token units",
+  "display": "1 Tempo close report(s). Each amount is a potential builder payout in native token units.",
+  "hint": "Retry reopens the search for the close so the builder's payout report can still be sent. Write-off permanently gives up that payout report if the close lands later; it does not refund the caller."
+}
+```
+
+HTTP: `GET /admin/credit/tempo-close-reports?limit=20`; `--all` sends `all=1`, and `--after` sends the opaque `after` cursor. Invalid queries return HTTP 400 `invalid_query`.
+
+---
+
+## credit tempo-close-report-retry
+
+Reopen the search for a close so the builder's payout report can still be sent. Restore complete chain history before retrying. The next sweep searches again without broadcasting or changing the caller's drain. Success means the search was reopened, not that the payout report was delivered.
+
+```sh
+dvmctl credit tempo-close-report-retry my-dvm close-test
+dvmctl credit tempo-close-report-retry my-dvm close-test --human
+```
+
+| Flag | Description |
+|---|---|
+| `--endpoint <url>` | DVM admin endpoint URL, skipping the platform lookup |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Human-readable output instead of JSON |
+
+Accepts only unsubmitted `unmatched` or `no_report` obligations with no competing report for that channel. A reserved, observed, delivered, or otherwise unresolved successor can block retry. Another unsubmitted `no_report` row does not compete. The server clears the durable search cursor and returns `status: "reserved"`.
+
+The CLI reads at most five audit pages of 50 rows to find the amount before retrying, preserving its decimal string. This is a snapshot, not an eligibility check. If the amount is not found within those pages, or a row becomes eligible only after that read, retry still proceeds and can succeed with `amount_native: null` and an unavailable-amount message. Inspect the retained service report evidence for its amount.
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_tempo_close_report_retry",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "status": "reserved",
+  "obligation_id": "close-test",
+  "amount_native": "9007199254740993",
+  "amount_unit": "native token units",
+  "display": "Reopened the search for close close-test (9007199254740993 native token units) so the builder's payout report can still be sent.",
+  "hint": "The next service sweep searches again without broadcasting or changing the caller's drain. Check service events for delivery; the report has not been sent by this command."
+}
+```
+
+HTTP: `POST /admin/credit/retry-tempo-close-report` with `{ "obligation_id": "close-test" }`. The server response contains only `status` and `obligation_id`; the CLI adds the pre-retry amount and output envelope.
+
+---
+
+## credit tempo-close-report-write-off
+
+Permanently give up the builder's payout report if the missing close lands later. Only an unsubmitted `unmatched` report can be written off. This discharges that report's cleanup blocker; it never moves caller money, releases caller refund liabilities, or declares a refund paid. The exact abandoned builder payout is printed as `amount_forgone_native` in native token units.
+
+If history becomes recoverable, an explicit `tempo-close-report-retry` can reopen the written-off row **before** a late close lands. A close that lands while written off will not have its payout reported. Do not use write-off as a routine retry or cleanup operation.
+
+```sh
+dvmctl credit tempo-close-report-write-off my-dvm close-test --note "History unavailable"
+dvmctl credit tempo-close-report-write-off my-dvm close-test --note "History unavailable" --human
+```
+
+| Flag | Description |
+|---|---|
+| `--note <text>` | Required reason, 1–2000 characters after trimming; retained on the report |
+| `--endpoint <url>` | DVM admin endpoint URL, skipping the platform lookup |
+| `--org <handle>` | Target this org, overriding the `dvmctl switch` context |
+| `--human` | Human-readable output instead of JSON |
+
+Like the existing `credit` write-off commands, this command has no interactive confirmation prompt. Running it authorizes the write-off; review the payout amount and action flags with `tempo-close-reports` first. A repeat write-off returns a conflict rather than replaying success.
+
+**JSON output:**
+
+```json
+{
+  "op": "credit_tempo_close_report_write_off",
+  "handle": "my-dvm",
+  "dvmId": "550e8400-e29b-41d4-a716-446655440000",
+  "slug": "my-dvm",
+  "status": "written_off",
+  "obligation_id": "close-test",
+  "channel_id": "0x1234",
+  "amount_forgone_native": "9007199254740993",
+  "note": "History unavailable",
+  "amount_unit": "native token units",
+  "display": "Wrote off close-test: 9007199254740993 native token units forgone. This permanently gives up the builder's payout report if the close lands later.",
+  "hint": "No caller funds moved or refund liability was discharged. If recovery becomes possible, explicitly retry before the close lands; a payout from a close that lands while written off will not be reported."
+}
+```
+
+HTTP: `POST /admin/credit/write-off-tempo-close-report` with `{ "obligation_id": "close-test", "note": "History unavailable" }`. Both action routes trim the obligation ID before lookup and response.
+
+**Error anchors for all three close-report commands:**
+
+| Code | Trigger and next step |
+|---|---|
+| `tempo_close_report_conflict` | HTTP 409: the server refused the transition, including repeat write-offs. Read its reason, then inspect `tempo-close-reports --all` and the action flags before deciding again. |
+| `not_found` | HTTP 404: this DVM does not serve the close-report routes. Upgrade the DVM to `@dvmkit/sdk` 0.10.0 or later, then retry. |
+| `tempo_close_report_not_found` | HTTP 404: missing obligation, another deployment's obligation, or another operation. Check the target DVM and the ID in `tempo-close-reports --all`. |
+| `tempo_close_report_unavailable` | HTTP 503: hosted settlement reports are not configured. Configure them on a DVM using SDK 0.10.0 or later, then retry. |
+| `invalid_request` | HTTP 400: malformed JSON, ID, or note. Correct the request; the CLI trims IDs and validates notes locally. |
+| `invalid_query` | HTTP 400: invalid page query. Use the documented page size, cursor, and audit flag. |
+| `invalid_limit` | Local page size outside 1..50. Use a valid limit and follow `next_after`. |
+| `invalid_note` | Local missing, empty, or oversized note. Supply 1–2000 characters after trimming. |
+| `invalid_obligation_id` | Local empty ID. Copy the ID from the list command. |
+| `admin_bad_signature` | HTTP 401 with `bad_signature`: the builder identity does not match the DVM's lock key. Restore the correct builder identity before retrying. |
+
+Other authentication refusals retain HTTP 401. Refused actions print no success output and include the server's reason and a next step.
 
 ---
 

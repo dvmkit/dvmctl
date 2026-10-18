@@ -24,7 +24,8 @@ Read only the relevant [dvmctl command contract](https://dvmkit.com/docs/cli-dvm
 
 - `credit blocked` inspects Lightning invoice problems; `credit reconcile` checks the existing payment evidence.
 - `credit x402-wedged` and `credit x402-reconcile` inspect and reconcile x402 settlement.
-- `credit tempo-wedged` and `credit tempo-reconcile` inspect and reconcile Tempo drains.
+- `credit tempo-wedged` and `credit tempo-reconcile` inspect and reconcile Tempo drains. For `exit_required`, a landed close covering the debit can be reconciled; a landed short refund has no repair command yet and cannot be written off. Only a confirmed no-close result directs the caller to the timed exit. With unavailable chain evidence or an unknown debit, re-run with chain lookups or check the channel before choosing. Written-off audit rows are visible but excluded from action counts.
+- `credit tempo-close-reports`, `credit tempo-close-report-retry`, and `credit tempo-close-report-write-off` manage the builder's payout reports. Read the [Tempo close-report reference](references/tempo-close-reports.md) before acting.
 - `credit drains-owed` identifies manual stablecoin refunds. `credit drain-settle` records a transfer that actually happened; it does not send the funds.
 - `melt-pending` services ecash refunds before builder payout. Restore missing worker credentials or connectivity without removing the refund hold.
 

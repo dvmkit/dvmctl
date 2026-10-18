@@ -25,6 +25,7 @@ const expectedFiles = [
   "skills/build-dvm/references/local-cashu-test.md",
   "skills/build-dvm/references/local-tempo-test.md",
   "skills/build-dvm/references/local-x402-test.md",
+  "skills/build-dvm/references/tempo-close-reports.md",
   "skills/build-dvm/retirement.md",
   "skills/build-dvm/testing.md",
 ];
