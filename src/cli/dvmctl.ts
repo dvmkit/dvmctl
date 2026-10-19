@@ -1,3 +1,5 @@
+import { registerBillingCommands } from "../commands/builder/billing.ts";
+
 import { realpathSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
@@ -1200,6 +1202,7 @@ export function buildProgram(): Command {
       catchErrors(() => setPayout(handle, lnAddress, opts), opts.human);
     });
 
+  registerBillingCommands(program);
   return program;
 }
 

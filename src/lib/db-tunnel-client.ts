@@ -255,7 +255,9 @@ export function mapHandshakeError(
   if (status === 410) {
     return new DvmError(
       code ?? "gone",
-      message ?? `DVM '${slug}' has been destroyed.`,
+      message ?? (code === "trial_recovery_closed"
+        ? "The seven-day trial recovery window has closed."
+        : `DVM '${slug}' has been destroyed.`),
       undefined,
       undefined,
       undefined,
