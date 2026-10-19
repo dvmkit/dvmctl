@@ -34,7 +34,7 @@ import { markPlatformError } from "./platform-error-tag.ts";
  * JSON output via `setOutputTraceId`. For multi-call commands, the last
  * response's trace_id wins.
  */
-async function platformFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+export async function platformFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
   const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
   const attempts = method === "GET" || method === "HEAD" ? 3 : 1;
   let lastError: unknown;
@@ -45,6 +45,10 @@ async function platformFetch(input: string | URL | Request, init?: RequestInit):
       if (tp) {
         const parsed = parseTraceparent(tp);
         if (parsed) setOutputTraceId(parsed.traceId);
+      }
+      if (res.status === 409 && /\/(deploy|resume|scale)$/.test(String(input))) {
+        const { admissionRefusal } = await import("./billing-client.ts");
+        return admissionRefusal(res, String(input), init);
       }
       return res;
     } catch (err) {
@@ -105,9 +109,12 @@ interface PlatformErrorBody {
   hint?: string;
   display?: string;
   data?: Record<string, unknown>;
+  options?: unknown;
+  reasons?: unknown;
+  next_actions?: unknown;
 }
 
-function platformResponseError(
+export function platformResponseError(
   code: string,
   remote: PlatformErrorBody | undefined,
   fallbackMessage: string,
@@ -117,8 +124,11 @@ function platformResponseError(
     data?: Record<string, unknown>;
   } = {}
 ): DvmError {
-  const data =
-    remote?.data || local.data ? { ...(remote?.data ?? {}), ...(local.data ?? {}) } : undefined;
+  const relay = Object.fromEntries(
+    ["options", "reasons", "next_actions"].filter((key) => remote && key in remote)
+      .map((key) => [key, remote![key as keyof PlatformErrorBody]])
+  );
+  const data = { ...(remote?.data ?? {}), ...relay, ...(local.data ?? {}) };
   const error = new DvmError(
     code,
     remote?.message ?? fallbackMessage,
