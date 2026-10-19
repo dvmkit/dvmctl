@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/dvmkit/dvmctl/compare/v0.10.0...v0.11.0) (2026-10-19)
+
+
+### Features
+
+* add billing and trial recovery commands ([#18](https://github.com/dvmkit/dvmctl/issues/18)) ([c49ebd9](https://github.com/dvmkit/dvmctl/commit/c49ebd9cd193d3df34cbd353f52403ea0a12fb84))
+
 ## [0.10.0](https://github.com/dvmkit/dvmctl/compare/v0.9.0...v0.10.0) (2026-10-18)
 
 

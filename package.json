@@ -1,6 +1,6 @@
 {
   "name": "@dvmkit/dvmctl",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Build and deploy Digital Vending Machines: pay-per-use HTTPS services that AI agents can find, pay, and call with no account or API key",
   "author": "DVM Technologies Ltd",
   "homepage": "https://dvmkit.com/docs/cli-dvmctl",
