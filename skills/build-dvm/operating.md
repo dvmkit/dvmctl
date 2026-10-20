@@ -22,6 +22,10 @@ For stablecoins, verify the configured network and recipient, then inspect the t
 
 ## Change the service
 
+For an authorized completed-job refund, run `dvmctl refund <job-id> --dvm <slug>` to inspect the local intent, then repeat it with `--confirm`. No HTTP is sent without confirmation. Omit `--amount` for the remaining unrefunded charge, or supply a positive decimal in the job's credit currency. The default refund ID is stable across retries and equivalent decimal spellings. Preserve the original arguments and reason after an interruption. Use a new `--refund-id` only for a deliberate additional partial refund of the same amount. The money returns to the caller's credit for reuse or `dvm credit drain <dvm>`; a replay reports the original refund and balance snapshot, not the current balance.
+
+Completed-job refunds require a persistent store and platform refund reporting on SDK `0.11.0-rc.1` or a compatible later release. Before activation, pause monetary writes and upgrade all processes sharing the credit database and report queue, including funding writers and retry workers. Mixed-version monetary history and rollback after refund state exists need a state compatibility assessment; see the [SDK upgrade details](https://github.com/dvmkit/sdk/blob/v0.11.0-rc.1/CHANGELOG.md). Per-job payments, closed credits, Tempo channel payments, and x402 batch-channel payments cannot be refunded through this command. Missing historical payment or reopening evidence requires operator inspection; retrying or current exchange rates cannot establish it. Follow each refusal's `hint` and preserve recovery evidence.
+
 Choose the command matching the requested change. Use [deploying](deploying.md) for a new revision. Use restart, scale, environment, domain, or database commands only after checking their target and consequences in the reference. A machine restart does not repair a missing payment record.
 
 Before a transfer, inspect the current owner, intended destination organization, and custody consequences. After transfer, verify the resulting owner and any pending treasury re-key. Follow the required redeployment before reporting payouts ready.
