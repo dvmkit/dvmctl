@@ -148,6 +148,7 @@ test("packaged scaffold declares the same exact SDK as the CLI runtime", async (
   assert.equal(result.code, 0, result.stderr);
   const project = JSON.parse(readFileSync(join(target, "package.json"), "utf8"));
   const installed = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
-  assert.equal(project.dependencies["@dvmkit/sdk"], "0.11.0-rc.1");
-  assert.equal(installed.dependencies["@dvmkit/sdk"], "0.11.0-rc.1");
+  const runtimeSdkVersion = installed.dependencies["@dvmkit/sdk"];
+  assert.match(runtimeSdkVersion, /^\d+\.\d+\.\d+(?:-rc\.\d+)?$/u);
+  assert.equal(project.dependencies["@dvmkit/sdk"], runtimeSdkVersion);
 });
