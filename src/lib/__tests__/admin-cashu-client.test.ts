@@ -183,6 +183,15 @@ describe("AdminCashuClient", () => {
     });
   });
 
+  it("classifies an older SDK's plain-text missing refund route without hiding typed missing draws", async () => {
+    const fetchImpl = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(new Response("404 Not Found", { status: 404 }))
+      .mockResolvedValueOnce(jsonResponse(404, { error: "draw_not_found" }));
+    const client = new AdminCashuClient({ endpoint: "https://dvm.example", dvmId: "dvm-fixture-1", privkeyHex: PRIVKEY, fetchImpl });
+    await expect(client.refundDraw({ jobId: "job-example", refundId: "refund-example" })).rejects.toMatchObject({ status: 404, body: { error: "not_found" } });
+    await expect(client.refundDraw({ jobId: "job-example", refundId: "refund-example" })).rejects.toMatchObject({ status: 404, body: { error: "draw_not_found" } });
+  });
+
   it("wraps fetch failures as admin_unreachable", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockRejectedValueOnce(new Error("ECONNREFUSED"));
     const client = new AdminCashuClient({

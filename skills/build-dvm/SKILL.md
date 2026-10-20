@@ -18,7 +18,7 @@ Identify the user's task and the service's current state. Read the matching file
 | Turn an idea into a working local capability | [new-builder](new-builder.md) |
 | Validate behavior or prove a paid call | [testing](testing.md), then only the chosen payment recipe |
 | Prepare or perform a deployment | [deploying](deploying.md) |
-| Inspect health or earnings, collect payouts, update, or transfer a service | [operating](operating.md) |
+| Inspect health or earnings, collect payouts, refund a completed job, update, or transfer a service | [operating](operating.md) |
 | Diagnose a failure or reconcile an uncertain payment or deploy | [recovery](recovery.md) |
 | Retain job content for support or a dispute | [content holds](references/content-holds.md) |
 | Export minimized financial evidence before database deletion | [financial export](references/financial-export.md) |

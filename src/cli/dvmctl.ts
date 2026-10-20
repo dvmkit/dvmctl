@@ -28,6 +28,7 @@ import { contentHolds, type ContentHoldOptions } from "../commands/builder/conte
 import type { CreateOptions } from "../commands/builder/create.ts";
 import { create } from "../commands/builder/create.ts";
 import { creditLiability, type CreditLiabilityOptions } from "../commands/builder/credit-liability.ts";
+import { refund, type RefundOptions } from "../commands/builder/refund.ts";
 import type { DbConnectOptions } from "../commands/builder/db-connect.ts";
 import { dbConnect } from "../commands/builder/db-connect.ts";
 import type { DbProxyOptions } from "../commands/builder/db-proxy.ts";
@@ -882,6 +883,21 @@ export function buildProgram(): Command {
       });
     }
   }
+
+  program
+    .command("refund <job-id>")
+    .description("Refund a completed job's charge onto the caller's prepaid credit")
+    .option("--dvm <handle>", "DVM slug (default: current project's name, as for deploy)")
+    .option("--amount <decimal>", "Amount in the job's credit currency; omit for the remaining unrefunded charge")
+    .option("--reason <text>", "Optional refund reason, at most 280 characters")
+    .option("--refund-id <id>", "Override the deterministic refund ID for a deliberate additional partial refund")
+    .option("--confirm", "Submit the refund; without this flag, refuse with a local intent and send no HTTP")
+    .option("--endpoint <url>", "DVM admin endpoint URL for self-hosted DVMs or local development")
+    .option("--org <handle>", "Target this org, overriding the dvmctl switch context")
+    .option("--human", "Human-readable output instead of JSON")
+    .action((jobId: string, opts: RefundOptions) => {
+      catchErrors(() => refund(jobId, opts), opts.human);
+    });
 
   const creditCmd = program
     .command("credit")

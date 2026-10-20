@@ -119,6 +119,29 @@ export interface AdminPendingDrainsResponse {
   };
 }
 
+export interface AdminRefundDrawRequest {
+  jobId: string;
+  refundId: string;
+  /** Omission is a stable request for the draw's unrefunded remainder. */
+  amountMicro?: number;
+  reason?: string;
+}
+
+export interface AdminRefundDrawResponse {
+  status: "refunded";
+  refund_id: string;
+  credit_id: string;
+  draw_id: string;
+  job_id: string;
+  amount_micro: number;
+  currency: string;
+  ledger_seq: number;
+  refunded_at: number;
+  /** The original refund's balance snapshot, including on replay. */
+  balance_after_micro: number;
+  replayed: boolean;
+}
+
 /**
  * Response body from `GET /admin/credit/bitcoin-liability` — what
  * this DVM owes callers in satoshis, priced off funding lots rather than a
@@ -692,6 +715,10 @@ export class AdminCashuClient {
     );
   }
 
+  async refundDraw(body: AdminRefundDrawRequest): Promise<AdminRefundDrawResponse> {
+    return this.requestJson<AdminRefundDrawResponse>("POST", "/admin/credit/refund-draw", body);
+  }
+
   /**
    * Read the sats this DVM owes callers: undrawn Bitcoin deposits
    * plus registered reclaims, both priced in kind off the funding lots.
@@ -978,6 +1005,9 @@ export class AdminCashuClient {
     try {
       parsed = text.length === 0 ? {} : JSON.parse(text);
     } catch {
+      if (res.status === 404 && path === "/admin/credit/refund-draw") {
+        throw new AdminApiError(404, { error: "not_found", raw: text });
+      }
       throw new DvmError(
         "admin_invalid_json",
         `DVM admin endpoint ${path} returned non-JSON (HTTP ${res.status}): ${text.slice(0, 200)}`,
