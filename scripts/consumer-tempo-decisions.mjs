@@ -2,17 +2,20 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
-import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { dirname, join, resolve } from "node:path";
 
 import { processCommand, removeTemporaryDirectory } from "./consumer-process.mjs";
 
 /** Exercise the CLI file supplied by the caller, including an installed tarball. @param {string} cli */
 export async function assertTempoDrainDecisions(cli) {
   const wire = JSON.parse(readFileSync(new URL("../test/fixtures/tempo-drain-decisions.json", import.meta.url), "utf8"));
-  const { buildAdminChallenge, deriveBuilderLockKeypair, verifyChallenge } = await import(pathToFileURL(createRequire(resolve(cli)).resolve("@dvmkit/sdk/internal")).href);
+  // The SDK exposes import-only entry points. Resolve from the supplied CLI's
+  // directory so installed-consumer checks use that consumer's dependency tree.
+  const sdk = await processCommand(process.execPath, ["--input-type=module", "-e", "process.stdout.write(import.meta.resolve('@dvmkit/sdk/internal'))"], {
+    cwd: dirname(resolve(cli)), capture: true,
+  });
+  const { buildAdminChallenge, deriveBuilderLockKeypair, verifyChallenge } = await import(sdk.stdout);
   const root = mkdtempSync(join(tmpdir(), "dvmctl-tempo-"));
   const config = join(root, "config");
   mkdirSync(config);
