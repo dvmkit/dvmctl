@@ -1,11 +1,3 @@
-/**
- * The `dvmctl credit tempo-*` verbs. The route contract is asserted
- * in `@dvmkit/sdk/server` and the shared terminal
- * transition in `tempo-drain-leg.test.ts`; what only this suite covers is the
- * CLI's own half — the page ceiling it refuses locally rather than asking the
- * DVM about, the bad-signature translation, and the JSON an agent
- * reads to decide between reconciling and writing off.
- */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type * as adminCashuClientModule from "../../../lib/admin-cashu-client";
@@ -137,8 +129,7 @@ describe("dvmctl credit tempo-wedged", () => {
           },
         }),
         drainRow({ drain_id: "drain-down", chain: { chain: "unreachable", error: "timeout" } }),
-        // A chain figure on a drain an operator already closed out is not work
-        // anybody is waiting on, so it must not inflate the repairable count.
+        // Write-off annotations remain visible without inflating existing action counts.
         drainRow({ drain_id: "drain-closed", write_off_note: "reviewed", written_off_at: 5 }),
       ],
       next_after: "cursor",
@@ -268,7 +259,7 @@ describe("dvmctl credit tempo-reconcile", () => {
 });
 
 describe("dvmctl credit tempo-write-off", () => {
-  it("says the shortfall is not expressible here, and that the verb is reversible", async () => {
+  it("keeps the write-off an annotation and directs full repayment to operator booking", async () => {
     await tempoWriteOff("cast", CREDIT_ID, DRAIN_ID, {
       endpoint: ENDPOINT,
       note: "chain refunded short",
@@ -280,7 +271,8 @@ describe("dvmctl credit tempo-write-off", () => {
     });
     const body = vi.mocked(output.json).mock.calls[0][0] as Record<string, unknown>;
     expect(body).toMatchObject({ op: "credit_tempo_write_off", replayed: false });
-    expect(String(body.display)).toContain("out of band");
+    expect(String(body.display)).toContain("refund liability remains");
+    expect(String(body.display)).toContain("tempo-book");
     expect(String(body.hint)).toContain("tempo-reconcile");
   });
 
@@ -303,5 +295,77 @@ describe("dvmctl credit tempo-write-off", () => {
     const body = vi.mocked(output.json).mock.calls[0][0] as Record<string, unknown>;
     expect(String(body.display)).toContain("the first note");
     expect(String(body.display)).toContain("not recorded over it");
+  });
+});
+
+
+describe("held Tempo audit presentation", () => {
+  it.each([false, true])("keeps held write-offs visible and terminal decisions out of action counts, human=%s", async (human) => {
+    const decision = { source: "operator" as const, decision: "release" as const, reason: "No refund paid", decidedAt: 1800000001000 };
+    const rows = [
+      drainRow(),
+      drainRow({ drain_id: "written-off", written_off_at: 5, write_off_note: "Reviewed", held_reason: "refund_short" }),
+      drainRow({ drain_id: "released", status: "released", held_reason: null, decision }),
+      drainRow({ drain_id: "booked", status: "sent", decision: { ...decision, decision: "book_refunded" } }),
+    ];
+    getTempoDrains.mockResolvedValue({ drains: rows, next_after: "opaque /?&cursor" });
+    await tempoWedged("cast", { endpoint: ENDPOINT, includeResolved: true, human, after: "prior /?&cursor", limit: 50 });
+    expect(getTempoDrains).toHaveBeenCalledWith({ limit: 50, after: "prior /?&cursor", includeResolved: true });
+    if (human) {
+      expect(output.raw).toHaveBeenCalledTimes(4);
+      expect(output.raw).toHaveBeenCalledWith(expect.stringContaining('written-off — note on record: "Reviewed"'));
+      expect(output.raw).toHaveBeenCalledWith(expect.stringContaining('decision={"source":"operator","decision":"release"'));
+      expect(output.info).toHaveBeenCalledWith(expect.stringContaining("1 awaiting a decision, 1 whose on-chain refund covers"));
+    } else {
+      expect(output.json).toHaveBeenCalledWith(expect.objectContaining({ drains: rows, wedged_count: 1, repairable_count: 1, next_after: "opaque /?&cursor" }));
+    }
+  });
+
+  it.each([false, true])("preserves exact, unknown, and sticky positive facts alongside separate reports, human=%s", async (human) => {
+    const rows = [
+      drainRow({ credit_id: "credit/日本語?&", drain_id: "drain with spaces", held_reason: "refund_short",
+        proven_refund_native: "900719925474099312345678901234567890", refund_payment_proven: true,
+        chain: { chain: "found", transaction: TX_HASH, refundedToPayer: "0", settledToPayee: "1" },
+        close_reports: [{ obligation_id: "report/1", status: "no_report", written_off: true }] }),
+      drainRow({ drain_id: "positive-lower-bound", proven_refund_native: null, refund_payment_proven: true, chain: undefined }),
+      drainRow({ drain_id: "exact-zero", proven_refund_native: "0", refund_payment_proven: false, chain: undefined }),
+      drainRow({ drain_id: "unknown", proven_refund_native: null, refund_payment_proven: false, chain: undefined }),
+    ];
+    getTempoDrains.mockResolvedValue({ drains: rows });
+    await tempoWedged("cast", { endpoint: ENDPOINT, human, evidence: false });
+    if (human) {
+      const text = vi.mocked(output.raw).mock.calls.flat().join(" ");
+      expect(text).toContain("900719925474099312345678901234567890");
+      expect(text).toContain("proven_refund_native=unknown  refund_payment_proven=true");
+      expect(text).toContain("proven_refund_native=0  refund_payment_proven=false");
+      expect(text).toContain("report/1  no_report  written_off=true (builder payout report; separate from caller refund)");
+      expect(output.info).toHaveBeenCalledWith(expect.stringContaining("false does not prove nonpayment"));
+    } else {
+      expect(output.json).toHaveBeenCalledWith(expect.objectContaining({ drains: rows, hint: expect.stringContaining("false does not prove nonpayment") }));
+    }
+  });
+
+  it.each([false, true])("keeps a written-off held row visible on the default page, human=%s", async (human) => {
+    const row = drainRow({ written_off_at: 5, write_off_note: "Reviewed", held_reason: "refund_short" });
+    getTempoDrains.mockResolvedValue({ drains: [row] });
+    await tempoWedged("cast", { endpoint: ENDPOINT, human });
+    expect(getTempoDrains).toHaveBeenCalledWith({ limit: 20 });
+    if (human) {
+      expect(output.raw).toHaveBeenCalledWith(expect.stringContaining("written-off"));
+      expect(output.info).toHaveBeenCalledWith(expect.stringContaining("still hold the caller's debited balance"));
+    } else {
+      expect(output.json).toHaveBeenCalledWith(expect.objectContaining({ drains: [row], wedged_count: 0, short_refund_count: 0,
+        hint: expect.stringContaining("Written-off held drains remain visible") }));
+    }
+  });
+
+  it("compares decimal receipt evidence without rounding above the safe integer limit", async () => {
+    // This debit is exactly representable; rounding the receipt up to it would hide a short refund.
+    getTempoDrains.mockResolvedValue({ drains: [
+      drainRow({ amount_native: 9007199254740996, chain: { chain: "found", transaction: TX_HASH, refundedToPayer: "9007199254740995", settledToPayee: "1" } }),
+      drainRow({ drain_id: "large", amount_native: 9007199254740991, chain: { chain: "found", transaction: TX_HASH, refundedToPayer: "90071992547409931234567890", settledToPayee: "1" } }),
+    ] });
+    await tempoWedged("cast", { endpoint: ENDPOINT });
+    expect(output.json).toHaveBeenCalledWith(expect.objectContaining({ repairable_count: 1, short_refund_count: 1 }));
   });
 });

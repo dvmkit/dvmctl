@@ -193,19 +193,19 @@ it.each([false, true])("offers reconciliation for an exit_required close coverin
   }
 });
 
-it.each([false, true])("separates a landed short exit_required refund from available repairs with human=%s", async (human) => {
+it.each([false, true])("directs a landed short exit_required refund to full operator booking with human=%s", async (human) => {
   response = { drains: [{ ...terminalDrain, chain: {
     chain: "found", transaction: "0x5678", refundedToPayer: "9", settledToPayee: "6",
   } }] };
   await tempoWedged("service", { endpoint, human });
   if (human) {
-    expect(info).toHaveBeenCalledWith(expect.stringMatching(/credit-test.*drain-test.*close landed.*short.*no command can repair it yet/i));
+    expect(info).toHaveBeenCalledWith(expect.stringMatching(/credit-test.*drain-test.*close landed.*short.*tempo-book/i));
     expect(info).not.toHaveBeenCalledWith(expect.stringMatching(/tempo-reconcile|tempo-write-off|timed exit/));
   } else {
     expect(json).toHaveBeenCalledWith(expect.objectContaining({
       wedged_count: 0, repairable_count: 0, short_refund_count: 0, timed_exit_count: 0,
       exit_required_short_refund_count: 1,
-      display: expect.stringMatching(/close.*landed.*short.*no command can repair/i),
+      display: expect.stringMatching(/close.*landed.*short.*tempo-book/i),
     }));
     expect(vi.mocked(json).mock.calls[0][0]).not.toMatchObject({ hint: expect.stringMatching(/tempo-reconcile|tempo-write-off|timed exit/) });
   }

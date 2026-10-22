@@ -2402,15 +2402,15 @@ The JSON response uses `op: "credit_tempo_losses"`. Each `losses[]` row carries 
 
 ## credit tempo-wedged
 
-List Tempo cooperative closes that landed on chain but never booked the caller's drain.
+List held Tempo caller drains with refund evidence, operator audit, and separate channel close-report summaries.
 
 A Tempo channel close debits the caller's credit balance when the close intent is reserved, then broadcasts, then checks that what the chain refunded covers what the ledger extinguished. When that last step refuses, the channel is closed, the balance is gone, and every retry — the caller's own poll included — lands on the same refusal, because a closed channel cannot pay a second time. This is that queue.
 
 Each row puts the two figures side by side: `amount_native` is the debit the refund has to cover, and `chain.refundedToPayer` is what the close receipt says it paid. Reading the chain costs an RPC round trip per row, so the page ceiling is 50 and `--no-evidence` skips the lookups entirely when you only want to see how many rows there are. A row whose RPC fails comes back `chain: "unreachable"` rather than failing the whole page — that says nothing about what the close paid, which is exactly why it is not the same answer as a close that names no receipt.
 
-Drains you have already written off are hidden by default; `--include-resolved` is the audit view.
+Current servers include written-off held drains by default: the annotation does not release the debit or pay the caller. `--include-resolved` additionally lists terminal operator decisions. Older servers may omit the new audit fields or hide write-offs; the CLI preserves their response and pagination.
 
-A drain with `status: "exit_required"` is classified using its chain evidence. If a close landed and its refund covers the debit, it counts in `wedged_count` and `repairable_count` and can be finished with `tempo-reconcile`. If a close landed with a short refund, no command can repair it yet: `tempo-write-off` refuses this status. These short terminal rows are counted separately in `exit_required_short_refund_count`, outside `short_refund_count` and `wedged_count`. A confirmed no-close result (`chain: "unconfirmed"`) means cooperative close is unavailable, and the caller must recover the funds with the timed exit; these rows appear in `timed_exit_count`. Unchecked, failed, or unknown chain reads, a missing close receipt, and a landed close with an unknown debit or unreadable refund instead get a "chain evidence unavailable" explanation. Re-run with chain lookups (omit `--no-evidence`), or check the channel before choosing an action. Those rows appear in `exit_required_evidence_unavailable_count`. `exit_required_count` counts unresolved rows with that status. All action counts exclude written-off drains, including under `--include-resolved`; the audit rows remain visible with their recorded notes and timestamps. Human output and JSON explanations distinguish all four cases. Builder payout reports are separate: inspect them with [`credit tempo-close-reports`](#credit-tempo-close-reports).
+A drain with `status: "exit_required"` is classified using its chain evidence. If a close landed and its refund covers the debit, it counts in `wedged_count` and `repairable_count` and can be finished with `tempo-reconcile`. If a close landed with a short refund, independently return any remainder and then use `tempo-book` to attest to the whole refund; `tempo-write-off` still refuses this status. These short terminal rows are counted separately in `exit_required_short_refund_count`, outside `short_refund_count` and `wedged_count`. A confirmed no-close result (`chain: "unconfirmed"`) means cooperative close is unavailable, and the caller must recover the funds with the timed exit; these rows appear in `timed_exit_count`. Unchecked, failed, or unknown chain reads, a missing close receipt, and a landed close with an unknown debit or unreadable refund instead get a "chain evidence unavailable" explanation. Re-run with chain lookups (omit `--no-evidence`), or check the channel before choosing an action. Those rows appear in `exit_required_evidence_unavailable_count`. `exit_required_count` counts unresolved rows with that status. All action counts exclude written-off drains and terminal decisions, including under `--include-resolved`; the audit rows remain visible with their recorded notes and timestamps. Human output and JSON explanations distinguish all four cases. Builder payout reports are separate: inspect them with [`credit tempo-close-reports`](#credit-tempo-close-reports).
 
 ```sh
 dvmctl credit tempo-wedged my-dvm
@@ -2421,7 +2421,7 @@ dvmctl credit tempo-wedged my-dvm --include-resolved --limit 50
 |---|---|
 | `--limit <n>` | Page size (default: 20, max 50) |
 | `--after <cursor>` | Continue from a previous run's `next_after` value |
-| `--include-resolved` | Also list drains you already wrote off — the audit view |
+| `--include-resolved` | Also list terminal operator decisions — the audit view |
 | `--min-age-ms <ms>` | How long a drain must have sat before it counts as stuck (default: 300000) |
 | `--no-evidence` | Skip the per-row chain lookups — a fast read of the queue itself |
 | `--endpoint <url>` | DVM admin endpoint URL (skips the platform lookup; use for self-hosted DVMs or local dev) |
@@ -2449,6 +2449,11 @@ dvmctl credit tempo-wedged my-dvm --include-resolved --limit 50
       "created_at": 1755200000000,
       "write_off_note": null,
       "written_off_at": null,
+      "decision": null,
+      "held_reason": "refund_short",
+      "proven_refund_native": "390000",
+      "refund_payment_proven": true,
+      "close_reports": [],
       "chain": {
         "chain": "found",
         "transaction": "0xb1c2...",
@@ -2466,11 +2471,11 @@ dvmctl credit tempo-wedged my-dvm --include-resolved --limit 50
   "timed_exit_count": 0,
   "exit_required_evidence_unavailable_count": 0,
   "display": "1 Tempo close(s) landed on chain without the caller's credit balance being booked as paid. 0 paid enough to cover the debit and can be finished. 1 refunded the caller less than was extinguished — those cannot be reconciled and need a decision.",
-  "hint": "Finish a repairable drain with `dvmctl credit tempo-reconcile <handle> <credit-id> <drain-id>` — the amount comes off the close receipt, not from you. If a pending drain's refund was genuinely short, close it with `dvmctl credit tempo-write-off`. Drains you have already written off are not counted here; re-run with `--include-resolved` to see those."
+  "hint": "Use tempo-book only after independently returning the entire held amount; use tempo-release only when no refund was paid. Unknown refund evidence is not zero. refund_payment_proven=true retains a positive-payment fact; false does not prove nonpayment. Separate channel close-report retry/write-off does not pay or release a caller drain. Finish a repairable drain with `dvmctl credit tempo-reconcile <handle> <credit-id> <drain-id>` — the amount comes off the close receipt, not from you. If a refund is short, independently return the remainder and use `dvmctl credit tempo-book` for the whole refund. A drain write-off only records an annotation. Written-off held drains remain visible but are not counted here; `--include-resolved` adds terminal operator decisions."
 }
 ```
 
-`repairable_count` is the rows whose on-chain refund covers the debit — those finish with `tempo-reconcile`. `short_refund_count` counts pending drains where the chain named a figure and it fell short; a reconcile refuses those, and `tempo-write-off` is how one gets closed. Landed short refunds on `exit_required` drains are separate and have no repair command yet. `awaiting_close_count` is counted separately and excluded from `wedged_count`: those are pending drains whose channel has no confirmed close at all, so nothing landed on chain and no repair applies — the caller's own poll is what finishes them. `next_after` appears when the page was full.
+`repairable_count` is the rows whose on-chain refund covers the debit — those finish with `tempo-reconcile`. `short_refund_count` counts pending drains where the chain named a figure and it fell short; a reconcile refuses those. Independently return any remainder and attest to the whole refund with `tempo-book`. Landed short refunds on `exit_required` drains are counted separately and use the same operator booking after full repayment. `awaiting_close_count` is counted separately and excluded from `wedged_count`: those are pending drains whose channel has no confirmed close at all, so nothing is confirmed on chain. Caller recovery and final evidence are needed before a decision; absence of a receipt is not proof of nonpayment. `next_after` appears when the page was full.
 
 **Error anchors:**
 
@@ -2480,6 +2485,92 @@ dvmctl credit tempo-wedged my-dvm --include-resolved --limit 50
 | `tempo_repair_unavailable` | The DVM has no durable Tempo session store, so it holds no closes to repair |
 | `admin_bad_signature` | The DVM advertises a lock pubkey your mnemonic cannot derive |
 
+The optional new audit fields remain absent on older servers. `held_reason` records the latest established proof refusal. `decision` retains operator action, reason, evidence, and Unix-millisecond `decidedAt`; terminal decisions have a null held reason. `close_reports` contains related terminal builder payout obligations (`obligation_id`, `status`, `written_off`), separate from the caller drain. `proven_refund_native` is a nullable exact decimal string; null means unknown, `"0"` is exact zero, and payer-exit lower bounds never populate it. Sticky `refund_payment_proven: true` means some refund is proven even if its exact amount is unknown or a later receipt says zero. False is not proof of nonpayment. Preserve decimal strings without Number conversion.
+
+---
+
+## credit tempo-book
+
+Attest that the entire held Tempo refund has independently been returned to the caller, including any off-path remainder. This command sends no payment and creates no transaction hash. A partial payment needs the remainder returned first.
+
+```sh
+dvmctl credit tempo-book my-dvm credit-example drain-example --reason "Full refund independently confirmed" --confirm
+```
+
+| Flag | Description |
+|---|---|
+| `--reason <text>` | Required immutable decision reason, 1–2000 characters after trimming |
+| `--evidence <text>` | Optional audit note/reference, 1–4000 trimmed characters; never chain proof |
+| `--confirm` | Submit this named intent; without it no discovery or admin HTTP is sent |
+| `--endpoint <url>` | DVM admin endpoint override for self-hosted or local services |
+| `--org <handle>` | Select the owning organization |
+| `--human` | Prose output instead of default JSON |
+
+HTTP: `POST /admin/credit/book-tempo-drain`. The JSON body contains exactly `credit_id`, `drain_id`, required trimmed `reason`, and optional trimmed `evidence`. IDs are matched exactly. No amount, source, or action overrides are supported. Requires SDK 0.11.0-rc.1 or a compatible later release.
+
+The output uses `op: "credit_tempo_book"` and preserves the server's `status: "sent"`, original `amount_micro`, nullable `amount_native`, `currency`, credit/drain/channel IDs, `decision`, current `balance_micro`, current `spendable_micro`, and `replayed`. The immutable audit object has `source: "operator"`, `decision: "book_refunded"`, `reason`, optional `evidence`, and `decidedAt` in Unix milliseconds. Both JSON and human output distinguish the decision from current balances. A restored balance can remain unspendable because of expiry, backing, job holds, and closing/finalized channels.
+
+Replay needs the same action, trimmed reason, and evidence and never moves money again; its audit/time remain original while balances are current. A changed reason/evidence, opposite action, or previously automatic booking returns `drain_decision_conflict`. Keep the original intent after a lost response. Neither command changes separate channel close-report obligations or treats off-path payment as verified escrow evidence.
+
+| Error | Next step |
+|---|---|
+| `confirmation_required` | Review the local intent, then repeat with `--confirm` |
+| `invalid_reason`, `invalid_evidence`, `invalid_id` | Correct locally invalid arguments; no HTTP was sent |
+| `drain_decision_conflict` (409) | Inspect `tempo-wedged --include-resolved`; preserve the original decision |
+| `tempo_drain_close_pending` (409) | Resolve the final close/exit outcome; a missing hash or elapsed time is not proof of nonpayment |
+| `tempo_drain_refund_paid` (409) | Independently return the remainder, then book the whole refund; do not release |
+| `tempo_drain_refund_unknown` (409) | Recover original evidence before asserting nonpayment |
+| `drain_not_repairable` (422) | Check the target and exact ID pair; only supported Tempo session drains qualify |
+| `tempo_drain_decision_unavailable` (503) | Configure durable decision support, Tempo sessions, and hosted transactional drain reporting |
+| `invalid_body` (400) | Correct the reason/evidence or IDs; partial amounts are unsupported |
+| `unauthorized`, `admin_bad_signature` (401) | Check the builder lock identity for this service |
+| `credit_not_found`, `drain_not_found` (404) | Check the target DVM and exact IDs |
+| `not_found` (404) | Upgrade the service to a compatible SDK with decision routes |
+
+No refusal automatically retries or replaces intent.
+
+---
+
+## credit tempo-release
+
+Record that no refund was paid and restore the exact original held debit. Use only after establishing nonpayment; an unknown refund amount is not zero. Restoring balance does not reopen a channel or undo genuine backing loss.
+
+```sh
+dvmctl credit tempo-release my-dvm credit-example drain-example --reason "No refund was paid" --confirm
+```
+
+| Flag | Description |
+|---|---|
+| `--reason <text>` | Required immutable decision reason, 1–2000 characters after trimming |
+| `--evidence <text>` | Optional audit note/reference, 1–4000 trimmed characters; never chain proof |
+| `--confirm` | Submit this named intent; without it no discovery or admin HTTP is sent |
+| `--endpoint <url>` | DVM admin endpoint override for self-hosted or local services |
+| `--org <handle>` | Select the owning organization |
+| `--human` | Prose output instead of default JSON |
+
+HTTP: `POST /admin/credit/release-tempo-drain`. The JSON body contains exactly `credit_id`, `drain_id`, required trimmed `reason`, and optional trimmed `evidence`. IDs are matched exactly. No amount, source, or action overrides are supported. Requires SDK 0.11.0-rc.1 or a compatible later release.
+
+The output uses `op: "credit_tempo_release"` and preserves the server's `status: "released"`, original `amount_micro`, nullable `amount_native`, `currency`, credit/drain/channel IDs, `decision`, current `balance_micro`, current `spendable_micro`, and `replayed`. The immutable audit object has `source: "operator"`, `decision: "release"`, `reason`, optional `evidence`, and `decidedAt` in Unix milliseconds. Both JSON and human output distinguish the decision from current balances. A restored balance can remain unspendable because of expiry, backing, job holds, and closing/finalized channels.
+
+Replay needs the same action, trimmed reason, and evidence and never moves money again; its audit/time remain original while balances are current. A changed reason/evidence, opposite action, or previously automatic booking returns `drain_decision_conflict`. Keep the original intent after a lost response. Neither command changes separate channel close-report obligations or treats off-path payment as verified escrow evidence.
+
+| Error | Next step |
+|---|---|
+| `confirmation_required` | Review the local intent, then repeat with `--confirm` |
+| `invalid_reason`, `invalid_evidence`, `invalid_id` | Correct locally invalid arguments; no HTTP was sent |
+| `drain_decision_conflict` (409) | Inspect `tempo-wedged --include-resolved`; preserve the original decision |
+| `tempo_drain_close_pending` (409) | Resolve the final close/exit outcome; a missing hash or elapsed time is not proof of nonpayment |
+| `tempo_drain_refund_paid` (409) | Independently return the remainder, then book the whole refund; do not release |
+| `tempo_drain_refund_unknown` (409) | Recover original evidence before asserting nonpayment |
+| `drain_not_repairable` (422) | Check the target and exact ID pair; only supported Tempo session drains qualify |
+| `tempo_drain_decision_unavailable` (503) | Configure durable decision support, Tempo sessions, and hosted transactional drain reporting |
+| `invalid_body` (400) | Correct the reason/evidence or IDs; partial amounts are unsupported |
+| `unauthorized`, `admin_bad_signature` (401) | Check the builder lock identity for this service |
+| `credit_not_found`, `drain_not_found` (404) | Check the target DVM and exact IDs |
+| `not_found` (404) | Upgrade the service to a compatible SDK with decision routes |
+
+No refusal automatically retries or replaces intent.
+
 ---
 
 ## credit tempo-reconcile
@@ -2488,7 +2579,7 @@ Book a Tempo drain whose channel close already paid on chain.
 
 You name one thing — which drain. The DVM re-reads the `ChannelClosed` receipt the confirmed close already points at and books the drain against *that* figure, never one you supply, so this door cannot extinguish more or less than the chain returned. Any excess over the debit is the payer's uncredited channel surplus and is recorded on the drain alongside the settled amount.
 
-If the chain refunded less than the ledger is extinguishing it refuses and names both figures. That drain is not reconcilable: the channel is closed, so nothing can top the refund up. `tempo-write-off` can close out a pending drain; an `exit_required` drain with a short refund has no repair command yet.
+If the chain refunded less than the ledger is extinguishing it refuses and names both figures. That drain is not reconcilable: the channel is closed, so nothing can top the refund up. Independently return the remainder, then use `tempo-book` to attest that the whole refund was returned. `tempo-write-off` only annotates a pending held drain and leaves its refund liability unresolved.
 
 Running it twice books once: the second call answers `replayed: true` off the drain's own recorded state, without paying for another chain read.
 
@@ -2543,9 +2634,9 @@ dvmctl credit tempo-reconcile my-dvm imp:tempo:challenge-9 drain-7
 
 Record that you reviewed a wedged Tempo close and are not booking it.
 
-Books nothing anywhere. The close paid the caller less than this ledger extinguished, and no dvmkit row can express that difference: the channel is closed, so there is nothing left to refund through it, and re-crediting the balance here would pay the caller twice for the part the chain *did* return. Making the shortfall good is an out-of-band decision — this verb records that you took it, so the row leaves the queue without pretending it booked.
+Books nothing and settles no caller liability. The debit remains held, with the write-off note and timestamp retained. Current servers keep the row visible in the default held listing, while excluding it from action counts. Independently return any remainder out of band, then use `tempo-book` to attest to the whole refund; use `tempo-release` only when no refund was paid.
 
-Reversing it is `tempo-reconcile`, and a reconcile that then refuses leaves the write-off exactly as it found it — note, timestamp and all — so a drain never sits in the queue advertising a decision that was undone.
+`tempo-reconcile` still accepts a written-off drain if chain evidence later supports it; a refused reconcile leaves the annotation intact.
 
 ```sh
 dvmctl credit tempo-write-off my-dvm imp:tempo:challenge-9 drain-7 --note "chain refunded 390000 of 400000; made good by transfer 0x…"
@@ -2574,7 +2665,7 @@ dvmctl credit tempo-write-off my-dvm imp:tempo:challenge-9 drain-7 --note "chain
   "currency": "usd",
   "note": "chain refunded 390000 of 400000; made good by transfer 0x…",
   "replayed": false,
-  "display": "Closed this drain without booking it. No ledger row moved: the caller keeps the on-chain refund the close paid them, and the shortfall against what was extinguished is not expressible here — make it good out of band if you owe it.",
+  "display": "Annotated this held drain without booking it. No money moved and the refund liability remains. Independently return any remainder out of band, then use tempo-book to attest to the whole refund.",
   "hint": "Reversible: `dvmctl credit tempo-reconcile` still accepts a written-off drain if you change your mind."
 }
 ```

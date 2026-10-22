@@ -3,7 +3,7 @@ import { DvmError } from "@dvmkit/sdk/internal";
 
 import { type AdminTempoDrain } from "../../lib/admin-cashu-client.ts";
 import { info, json, raw } from "../../shared/output.ts";
-import { adminCall, connectAdmin } from "./admin-connection.ts";
+import { adminCall, type AdminConnectionOptions, connectAdmin } from "./admin-connection.ts";
 
 /** Largest page `dvmctl credit tempo-wedged` will ask the DVM for. */
 const MAX_LIMIT = 50;
@@ -57,7 +57,7 @@ export interface TempoWedgedOptions {
   limit?: number;
   /** Opaque `next_after` cursor from a previous run. */
   after?: string;
-  /** Also list drains already written off — the audit view. */
+  /** Also list terminal operator decisions — the audit view. */
   includeResolved?: boolean;
   /** How long a drain must have sat before it counts as stuck. Default 5 min. */
   minAgeMs?: number;
@@ -81,15 +81,96 @@ export interface TempoWriteOffOptions {
   org?: string;
 }
 
-/**
- * List the Tempo cooperative closes this DVM could not finish booking
- * — a channel close that landed on chain while its ledger leg
- * refused because the refund did not cover the debit.
- *
- * Read-only. Chain evidence determines whether a drain can be reconciled,
- * whether a pending drain has a short refund that can be written off, or
- * whether an exit_required drain still needs caller recovery.
- */
+export interface TempoDecisionOptions extends AdminConnectionOptions {
+  reason?: string;
+  evidence?: string;
+  confirm?: boolean;
+  human?: boolean;
+}
+
+const HELD_GUIDANCE = "Use tempo-book only after independently returning the entire held amount; use tempo-release only when no refund was paid. Unknown refund evidence is not zero. refund_payment_proven=true retains a positive-payment fact; false does not prove nonpayment. Separate channel close-report retry/write-off does not pay or release a caller drain.";
+
+const DECISION_HINTS: Record<string, string> = {
+  drain_decision_conflict: "Inspect tempo-wedged --include-resolved for the original decision. Replay only the same action, reason, and evidence; do not switch intent to bypass this conflict.",
+  tempo_drain_close_pending: "The close may already have been broadcast. Resolve its final close or timed-exit outcome before deciding; elapsed time or a missing transaction hash does not prove nonpayment.",
+  tempo_drain_refund_paid: "Some refund payment is already proven. Independently return any remaining amount, then use tempo-book for the whole held refund. Do not release a partial refund.",
+  tempo_drain_refund_unknown: "Recover the original refund evidence before asserting nonpayment. An unknown historical amount is not zero; do not release it on that assumption.",
+  drain_not_repairable: "Check the DVM, credit, and drain IDs in tempo-wedged. Only supported held Tempo session drains can receive these decisions; completed-job refunds use a separate command.",
+  tempo_drain_decision_unavailable: "Configure a durable decision-capable ledger and Tempo session store, plus transactional drain reporting for hosted services. Upgrade the service to @dvmkit/sdk 0.11.0-rc.1 or a compatible later release before retrying the same intent.",
+  credit_not_found: "Check the target DVM and exact credit ID in tempo-wedged before submitting the same intent again.",
+  drain_not_found: "Check the target DVM and exact credit/drain ID pair in tempo-wedged before submitting the same intent again.",
+  invalid_body: "Check the IDs, a reason of 1–2000 characters, and optional evidence of 1–4000 characters. Amount, source, and action overrides are unsupported.",
+  unauthorized: "Check the intended service and builder lock identity. Authentication must succeed before a decision can run; do not replace the financial intent.",
+};
+
+export async function tempoBook(handle: string, creditId: string, drainId: string, opts: TempoDecisionOptions): Promise<void> {
+  return tempoDecision("book_refunded", handle, creditId, drainId, opts);
+}
+
+export async function tempoRelease(handle: string, creditId: string, drainId: string, opts: TempoDecisionOptions): Promise<void> {
+  return tempoDecision("release", handle, creditId, drainId, opts);
+}
+
+async function tempoDecision(
+  action: "book_refunded" | "release", handle: string, creditId: string, drainId: string, opts: TempoDecisionOptions
+): Promise<void> {
+  if (!creditId.trim() || !drainId.trim()) {
+    throw new DvmError("invalid_id", "Nonempty credit and drain IDs are required.", "Copy the exact ID pair from tempo-wedged; IDs are matched exactly.");
+  }
+  const reason = opts.reason?.trim();
+  if (!reason || reason.length > 2000) {
+    throw new DvmError("invalid_reason", "--reason must contain 1 to 2000 characters after trimming.", "Explain why the whole refund was independently returned, or why no refund was paid.");
+  }
+  const evidence = opts.evidence?.trim();
+  if (opts.evidence !== undefined && (!evidence || evidence.length > 4000)) {
+    throw new DvmError("invalid_evidence", "--evidence must contain 1 to 4000 characters after trimming.", "Supply an audit note/reference, or omit --evidence. It is not submitted chain proof.");
+  }
+  const intent = action === "book_refunded"
+    ? "Attest that the entire held refund, including any off-path remainder, was independently returned to the caller."
+    : "Record that no refund was paid and restore the original held debit, subject to existing spending restrictions.";
+  if (!opts.confirm) {
+    throw new DvmError("confirmation_required", "Tempo drain decision confirmation is required.",
+      "Repeat the same command with --confirm to submit this intent. No HTTP request has been sent.",
+      { handle, credit_id: creditId, drain_id: drainId, action, reason, ...(evidence === undefined ? {} : { evidence }) },
+      `${intent} This local intent does not establish eligibility.`);
+  }
+  const { client, dvmId } = await connectAdmin(handle, opts);
+  const body = { credit_id: creditId, drain_id: drainId, reason, ...(evidence === undefined ? {} : { evidence }) };
+  const res = await decisionCall(() => action === "book_refunded" ? client.bookTempoDrain(body) : client.releaseTempoDrain(body));
+  const outcome = action === "book_refunded"
+    ? `Booked the whole held refund of ${res.amount_micro} ${res.currency} micro as independently returned to the caller; this command sent no payment.`
+    : `Released the held debit of ${res.amount_micro} ${res.currency} micro because no refund was paid.`;
+  const display = `Drain ${res.drain_id} on ${res.credit_id}, channel=${res.channel_id ?? "unknown"}, original native=${res.amount_native ?? "unknown"}. ${res.replayed ? "Replayed the original immutable decision. Nothing moved again. " : ""}${outcome} Current balance=${res.balance_micro}, spendable=${res.spendable_micro} ${res.currency} micro.`;
+  const hint = "Replay requires the same action, trimmed reason, and evidence. The decision/time are original; balances are current. Restored balance may remain unspendable because expiry, backing, job holds, and channel restrictions still apply. Evidence is an audit note, not verified escrow refund proof; channel close reports are separate.";
+  if (opts.human) {
+    info(display);
+    info(`Decision: ${res.decision.decision} at ${res.decision.decidedAt} ms; reason=${JSON.stringify(res.decision.reason)}` +
+      (res.decision.evidence === undefined ? "" : `; evidence=${JSON.stringify(res.decision.evidence)}`));
+    info(hint);
+    return;
+  }
+  json({ op: action === "book_refunded" ? "credit_tempo_book" : "credit_tempo_release", handle, dvmId, slug: handle, ...res, display, hint });
+}
+
+async function decisionCall<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await adminCall(fn);
+  } catch (err) {
+    if (err instanceof DvmError) {
+      const hint = (Object.hasOwn(DECISION_HINTS, err.code) ? DECISION_HINTS[err.code] : undefined)
+        ?? (err.code === "not_found" && err.data?.http_status === 404
+          ? "This service does not serve held Tempo drain decisions. Upgrade to @dvmkit/sdk 0.11.0-rc.1 or a compatible later release, then retry the same intent."
+          : undefined);
+      if (hint) {
+        const { hint: _providerHint, ...proseSources } = err.proseSources ?? {};
+        throw new DvmError(err.code, err.message, hint, err.data, err.display, proseSources);
+      }
+    }
+    throw err;
+  }
+}
+
+/** List held caller drains separately from channel payout-report obligations. */
 export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Promise<void> {
   const limit = resolveLimit(opts.limit);
   const { client, dvmId } = await connectAdmin(handle, opts);
@@ -103,7 +184,7 @@ export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Pro
     })
   );
 
-  const unresolved = res.drains.filter((d) => d.written_off_at === null);
+  const unresolved = res.drains.filter((d) => d.written_off_at === null && !d.decision && (d.status === "pending" || d.status === "exit_required"));
   // A pending drain whose channel has no confirmed close is not wedged at all —
   // the caller simply never came back to finish it, and nothing has landed on
   // chain to book. Counting those as stuck closes would put an operator in
@@ -125,18 +206,13 @@ export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Pro
     ? ` ${timedExit.length} drain(s): cooperative close is unavailable; the caller must recover the funds with the timed exit.`
     : "";
   const shortExitNotice = exitShort.length > 0
-    ? ` ${exitShort.length} exit_required drain(s): a close landed with a short refund. No command can repair these drains yet; their status prevents a drain write-off.`
+    ? ` ${exitShort.length} exit_required drain(s): a close landed with a short refund. Independently return any remainder, then attest to the whole refund with \`dvmctl credit tempo-book\`; release is only for nonpayment.`
     : "";
   // Counted over the unresolved rows only: under `--include-resolved` the page
   // also carries drains an operator has already closed out, and a chain figure
   // on one of those is not work anybody is waiting on.
   const repairable = wedged.filter((d) => coversDebit(d));
-  // The sharp end: the chain named a figure and it is *short*. Those are the
-  // rows a reconcile will refuse, so they are the ones a write-off is for. A
-  // drain with no native debit is not among them — there is nothing for the
-  // refund to be short against, and `coversDebit` refusing it is about the
-  // reconcile it would send an operator at, not about the chain paying too
-  // little.
+  // An unknown native debit cannot establish a short refund.
   const short = wedged.filter((d) => isShortRefund(d));
   if (opts.human) {
     if (res.drains.length === 0) {
@@ -146,9 +222,16 @@ export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Pro
     for (const drain of res.drains) {
       raw(
         `${drain.credit_id} ${drain.drain_id}  ${drain.status}  ${describeChain(drain)}` +
-          `  owed=${drain.amount_native ?? "-"} native (${String(drain.amount_micro)} ${drain.currency} micro)` +
-          (drain.written_off_at === null ? "" : `  written-off${noteSuffix(drain.write_off_note)}`)
+          `  original_debit=${drain.amount_native ?? "-"} native (${String(drain.amount_micro)} ${drain.currency} micro)` +
+          (drain.written_off_at === null ? "" : `  written-off${noteSuffix(drain.write_off_note)}`) +
+          (drain.held_reason === undefined ? "" : `  held_reason=${drain.held_reason ?? "-"}`) +
+          (drain.proven_refund_native === undefined ? "" : `  proven_refund_native=${drain.proven_refund_native ?? "unknown"}`) +
+          (drain.refund_payment_proven === undefined ? "" : `  refund_payment_proven=${drain.refund_payment_proven}`) +
+          (drain.decision ? `  decision=${JSON.stringify(drain.decision)}` : "")
       );
+      for (const report of drain.close_reports ?? []) {
+        raw(`  close-report ${report.obligation_id}  ${report.status}  written_off=${report.written_off} (builder payout report; separate from caller refund)`);
+      }
     }
     if (wedged.length > 0) {
       info(
@@ -158,11 +241,11 @@ export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Pro
     }
     if (short.length > 0) {
       info(
-        `${short.length} refunded the caller less than the ledger extinguished. A reconcile refuses those; \`dvmctl credit tempo-write-off\` is how one is closed.`
+        `${short.length} refunded the caller less than the ledger extinguished. A reconcile refuses those. Independently return the remainder, then use \`dvmctl credit tempo-book\` for the whole refund. A drain write-off only annotates the held liability.`
       );
     }
     for (const drain of exitShort) {
-      info(`${drain.credit_id} ${drain.drain_id}: close landed with a short refund. No command can repair it yet; its status prevents a drain write-off.`);
+      info(`${drain.credit_id} ${drain.drain_id}: close landed with a short refund. Independently return any remainder, then use tempo-book for the whole refund. Release is only for nonpayment.`);
     }
     for (const drain of evidenceUnavailable) {
       info(`${drain.credit_id} ${drain.drain_id}: chain evidence unavailable. ${evidenceHint}`);
@@ -175,9 +258,10 @@ export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Pro
     }
     if (!opts.includeResolved) {
       info(
-        "A written-off close still holds its caller's debited balance, and is not on this page — `--include-resolved` lists those too."
+        "Written-off held drains remain visible and still hold the caller's debited balance; they are excluded from action counts. `--include-resolved` adds terminal operator decisions."
       );
     }
+    info(HELD_GUIDANCE);
     if (res.next_after) info(`More rows: re-run with \`--after ${res.next_after}\`.`);
     return;
   }
@@ -210,15 +294,16 @@ export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Pro
             ? ` A further ${awaitingClose.length} pending drain(s) have no confirmed close on chain yet and are not counted here.`
             : "")) + shortExitNotice + exitNotice + evidenceNotice,
     hint: [
+      HELD_GUIDANCE,
       wedged.length > 0
-        ? "Finish a repairable drain with `dvmctl credit tempo-reconcile <handle> <credit-id> <drain-id>` — the amount comes off the close receipt, not from you. If a pending drain's refund was genuinely short, close it with `dvmctl credit tempo-write-off`."
+        ? "Finish a repairable drain with `dvmctl credit tempo-reconcile <handle> <credit-id> <drain-id>` — the amount comes off the close receipt, not from you. If a refund is short, independently return the remainder and use `dvmctl credit tempo-book` for the whole refund. A drain write-off only records an annotation."
         : "",
       shortExitNotice.trim(),
       exitNotice.trim(),
       evidenceNotice.trim(),
       opts.includeResolved
         ? ""
-        : "Drains you have already written off are not counted here; re-run with `--include-resolved` to see those.",
+        : "Written-off held drains remain visible but are not counted here; `--include-resolved` adds terminal operator decisions.",
     ].filter(Boolean).join(" "),
   });
 }
@@ -229,8 +314,8 @@ export async function tempoWedged(handle: string, opts: TempoWedgedOptions): Pro
  * The DVM decides everything: it re-reads the `ChannelClosed` receipt the close
  * already recorded and books the drain against that figure. You name one thing
  * — which drain. If the chain refunded less than the ledger is extinguishing it
- * refuses, naming both figures. A pending drain can be written off; an
- * exit_required drain with a short refund has no repair command yet.
+ * refuses, naming both figures. For a short refund, independently return the
+ * remainder before using tempo-book to attest to the whole refund.
  * Running this twice books once.
  */
 export async function tempoReconcile(
@@ -273,17 +358,7 @@ export async function tempoReconcile(
   });
 }
 
-/**
- * Record that you reviewed a wedged Tempo close and are not booking it.
- *
- * Moves no money and books nothing. The close paid the caller less than this
- * ledger extinguished, and no dvmkit row can express that difference — the
- * channel is closed, so there is nothing left to refund through it, and
- * re-crediting the balance here would pay the caller twice for the part the
- * chain did return. Making the shortfall good is an out-of-band decision; this
- * verb records that you took it. It is reversible —
- * `dvmctl credit tempo-reconcile` still accepts a written-off drain.
- */
+/** Record an audit annotation without paying, releasing, or settling the held debit. */
 export async function tempoWriteOff(
   handle: string,
   creditId: string,
@@ -305,6 +380,7 @@ export async function tempoWriteOff(
         ? `Already written off (drain ${res.drain_id} on ${res.credit_id})${noteSuffix(res.note)}. Nothing changed.`
         : `Wrote off drain ${res.drain_id} on ${res.credit_id}. Nothing was booked.`
     );
+    info("The debit and refund liability remain held; a write-off annotation does not pay the caller.");
     return;
   }
   json({
@@ -322,7 +398,7 @@ export async function tempoWriteOff(
     replayed: res.replayed,
     display: res.replayed
       ? `This drain was already written off${res.note ? `, with the note "${res.note}"` : ""}. Nothing changed, and your note was not recorded over it.`
-      : "Closed this drain without booking it. No ledger row moved: the caller keeps the on-chain refund the close paid them, and the shortfall against what was extinguished is not expressible here — make it good out of band if you owe it.",
+      : "Annotated this held drain without booking it. No money moved and the refund liability remains. Independently return any remainder out of band, then use tempo-book to attest to the whole refund.",
     hint: "Reversible: `dvmctl credit tempo-reconcile` still accepts a written-off drain if you change your mind.",
   });
 }
@@ -342,8 +418,7 @@ function coversDebit(drain: AdminTempoDrain): boolean {
 }
 
 /**
- * Whether the chain's stated refund is **short** of the debit — the rows a
- * write-off exists for.
+ * Whether the chain's stated refund is short of the debit.
  *
  * Deliberately not `!coversDebit`: a drain whose debit is unknown fails that
  * test too, and calling it short would claim the chain underpaid when nothing

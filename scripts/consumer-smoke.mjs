@@ -5,6 +5,7 @@ import { createServer as createHttpServer, request } from "node:http";
 import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { assertTempoDrainDecisions } from "./consumer-tempo-decisions.mjs";
 import { isHealthyResponse } from "./consumer-health.mjs";
 import { scaffoldInstallCommand } from "./consumer-install.mjs";
 import { cleanupAll, INSTALL_COMMAND_TIMEOUT_MS, observeProcess, preservePrimaryFailure, processCommand, removeTemporaryDirectory, stopProcess, waitForProcessClose } from "./consumer-process.mjs";
@@ -23,6 +24,7 @@ let platformServer;
 await preservePrimaryFailure(async () => {
   await command(cliPath, ["--version"]);
   assertInstalledPackage(cliPath);
+  await assertTempoDrainDecisions(cliPath);
   const project = join(root, "first-project");
   await scaffold(cliPath, project);
   await assertScaffold(cliPath, project);
