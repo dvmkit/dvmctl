@@ -1,6 +1,6 @@
 # Hosting billing and trial recovery
 
-`dvmctl billing status` reads the platform's billing-state version 1 without buying a plan, creating an account, starting a trial, or changing a restriction. Output is JSON by default; add `--human` for indented terminal output. The response retains canonical money units, service periods, reservations, cost breakdowns, coverage, deadlines, restriction codes, and all allowed next actions. Unknown coverage is not zero usage. Read every restriction: paying one balance does not remove other holds.
+`dvmctl billing status` reads the platform's billing-state version 1 without buying a plan, creating an account, starting a trial, or changing a restriction. Output is JSON by default; add `--human` for prose on stderr, including relevant amounts, deadlines, next steps, and the request trace ID. The JSON response retains canonical money units, service periods, reservations, cost breakdowns, coverage, deadlines, restriction codes, and all allowed next actions. Unknown coverage is not zero usage. Read every restriction: paying one balance does not remove other holds.
 
 | Command | Action |
 | --- | --- |
@@ -15,7 +15,7 @@
 | `billing checkout <plan-id> --rail stripe\|lightning [--months 1\|3\|6\|12]` | Explicitly request checkout, including a trial-to-paid conversion. Months apply only to Lightning. |
 | `billing invoice <invoice-id>` | Poll an existing Lightning subscription invoice once. |
 | `trial export <slug> [--port <port>] [--machine <id>]` | Open the existing read-only database tunnel during the seven-day recovery window. |
-| `trial restore <slug>` | Request restore after verified purchase; never purchase or reset the trial. |
+| `trial restore <slug>` | Request restore after verified purchase, including after the seven-day recovery deadline if a paid plan was purchased before it; never purchase or reset the trial. |
 
 All commands accept `--human` and `--org <handle>`. Organisation selection, including the context saved by `dvmctl switch`, applies to status, budgets, top-ups, Stripe checkout, and trial recovery. The platform's plan-change and Lightning subscription routes bill only the authenticated key's account. Those commands reject a selected organisation rather than charging another account. Use a key for the intended account and `dvmctl switch --personal` for those routes. Organisation keys cannot edit budgets; the platform requires an authorised builder key.
 

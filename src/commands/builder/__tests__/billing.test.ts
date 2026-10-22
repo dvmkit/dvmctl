@@ -1,8 +1,12 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("../../../lib/platform.ts", () => ({
+vi.mock("../../../lib/platform.ts", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../../lib/platform.ts")>(),
   requireAuth: () => ({ platformUrl: "https://platform.example", token: "test-key" }),
-  resolveOrgScope: (opts: { org?: string }) => opts.org,
 }));
 const outputTrace = vi.hoisted(() => ({ current: null as string | null }));
 vi.mock("../../../shared/output.ts", () => ({
@@ -16,9 +20,11 @@ vi.mock("../resolve-dvm.ts", () => ({ resolveDvm: vi.fn(async () => ({
 vi.mock("../db-proxy.ts", () => ({ startDbProxy: vi.fn(), buildDatabaseUrl: () => "postgres://readonly@127.0.0.1:1234/app" }));
 vi.mock("../../../lib/keep-alive.ts", () => ({ blockUntilShutdown: vi.fn(async () => {}) }));
 
-import { getOutputTraceId, json } from "../../../shared/output.ts";
+import { getOutputTraceId, info, json } from "../../../shared/output.ts";
 import { getBillingState } from "../../../lib/billing-client.ts";
 import { mapHandshakeError } from "../../../lib/db-tunnel-client.ts";
+import { blockUntilShutdown } from "../../../lib/keep-alive.ts";
+import { saveActiveOrg } from "../../../lib/platform.ts";
 import { resumeDvm, scaleDvm, startDeploy } from "../../../lib/platform-client.ts";
 import { startDbProxy } from "../db-proxy.ts";
 import { billingCheckout, billingStatus, billingTopup, budgetGet, budgetSet, invoiceStatus, planPurchase, planQuote, planStatus, topupStatus, trialExport, trialRestore } from "../billing.ts";
@@ -58,8 +64,19 @@ function sent(index = 0) {
     body: opts.body ? JSON.parse(String(opts.body)) as unknown : undefined };
 }
 
-beforeEach(() => { outputTrace.current = null; vi.clearAllMocks(); vi.stubGlobal("fetch", vi.fn()); });
-afterEach(() => vi.unstubAllGlobals());
+let configDir: string;
+beforeEach(() => {
+  configDir = mkdtempSync(join(tmpdir(), "dvmctl-billing-"));
+  vi.stubEnv("DVMCTL_CONFIG_DIR", configDir);
+  outputTrace.current = null;
+  vi.clearAllMocks();
+  vi.stubGlobal("fetch", vi.fn());
+});
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
+  rmSync(configDir, { recursive: true, force: true });
+});
 
 describe("billing command HTTP contracts", () => {
   it.each([
@@ -110,7 +127,7 @@ describe("billing command HTTP contracts", () => {
     expect(sent()).toMatchObject({ method: "GET", url: `${ctx.platformUrl}${path}/plan-change/quote-1` });
     expect(sent(1)).toMatchObject({ method: "POST", url: `${ctx.platformUrl}${path}/plan-change/quote-1/purchase`, body: { rail: "lightning" } });
     expect(json).toHaveBeenLastCalledWith(expect.objectContaining({ invoiceId: "invoice-1", expiresAt: invoice.expiresAt,
-      display: expect.stringContaining("$19.00 USD plan value before credit"), amount_display: "$12.00",
+      display: "$19.00 USD plan value before credit; $12.00 invoice value; Lightning invoice 15000 sats (Bitcoin units); expires at 2033-05-18T03:33:20.000Z.", amount_display: "$12.00",
       continuation: expect.objectContaining({ status_command: ["dvmctl", "billing", "plan", "status", "quote-1"] }) }));
   });
 
@@ -187,6 +204,30 @@ describe("billing command HTTP contracts", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ["quote", () => planQuote("studio-monthly", { requestKey })],
+    ["purchase", () => planPurchase("quote-1", { rail: "stripe" })],
+    ["plan status", () => planStatus("quote-1", {})],
+    ["invoice", () => invoiceStatus("invoice-1", {})],
+    ["checkout", () => billingCheckout("builder-monthly", { rail: "lightning" })],
+  ] as const)("%s explains how to clear a saved org before any HTTP request", async (_name, run) => {
+    saveActiveOrg("team");
+    await expect(run()).rejects.toMatchObject({
+      code: "billing_scope_unsupported", hint: expect.stringContaining("dvmctl switch --personal"),
+    });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("uses the saved org for card checkout and its continuation", async () => {
+    saveActiveOrg("team");
+    vi.mocked(fetch).mockResolvedValue(reply({ url: "https://checkout.example/session" }));
+    await billingCheckout("builder-monthly", { rail: "stripe" });
+    expect(sent().url).toBe(`${ctx.platformUrl}/api/v1/builder/orgs/team/billing/checkout`);
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({ continuation: expect.objectContaining({
+      status_command: ["dvmctl", "billing", "status", "--org", "team"],
+    }) }));
+  });
+
   it("rejects a newer billing contract with an upgrade instruction", async () => {
     vi.mocked(fetch).mockResolvedValue(reply({ ...state, version: 2 }));
     await expect(getBillingState(ctx)).rejects.toMatchObject({ code: "billing_version_unsupported", hint: expect.stringContaining("Upgrade dvmctl") });
@@ -226,6 +267,103 @@ describe("billing command HTTP contracts", () => {
   it("explains a missing route on an older platform", async () => {
     vi.mocked(fetch).mockResolvedValue(new Response("404 Not Found", { status: 404 }));
     await expect(billingStatus({})).rejects.toMatchObject({ code: "billing_not_available", message: expect.stringContaining("not available on this platform") });
+  });
+});
+
+function humanText(): string {
+  return vi.mocked(info).mock.calls.map(([line]) => line).join("\n");
+}
+
+describe("human billing output", () => {
+  const trace = "3".repeat(32);
+
+  it("renders billing sections, all restrictions and next actions with their deadlines", async () => {
+    vi.mocked(fetch).mockResolvedValue(reply({ ...state,
+      plan: { display: "Builder plan.", hint: "Plan renews monthly." },
+      usage: { display: "$1.25 estimated usage.", hint: "Usage can change." },
+      budget,
+    }, 200, trace));
+    await billingStatus({ human: true });
+    const text = humanText();
+    for (const detail of ["Hosting is restricted.", "Builder plan.", "Plan renews monthly.", "$1.25 estimated usage.",
+      "Usage can change.", "2026-10-01", "2026-11-01", "payment", "eligibility", "customer_budget",
+      "Settle the card balance.", "Open billing.", "Upgrade your plan.", "raise_or_remove_budget", "2026-10-23",
+      "Your monthly hosting budget has been reached.", "expired", "2026-10-25", "Export your database.",
+      "Restore after purchase.", `Trace ID: ${trace}`]) expect(text).toContain(detail);
+    expect(text.trimStart()).not.toMatch(/^\{/);
+    expect(json).not.toHaveBeenCalled();
+  });
+
+  it("keeps unknown budget amounts and incomplete restriction coverage explicit", async () => {
+    vi.mocked(fetch).mockResolvedValue(reply({ ...state,
+      restrictions: { coverage: "unknown", items: [] },
+      budget: { ...budget, limit_cents: null, actual_cents: null, reserved_cents: null, coverage: "unknown" },
+    }));
+    await billingStatus({ human: true });
+    expect(humanText()).toContain("Restriction coverage: unknown");
+    expect(humanText()).toContain("Actual: unknown");
+    expect(humanText()).toContain("Reserved: unknown");
+    expect(humanText()).not.toContain("$0.00");
+    expect(humanText()).not.toContain("No restrictions");
+  });
+
+  it("retains invoice details beside platform status prose and quotes continuation arguments", async () => {
+    vi.mocked(fetch).mockResolvedValue(reply({ ...invoice, fiatCurrency: "gbp", planUsdCents: 1900,
+      status: "payment_recovery", display: "Payment received; applying your plan." }));
+    await invoiceStatus("invoice; echo unsafe", { human: true });
+    const text = humanText();
+    expect(text).toContain("Payment received; applying your plan.");
+    expect(text).toContain("payment_recovery");
+    expect(text).toContain("£15.00");
+    expect(text).toContain("$19.00");
+    expect(text).toContain("2033-05-18T03:33:20.000Z");
+    expect(text).toContain("Check status: dvmctl billing invoice 'invoice; echo unsafe'");
+  });
+
+  it.each([
+    ["budget get", () => budgetGet({ human: true }), [budget], ["$10.00", "$9.00", "$1.00", "Version: 2"]],
+    ["budget set", () => budgetSet("1000", { human: true, expectedVersion: "1", idempotencyKey: requestKey }),
+      [budget], ["$10.00", "Version: 2", requestKey]],
+    ["topup", () => billingTopup("1000", { human: true, idempotencyKey: requestKey }), [topup],
+      ["$10.00", "10000 sats", "lnbc-test", "dvmctl billing topup-status topup-1", requestKey]],
+    ["topup-status", () => topupStatus("topup-1", { human: true }), [topup],
+      ["invoiced", "lnbc-test", "dvmctl billing topup-status topup-1"]],
+    ["invoice", () => invoiceStatus("invoice-1", { human: true }), [{ ...invoice, status: "pending" }],
+      ["pending", "lnbc-test", "currency unstated", "dvmctl billing invoice invoice-1"]],
+    ["checkout", () => billingCheckout("builder-monthly", { human: true, rail: "stripe", org: "team" }),
+      [{ url: "https://checkout.example/session" }], ["https://checkout.example/session", "dvmctl billing status --org team"]],
+    ["plan quote", () => planQuote("studio-monthly", { human: true, requestKey }), [quote],
+      ["$12.00", "quote-1", requestKey, "2033-05-18T03:33:20.000Z"]],
+    ["plan purchase", () => planPurchase("quote-1", { human: true, rail: "lightning" }), [quote, invoice],
+      ["$15.00", "lnbc-test", "dvmctl billing plan status quote-1"]],
+    ["plan status", () => planStatus("quote-1", { human: true }), [quote], ["quoted", "quote-1"]],
+    ["trial restore", () => trialRestore("app", { human: true }), [{ restored: true, display: "Restored." }],
+      ["Restored.", "app"]],
+  ] as const)("%s prints actionable prose instead of a JSON object", async (_name, run, responses, details) => {
+    for (const response of responses) vi.mocked(fetch).mockResolvedValueOnce(reply(response, 200, trace));
+    await run();
+    const text = humanText();
+    for (const detail of details) expect(text).toContain(detail);
+    expect(text).toContain(`Trace ID: ${trace}`);
+    expect(text.trimStart()).not.toMatch(/^\{/);
+    expect(json).not.toHaveBeenCalled();
+  });
+
+  it("keeps trial export usable while the process holds the read-only tunnel open", async () => {
+    vi.mocked(fetch).mockResolvedValue(reply(state, 200, trace));
+    const proxy = { port: 1234, ready: { user: "readonly", password: "test", database: "app" }, close: vi.fn() };
+    vi.mocked(startDbProxy).mockResolvedValue(proxy);
+    await trialExport("app", { human: true });
+    const text = humanText();
+    expect(text).toContain("postgres://readonly@127.0.0.1:1234/app");
+    expect(text).toContain("2026-10-25T00:00:00.000Z");
+    expect(text).toContain("pg_dump");
+    expect(text).toContain("Keep this process running");
+    expect(text).toContain(`Trace ID: ${trace}`);
+    expect(text.trimStart()).not.toMatch(/^\{/);
+    expect(json).not.toHaveBeenCalled();
+    expect(blockUntilShutdown).toHaveBeenCalledOnce();
+    expect(vi.mocked(blockUntilShutdown).mock.calls[0]![0]()).toBe(proxy);
   });
 });
 
