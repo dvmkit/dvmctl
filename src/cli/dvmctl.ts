@@ -106,12 +106,15 @@ import { status } from "../commands/builder/status.ts";
 import type { SwitchOptions } from "../commands/builder/switch.ts";
 import { switchCmd } from "../commands/builder/switch.ts";
 import type {
+  TempoDecisionOptions,
   TempoLossesOptions,
   TempoReconcileOptions,
   TempoWedgedOptions,
   TempoWriteOffOptions,
 } from "../commands/builder/tempo-drains.ts";
 import {
+  tempoBook,
+  tempoRelease,
   tempoLosses,
   tempoReconcile,
   tempoWedged,
@@ -1113,7 +1116,7 @@ export function buildProgram(): Command {
   creditCmd
     .command("tempo-wedged <handle>")
     .description(
-      "List Tempo cooperative closes that landed on chain but never booked the caller's drain, with what the close receipt says about each"
+      "List held Tempo drains with refund evidence, decision audit, and separate channel close-report summaries"
     )
     .option(
       "--endpoint <url>",
@@ -1122,7 +1125,7 @@ export function buildProgram(): Command {
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--limit <n>", "Page size (default: 20, max 50)", (v) => Number(v))
     .option("--after <cursor>", "Continue from a previous run's `next_after` value")
-    .option("--include-resolved", "Also list drains you already wrote off — the audit view")
+    .option("--include-resolved", "Also list terminal operator decisions — the audit view")
     .option(
       "--min-age-ms <ms>",
       "How long a drain must have sat before it counts as stuck (default: 300000)",
@@ -1168,6 +1171,24 @@ export function buildProgram(): Command {
       catchErrors(() => tempoCloseReportWriteOff(handleArg, obligationId, opts), opts.human);
     });
 
+  for (const [name, description, command] of [
+    ["tempo-book", "Attest that the entire held Tempo refund was independently returned, including any off-path remainder", tempoBook],
+    ["tempo-release", "Release a held Tempo debit only when no refund was paid; restored balance may remain unspendable", tempoRelease],
+  ] as const) {
+    creditCmd
+      .command(`${name} <handle> <credit-id> <drain-id>`)
+      .description(description)
+      .requiredOption("--reason <text>", "Reason for the immutable decision (1 to 2000 characters after trimming)")
+      .option("--evidence <text>", "Audit note/reference (1 to 4000 characters after trimming); not chain proof")
+      .option("--confirm", "Submit this named decision; without this flag, send no HTTP")
+      .option("--endpoint <url>", "DVM admin endpoint URL (skips the platform getDvm lookup)")
+      .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
+      .option("--human", "Human-readable output instead of JSON")
+      .action((handleArg: string, creditId: string, drainId: string, opts: TempoDecisionOptions) => {
+        catchErrors(() => command(handleArg, creditId, drainId, opts), opts.human);
+      });
+  }
+
   creditCmd
     .command("tempo-reconcile <handle> <credit-id> <drain-id>")
     .description(
@@ -1186,7 +1207,7 @@ export function buildProgram(): Command {
   creditCmd
     .command("tempo-write-off <handle> <credit-id> <drain-id>")
     .description(
-      "Record that you reviewed a wedged Tempo close and are not booking it. Books nothing and is reversible — the row just leaves the queue"
+      "Record that you reviewed a wedged Tempo close and are not booking it. Books nothing; the debit and refund liability remain held"
     )
     .option("--note <text>", "Why you are not booking it. Recorded on the drain row")
     .option(

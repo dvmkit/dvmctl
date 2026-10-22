@@ -459,7 +459,37 @@ export type AdminTempoChainEvidence =
   | { chain: "unreachable"; error: string }
   | { chain: "unconfirmed" };
 
-/** One Tempo drain stuck between "chain paid" and "ledger booked". */
+export interface AdminTempoDrainDecision {
+  source: "operator";
+  decision: "book_refunded" | "release";
+  reason: string;
+  evidence?: string;
+  decidedAt: number;
+}
+
+export interface AdminTempoDrainDecisionRequest {
+  credit_id: string;
+  drain_id: string;
+  reason: string;
+  evidence?: string;
+}
+
+export interface AdminTempoDrainDecisionResponse {
+  status: "sent" | "released";
+  credit_id: string;
+  drain_id: string;
+  channel_id: string | null;
+  amount_micro: number;
+  amount_native: number | null;
+  currency: string;
+  decision: AdminTempoDrainDecision;
+  /** Current balances, including on replay; these are not decision-time snapshots. */
+  balance_micro: number;
+  spendable_micro: number;
+  replayed: boolean;
+}
+
+/** A held Tempo drain, or a terminal drain included in the audit view. */
 export interface AdminTempoDrain {
   credit_id: string;
   drain_id: string;
@@ -472,9 +502,17 @@ export interface AdminTempoDrain {
   caller_pubkey: string;
   status: "pending" | "parked" | "picked_up" | "sent" | "released" | "exit_required";
   created_at: number;
-  /** An operator's recorded decision not to book this one; `null` while it is live. */
+  /** A write-off annotation leaves the debit held; it does not pay the caller. */
   write_off_note: string | null;
   written_off_at: number | null;
+  /** New audit fields are absent on older servers. */
+  decision?: AdminTempoDrainDecision | null;
+  held_reason?: "close_evidence_missing" | "close_history_unmatched" | "collateral_missing" | "refund_short" | "exit_required" | "refund_unproven" | null;
+  /** Receipt-derived exact amount; payer-exit lower bounds never populate it. */
+  proven_refund_native?: string | null;
+  /** Sticky positive-payment fact; false does not establish nonpayment. */
+  refund_payment_proven?: boolean;
+  close_reports?: { obligation_id: string; status: "unmatched" | "no_report"; written_off: boolean }[];
   /** Absent when the listing was asked to skip chain lookups. */
   chain?: AdminTempoChainEvidence;
 }
@@ -950,6 +988,14 @@ export class AdminCashuClient {
     );
   }
 
+  async bookTempoDrain(body: AdminTempoDrainDecisionRequest): Promise<AdminTempoDrainDecisionResponse> {
+    return this.requestJson("POST", "/admin/credit/book-tempo-drain", body);
+  }
+
+  async releaseTempoDrain(body: AdminTempoDrainDecisionRequest): Promise<AdminTempoDrainDecisionResponse> {
+    return this.requestJson("POST", "/admin/credit/release-tempo-drain", body);
+  }
+
   /** Record "reviewed, not booking" against a wedged Tempo drain. */
   async writeOffTempoDrain(body: AdminWriteOffTempoRequest): Promise<AdminWriteOffTempoResponse> {
     return this.requestJson<AdminWriteOffTempoResponse>(
@@ -1005,7 +1051,7 @@ export class AdminCashuClient {
     try {
       parsed = text.length === 0 ? {} : JSON.parse(text);
     } catch {
-      if (res.status === 404 && path === "/admin/credit/refund-draw") {
+      if (res.status === 404 && ["/admin/credit/refund-draw", "/admin/credit/book-tempo-drain", "/admin/credit/release-tempo-drain"].includes(path)) {
         throw new AdminApiError(404, { error: "not_found", raw: text });
       }
       throw new DvmError(
