@@ -1,12 +1,12 @@
-import { DvmError } from "@dvmkit/sdk/internal";
+import { DvmError, shellQuoteArg } from "@dvmkit/sdk/internal";
 import type { Command } from "commander";
 
 import { billingPath, billingRequest, billingStateAfterRefusal, getBillingState, type BillingContext } from "../../lib/billing-client.ts";
-import type { BudgetSummary, HostingTopup, PaymentResult, PlanQuote } from "../../lib/billing-types.ts";
+import type { BillingState, BudgetSummary, HostingTopup, PaymentResult, PlanQuote, RelayCopy } from "../../lib/billing-types.ts";
 import { catchErrors } from "../../lib/error-handler.ts";
 import { blockUntilShutdown } from "../../lib/keep-alive.ts";
 import { requireAuth, resolveOrgScope } from "../../lib/platform.ts";
-import { info, json } from "../../shared/output.ts";
+import { getOutputTraceId, info, json } from "../../shared/output.ts";
 import { buildDatabaseUrl, startDbProxy } from "./db-proxy.ts";
 import { resolveDvm } from "./resolve-dvm.ts";
 
@@ -54,9 +54,72 @@ function rail(opts: BillingOptions): "stripe" | "lightning" {
   return opts.rail;
 }
 
-function output(result: unknown, opts: BillingOptions): void {
-  if (opts.human) info(JSON.stringify(result, null, 2));
-  else json(result);
+function output(result: object, opts: BillingOptions, details: () => string[]): void {
+  if (!opts.human) {
+    json(result);
+    return;
+  }
+  if ("display" in result && typeof result.display === "string") info(result.display);
+  for (const line of details()) info(line);
+  if ("hint" in result && typeof result.hint === "string") info(result.hint);
+  const trace = getOutputTraceId();
+  if (trace) info(`Trace ID: ${trace}`);
+}
+
+function relayLines(value: Partial<RelayCopy> | null | undefined, label: string): string[] {
+  return [
+    ...(value?.display ? [`${label}: ${value.display}`] : []),
+    ...(value?.hint ? [value.hint] : []),
+  ];
+}
+
+function budgetDetails(budget: BudgetSummary): string[] {
+  const amount = (value: number | null): string => typeof value === "number" ? money(value, "USD") : "unknown";
+  return [
+    `Budget status: ${budget.state}. Version: ${budget.version}`,
+    `Limit: ${budget.limit_cents === null ? "none" : amount(budget.limit_cents)}`,
+    `Actual: ${amount(budget.actual_cents)}. Reserved: ${amount(budget.reserved_cents)}`,
+    `Budget coverage: ${budget.coverage ?? "unknown"}`,
+  ];
+}
+
+function statusDetails(state: BillingState): string[] {
+  const lines = [
+    ...relayLines(state.plan, "Plan"),
+    ...relayLines(state.period, "Period"),
+    `Period: ${state.period.start ?? "unknown"} to ${state.period.end ?? "unknown"} (coverage: ${state.period.coverage})`,
+  ];
+  for (const [label, value] of [
+    ["Usage", state.usage], ["Outbound", state.outbound], ["Card", state.card],
+    ["Prepaid", state.prepaid], ["Continuing costs", state.continuing_costs], ["Eligibility", state.eligibility],
+  ] as const) lines.push(...relayLines(value, label));
+  lines.push(...relayLines(state.restrictions, "Restrictions"), `Restriction coverage: ${state.restrictions.coverage}`);
+  for (const restriction of state.restrictions.items) {
+    lines.push(`Restriction (${restriction.reason}): ${restriction.display ?? restriction.reason}`);
+    if (restriction.dvm_id) lines.push(`DVM: ${restriction.dvm_id}`);
+    if (restriction.hint) lines.push(restriction.hint);
+    if (restriction.deadline_at) lines.push(`Deadline: ${restriction.deadline_at}`);
+    for (const action of restriction.next_actions) {
+      lines.push(`Action (${action.code}): ${action.display ?? action.code}`);
+      if (action.hint) lines.push(action.hint);
+      if (action.deadline_at) lines.push(`Action deadline: ${action.deadline_at}`);
+    }
+  }
+  if (state.budget) lines.push(...relayLines(state.budget, "Budget"), ...budgetDetails(state.budget));
+  if (state.trial) {
+    const trial = state.trial;
+    lines.push(`Trial status: ${trial.state}`, ...relayLines(trial, "Trial"));
+    if (trial.ends_at) lines.push(`Trial ends: ${trial.ends_at}`);
+    if (trial.limit_fired) lines.push(`Trial limit reached: ${trial.limit_fired}`);
+    for (const [label, value] of [
+      ["Trial days remaining", trial.remaining_days], ["Trial credit remaining", trial.remaining_credit],
+      ["Trial outbound remaining", trial.remaining_outbound],
+    ] as const) lines.push(...relayLines(value, label));
+    if (trial.recovery_deadline_at) lines.push(`Recovery deadline: ${trial.recovery_deadline_at}`);
+    lines.push(...relayLines(trial.recovery, "Recovery"), ...relayLines(trial.recovery?.export, "Export"),
+      ...relayLines(trial.recovery?.restore, "Restore"), ...relayLines(trial.action, "Next action"));
+  }
+  return lines;
 }
 
 function money(minorUnits: number, currency: string): string {
@@ -75,12 +138,14 @@ function continuation(command: string[], opts: BillingOptions): string[] {
 }
 
 export async function billingStatus(opts: BillingOptions): Promise<void> {
-  output(await getBillingState(context(opts)), opts);
+  const result = await getBillingState(context(opts));
+  output(result, opts, () => statusDetails(result));
 }
 
 export async function budgetGet(opts: BillingOptions): Promise<void> {
   const ctx = context(opts);
-  output(await billingRequest<BudgetSummary>(ctx, `${billingPath(ctx.org)}/budget`), opts);
+  const result = await billingRequest<BudgetSummary>(ctx, `${billingPath(ctx.org)}/budget`);
+  output(result, opts, () => budgetDetails(result));
 }
 
 export async function budgetSet(limit: string, opts: BillingOptions): Promise<void> {
@@ -89,7 +154,8 @@ export async function budgetSet(limit: string, opts: BillingOptions): Promise<vo
     expected_version: integer(opts.expectedVersion, "--expected-version"),
     limit_cents: limit === "none" ? null : integer(limit, "limit in USD cents", 1),
   }, key(opts.idempotencyKey));
-  output({ ...result, idempotency_key: opts.idempotencyKey }, opts);
+  output({ ...result, idempotency_key: opts.idempotencyKey }, opts,
+    () => [...budgetDetails(result), `Idempotency key: ${opts.idempotencyKey}`]);
 }
 
 function topupOutput(result: HostingTopup, opts: BillingOptions): void {
@@ -97,7 +163,13 @@ function topupOutput(result: HostingTopup, opts: BillingOptions): void {
     display: `${money(result.quote.usdCents, "USD")} hosting value; Lightning invoice ${result.quote.nativeSats} sats (Bitcoin units). Quote expires: ${new Date(result.quote.expiresAt).toISOString()}. Status: ${result.state}.`,
     hint: "Only paid confirms hosting credit. Check the saved invoice status; do not create another top-up to resume.",
     continuation: { invoice_id: result.id, status_command: continuation(["dvmctl", "billing", "topup-status", result.id], opts) },
-  }, opts);
+  }, opts, () => [
+    `Invoice ID: ${result.id}`,
+    ...(result.bolt11 ? [`Lightning invoice: ${result.bolt11}`] : []),
+    ...(typeof result.providerExpiresAt === "number" ? [`Invoice expires: ${new Date(result.providerExpiresAt).toISOString()}`] : []),
+    `Idempotency key: ${result.requestKey}`,
+    `Check status: ${continuation(["dvmctl", "billing", "topup-status", result.id], opts).map(shellQuoteArg).join(" ")}`,
+  ]);
 }
 
 export async function billingTopup(amount: string, opts: BillingOptions): Promise<void> {
@@ -118,14 +190,16 @@ export async function planQuote(planId: string, opts: BillingOptions): Promise<v
   output({ ...result, request_key: opts.requestKey,
     display: `Plan quote: ${money(result.quote.payableCents, result.quote.currency)} payable. No purchase has been made.`,
     hint: "Use the saved quote id for an explicit purchase. A renewal downgrade requires scheduling on the platform.",
-  }, opts);
+  }, opts, () => [`Quote ID: ${result.id}`, `Request key: ${opts.requestKey}`,
+    `Quote expires: ${new Date(result.quote.expiresAt).toISOString()}`]);
 }
 
 export async function planStatus(id: string, opts: BillingOptions): Promise<void> {
   const ctx = context(opts, true);
   const result = await billingRequest<PlanQuote>(ctx, `${billingPath()}/plan-change/${encodeURIComponent(id)}`);
   output({ ...result, display: `Plan change status: ${result.state}.`,
-    hint: "Only the platform's applied state confirms the plan change. Retain this quote id to resume inspection." }, opts);
+    hint: "Only the platform's applied state confirms the plan change. Retain this quote id to resume inspection." }, opts,
+    () => [`Quote ID: ${result.id}`]);
 }
 
 export async function planPurchase(id: string, opts: BillingOptions): Promise<void> {
@@ -145,9 +219,9 @@ function paymentOutput(result: PaymentResult, opts: BillingOptions, currency: st
   const invoiceDescription = [
     ...(planDisplay ? [`${planDisplay} USD plan value before credit`] : []),
     ...(amountDisplay ? [`${amountDisplay} invoice value`] : []),
-    `Lightning invoice ${result.amountSats} sats (Bitcoin units).`,
-    ...(typeof result.expiresAt === "number" ? [`Expires: ${new Date(result.expiresAt).toISOString()}.`] : []),
-  ].join("; ");
+    `Lightning invoice ${result.amountSats} sats (Bitcoin units)`,
+    ...(typeof result.expiresAt === "number" ? [`expires at ${new Date(result.expiresAt).toISOString()}`] : []),
+  ].join("; ") + ".";
   output({ ...result, ...(currency ? { quote_currency: currency } : {}),
     ...(amountDisplay ? { amount_display: amountDisplay } : {}),
     ...("planUsdCents" in result ? { plan_usd_display: planDisplay } : {}),
@@ -157,7 +231,16 @@ function paymentOutput(result: PaymentResult, opts: BillingOptions, currency: st
       (amountDisplay && !invoiceCurrency ? " The invoice currency is unstated; amountCents is preserved without assuming USD." : ""),
     continuation: { url: result.url ?? result.hostedInvoiceUrl ?? null, invoice_id: result.invoiceId ?? null,
       status_command: continuation(statusCommand, opts) },
-  }, opts);
+  }, opts, () => [
+    ...(result.state ?? result.status ? [`Payment status: ${result.state ?? result.status}`] : []),
+    ...(planDisplay ? [`USD plan value before credit: ${planDisplay}`] : []),
+    ...(amountDisplay ? [`Invoice amount: ${amountDisplay}`] : []),
+    ...(result.invoiceId ? [`Invoice ID: ${result.invoiceId}`] : []),
+    ...(result.bolt11 ? [`Lightning invoice: ${result.bolt11}`] : []),
+    ...(typeof result.expiresAt === "number" ? [`Invoice expires: ${new Date(result.expiresAt).toISOString()}`] : []),
+    ...(result.url ?? result.hostedInvoiceUrl ? [`Payment page: ${result.url ?? result.hostedInvoiceUrl}`] : []),
+    `Check status: ${continuation(statusCommand, opts).map(shellQuoteArg).join(" ")}`,
+  ]);
 }
 
 export async function billingCheckout(planId: string, opts: BillingOptions): Promise<void> {
@@ -184,7 +267,7 @@ export async function trialRestore(slug: string, opts: BillingOptions): Promise<
   try {
     const result = await billingRequest<Record<string, unknown>>(target,
       `/api/v1/builder/dvms/${encodeURIComponent(target.dvmId)}/trial-restore`, "POST");
-    output({ ...result, dvmId: target.dvmId, slug }, opts);
+    output({ ...result, dvmId: target.dvmId, slug }, opts, () => [`DVM: ${slug} (${target.dvmId})`]);
   } catch (error) {
     if (error instanceof DvmError) {
       const followUp = await billingStateAfterRefusal(context(opts));
@@ -213,7 +296,7 @@ export async function trialExport(slug: string, opts: BillingOptions): Promise<v
     recovery_deadline_at: trial.recovery_deadline_at, recovery: trial.recovery,
     display: trial.recovery.export.display,
     hint: "Use pg_dump with database_url to save the database. Keep this process running during export; the read-only tunnel ends by the recovery deadline.",
-  }, opts);
+  }, opts, () => [`DVM: ${slug}`, `Database URL: ${url}`, `Recovery deadline: ${trial.recovery_deadline_at ?? "unknown"}`]);
   await blockUntilShutdown(() => proxy);
 }
 
@@ -255,5 +338,6 @@ export function registerBillingCommands(program: Command): void {
     .option("--machine <id>", "Machine to broker through")
     .action((slug: string, opts: BillingOptions) => catchErrors(() => trialExport(slug, opts), opts.human));
   add(trial, "restore <slug>", "Request restoration; does not purchase a plan or reset trial")
+    .addHelpText("after", "\nRestore also works after the seven-day recovery deadline if a paid plan was purchased before that deadline.")
     .action((slug: string, opts: BillingOptions) => catchErrors(() => trialRestore(slug, opts), opts.human));
 }
