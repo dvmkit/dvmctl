@@ -843,8 +843,7 @@ describe("dvmctl deploy cloud dirty-tree guard", { timeout: SPAWN_HEAVY_TIMEOUT 
     writeFileSync(join(worktree, "session.json"), JSON.stringify({ state: "active" }), "utf-8");
     const verifyLogs = join(dir, ".verify-logs");
     mkdirSync(verifyLogs, { recursive: true });
-    // Incompressible content just beyond createTarball's unchanged 50 MiB
-    // spawnSync cap: without the exclusion, tar reaches ENOBUFS before upload.
+    // Incompressible logs exceed the archive limit unless local evidence is excluded.
     writeFileSync(join(verifyLogs, "production-acceptance.log"), randomBytes(50 * 1024 * 1024 + 1));
 
     await deploy({ target: "cloud", allowDirty: true });
@@ -996,9 +995,6 @@ describe("dirty-tree sha marking", { timeout: SPAWN_HEAVY_TIMEOUT }, () => {
   it("ignores excluded noise, so the marker keeps its meaning", () => {
     // These are the paths that would otherwise mark every real deploy dirty.
     seedRepo();
-    // `web/` is committed first so git recurses into it and reports
-    // `?? web/.next/`. Left untracked, git would collapse the whole subtree to
-    // `?? web/` — see the nested-excluded-dir case below.
     mkdirSync(join(dir, "web"), { recursive: true });
     writeFileSync(join(dir, "web", "index.ts"), "export default {};", "utf-8");
     git("add", ".");
@@ -1020,17 +1016,12 @@ describe("dirty-tree sha marking", { timeout: SPAWN_HEAVY_TIMEOUT }, () => {
     expect(readGitHead(dir, dir)?.sha).toMatch(/^[0-9a-f]{40}$/);
   });
 
-  it("over-reports rather than under-reports when git collapses an untracked dir", () => {
-    // git status reports the shallowest untracked dir (`?? web/`), not its
-    // contents, so a brand-new dir whose content is entirely excluded reads as
-    // packaged. Pinned deliberately: the dir itself does ship, and erring
-    // toward "dirty" keeps the sha from over-claiming. Contrast the case above,
-    // where the parent is tracked and git recurses to the excluded child.
+  it("ignores an untracked directory containing only excluded files", () => {
     seedRepo();
     mkdirSync(join(dir, "web", ".next"), { recursive: true });
     writeFileSync(join(dir, "web", ".next", "page.js"), "x", "utf-8");
 
-    expect(isPackagedTreeDirty(dir)).toBe(true);
+    expect(isPackagedTreeDirty(dir)).toBe(false);
   });
 
   it("ignores a tracked .claude edit, which git sees but the tarball never ships", () => {
