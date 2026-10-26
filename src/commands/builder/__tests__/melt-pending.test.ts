@@ -6,12 +6,6 @@ import type * as adminCashuClientModule from "../../../lib/admin-cashu-client";
 import type { AdminBatch } from "../../../lib/admin-cashu-client";
 import type * as drainHoldStateModule from "../../../lib/drain-hold-state";
 
-// Watch-loop tests advance virtual time; real filesystem locking is exercised
-// by the separate cross-process suite with a durable journal and real clocks.
-vi.mock("proper-lockfile", () => ({
-  default: { lock: vi.fn(async () => async () => undefined) },
-}));
-
 vi.mock("../../../lib/builder-mnemonic", () => ({
   readBuilderMnemonic: vi.fn(),
 }));

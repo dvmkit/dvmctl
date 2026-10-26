@@ -73,7 +73,7 @@ try {
   await meltPending("fixture", { endpoint: "https://dvm.invalid" });
   emit("done");
 } catch (error) {
-  emit("done", { code: error.code, message: error.message });
+  emit("done", { code: error.code, message: error.message, hint: error.hint });
 } finally {
   process.disconnect();
 }

@@ -115,7 +115,7 @@ function assertBinding(details, release) {
   if (JSON.stringify(details.files) !== JSON.stringify(expectedFiles)) fail("archive file list is not the standalone package shape");
   const manifest = details.manifest;
   if (JSON.stringify(manifest.bin) !== JSON.stringify({ dvmctl: "dist/dvmctl.js" })) fail("archive must expose only dvmctl at dist/dvmctl.js");
-  if (JSON.stringify(manifest.dependencies) !== JSON.stringify({ "@dvmkit/sdk": sdkVersion, "proper-lockfile": "4.1.2" })) fail("archive must have only the exact SDK and lockfile runtime dependencies");
+  if (JSON.stringify(manifest.dependencies) !== JSON.stringify({ "@dvmkit/sdk": sdkVersion })) fail("archive must have only the exact SDK runtime dependency");
   if (JSON.stringify(manifest.exports) !== JSON.stringify({ "./skill": "./skills/build-dvm/SKILL.md" })) fail("archive must export the bundled build-dvm skill");
   if (manifest.peerDependencies && Object.keys(manifest.peerDependencies).length > 0) fail("archive must not declare peer dependencies");
   if (JSON.stringify(manifest.optionalDependencies) !== JSON.stringify({ pg: "8.20.0", tsx: "^4" })) fail("archive must declare exact pg and tsx optional dependencies");
