@@ -791,22 +791,21 @@ async function meltBatch(
     );
   } catch (err) {
     const recoveryDiagnostic = missingDleqRecoveryDiagnostic(proofs, err);
-    appendPostMelt({
-      dvm_id: ctx.dvmId,
-      row_ids: batch.row_ids,
-      quote_id: quote.rawQuote.quote,
-      status: "failed",
-      error: err instanceof Error ? err.message : String(err),
-    });
-    // SDK wallets may carry a separate cashu-ts copy; inspect the protocol code
-    // rather than relying on error constructor identity across package boundaries.
-    if (
-      batch.proofs.length > 1 &&
-      typeof err === "object" && err !== null && "code" in err &&
-      (err.code === 11014 || err.code === 11015)
-    ) {
-      return "input_cap_exceeded";
+    const rejectionCode = noSpendRejectionCode(err);
+    if (rejectionCode !== null) {
+      appendPostMelt({
+        dvm_id: ctx.dvmId,
+        row_ids: batch.row_ids,
+        quote_id: quote.rawQuote.quote,
+        status: "failed",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      if (batch.proofs.length > 1 && (rejectionCode === 11014 || rejectionCode === 11015)) {
+        return "input_cap_exceeded";
+      }
     }
+    // An unclassified failure may follow acceptance, payment, or change
+    // reconstruction. Leave the pre-melt open so its original quote is checked.
     logErr(ctx, "melt_pending_melt_failed", err, {
       mint_url: batch.mint_url,
       row_ids: batch.row_ids,
@@ -825,13 +824,13 @@ async function meltBatch(
     return "skipped";
   }
 
-  if (!meltResult.preimage) {
+  if (meltResult.state !== "PAID" || !meltResult.preimage) {
     // Keep the pre-melt unpaired: the mint may still settle or release the
     // proofs, and only a later quote-state lookup can distinguish those.
     logErr(
       ctx,
       "melt_pending_missing_preimage_after_success",
-      new Error(`mint returned ${meltResult.state} without payment_preimage`),
+      new Error(`mint returned ${meltResult.state} without confirmed PAID state and payment_preimage`),
       {
         mint_url: batch.mint_url,
         row_ids: batch.row_ids,
@@ -878,6 +877,23 @@ async function meltBatch(
   return "melted";
 }
 
+/** Only explicit pre-execution validation rejections prove this request spent nothing. */
+function noSpendRejectionCode(err: unknown): number | null {
+  // SDK wallets may use another cashu-ts copy. Match its protocol error shape,
+  // not constructor identity; never classify transport errors by message text.
+  if (!(err instanceof Error) || err.name !== "MintOperationError" || !("code" in err)) {
+    return null;
+  }
+  const code = err.code;
+  // NUT error codes: invalid proof, unbalanced/invalid request, input/output
+  // limits, and expired input keyset. Spent/pending proofs and quote/payment
+  // errors do not prove the original payment failed and must stay held.
+  return typeof code === "number" &&
+    (code === 10001 || (code >= 11005 && code <= 11015) || code === 12003)
+    ? code
+    : null;
+}
+
 /**
  * Melt the given proofs against an issued quote, passing the per-DVM lock
  * privkey so cashu-ts signs NUT-11 witnesses on the inputs internally. The
@@ -900,8 +916,8 @@ async function meltProofsWithQuoteSigned(
 /**
  * On every run, check the log for melts that started but didn't reach a
  * post-melt record. For each: query the mint for the quote's state and
- * either forward the preimage to `mark-melted` (PAID), abandon the entry
- * (UNPAID), or leave it for the next tick (PENDING).
+ * either forward the preimage to `mark-melted` (PAID) or keep the entry
+ * held for the next tick.
  */
 async function runRecovery(
   ctx: MeltContext
@@ -913,18 +929,24 @@ async function runRecovery(
   for (const entry of inFlight) {
     const result = await recoverOne(ctx, entry);
     if (result === "recovered") recovered++;
-    else if (result !== "abandoned") unresolved.push({ ...entry, pendingReason: result });
+    else unresolved.push({ ...entry, pendingReason: result });
   }
   return { recovered, unresolved };
 }
 
 /**
  * Why recovery left a melt unresolved. Only `mint_pending` is the stuck quote
- * an operator can acknowledge: the others mean the mint was unreachable, broke
- * protocol, or paid while the DVM refused the preimage, so sats may already
+ * an operator can acknowledge: the others mean submission is still uncertain,
+ * the mint was unreachable, broke protocol, or paid while the DVM refused
+ * the preimage, so sats may already
  * have left without the rows being marked melted. Those keep alarming.
  */
-type PendingReason = "mint_pending" | "check_failed" | "paid_no_preimage" | "mark_melted_failed";
+type PendingReason =
+  | "mint_pending"
+  | "mint_unpaid"
+  | "check_failed"
+  | "paid_no_preimage"
+  | "mark_melted_failed";
 
 type UnresolvedMelt = InFlightMelt & { pendingReason: PendingReason };
 
@@ -937,7 +959,7 @@ function isAcknowledgedPending(
 async function recoverOne(
   ctx: MeltContext,
   entry: InFlightMelt
-): Promise<"recovered" | "abandoned" | PendingReason> {
+): Promise<"recovered" | PendingReason> {
   let quote: MeltQuoteBolt11Response;
   try {
     quote = await checkMeltQuoteState(entry.mintUrl, entry.quoteId);
@@ -956,19 +978,18 @@ async function recoverOne(
     return "mint_pending";
   }
   if (quote.state === "UNPAID") {
-    appendPostMelt({
-      dvm_id: ctx.dvmId,
-      row_ids: entry.rowIds,
-      quote_id: entry.quoteId,
-      status: "failed",
-      error: "ln_unpaid_on_recovery",
-    });
-    logEvent(ctx, "melt_pending_recovery_abandoned", {
+    // UNPAID is an observation, not request finality: a timed-out submission
+    // can still arrive after this check, even after quote expiry. Neither time
+    // nor repeated UNPAID checks prove cancellation. Only an explicit no-spend
+    // rejection at submission closes a failure; otherwise hold indefinitely
+    // until PAID with a preimage can be acknowledged. Never re-quote these rows.
+    logEvent(ctx, "melt_pending_recovery_unpaid", {
       mint_url: entry.mintUrl,
       quote_id: entry.quoteId,
     });
-    return "abandoned";
+    return "mint_unpaid";
   }
+  if (quote.state !== "PAID") return "check_failed";
   // PAID — forward preimage to the DVM so the rows transition to melted.
   const preimage = quote.payment_preimage;
   if (!preimage) {

@@ -74,7 +74,8 @@ export type MeltPendingEntry = PreMeltEntry | PostMeltEntry | MeltAcknowledgedEn
 /**
  * An in-flight melt — a pre-melt record without a matching post-melt. The
  * recovery sweep on each run consumes these and either reconciles them via
- * `checkMeltQuoteState` + `mark-melted` (PAID) or marks them failed (UNPAID).
+ * `checkMeltQuoteState` + `mark-melted` (PAID). UNPAID is not proof that
+ * an outstanding submission cannot still arrive, so it stays in flight.
  */
 export interface InFlightMelt {
   ts: number;
@@ -171,6 +172,9 @@ function scanJournal(dvmId: string): ScannedJournal {
     }
     if (entry.dvm_id !== dvmId) continue;
     if (entry.kind === "pre_melt") journal.pre.set(entry.quote_id, entry);
+    // Historical failed posts lack reliable submission evidence. Preserve their
+    // terminal meaning: reopening them all would also reopen definitive rejects
+    // whose rows may already have been split into later successful quotes.
     else if (entry.kind === "post_melt") journal.done.add(entry.quote_id);
     else if (entry.kind === "melt_acknowledged") {
       journal.acknowledged.set(entry.acknowledged_quote_id, entry);
