@@ -36,6 +36,7 @@ import {
   lookupMeltQuote,
   readInFlight,
 } from "../../lib/melt-pending-log.ts";
+import { withMeltPendingLock } from "../../lib/melt-pending-lock.ts";
 import { recordMeltSuccess } from "../../lib/melt-success-state.ts";
 import { requireAuth } from "../../lib/platform.ts";
 import * as platformClient from "../../lib/platform-client.ts";
@@ -251,56 +252,58 @@ async function acknowledgeStuck(handle: string, opts: MeltPendingOptions): Promi
   }
 
   const { canonicalDvmId } = await resolveKeyring(handle, opts);
-  const found = lookupMeltQuote(canonicalDvmId, quoteId);
-  if (found.state === "unknown") {
-    throw new DvmError(
-      "melt_quote_not_found",
-      `No melt for quote ${quoteId} is journalled for ${handle} on this machine.`,
-      "Copy the `quote_id` from a `melt_pending_batch_in_flight` line this DVM's sweep logged. The journal is local, so run this on the host that runs `melt-pending`."
-    );
-  }
-  if (found.state === "resolved") {
-    throw new DvmError(
-      "melt_quote_resolved",
-      `The melt for quote ${quoteId} is already resolved, so there is nothing to acknowledge.`,
-      "Its rows were marked melted or released for a new melt. If a sweep still fails, the failing quote is a different one; read its `melt_pending_batch_in_flight` line."
-    );
-  }
-  const ageMs = Math.max(0, Date.now() - found.entry.ts);
-  if (ageMs < IN_FLIGHT_MELT_ALARM_AFTER_MS) {
-    throw new DvmError(
-      "melt_quote_too_young",
-      `The melt for quote ${quoteId} has been in flight for ${Math.floor(ageMs / 3_600_000)}h; only one past the 24h alarm can be acknowledged.`,
-      "A young pending melt usually settles on its own: the next sweeps keep checking it at the mint. Acknowledge it only once it has stayed stuck past 24h and the mint will not resolve it."
-    );
-  }
+  await withMeltPendingLock(canonicalDvmId, () => {
+    const found = lookupMeltQuote(canonicalDvmId, quoteId);
+    if (found.state === "unknown") {
+      throw new DvmError(
+        "melt_quote_not_found",
+        `No melt for quote ${quoteId} is journalled for ${handle} on this machine.`,
+        "Copy the `quote_id` from a `melt_pending_batch_in_flight` line this DVM's sweep logged. The journal is local, so run this on the host that runs `melt-pending`."
+      );
+    }
+    if (found.state === "resolved") {
+      throw new DvmError(
+        "melt_quote_resolved",
+        `The melt for quote ${quoteId} is already resolved, so there is nothing to acknowledge.`,
+        "Its rows were marked melted or released for a new melt. If a sweep still fails, the failing quote is a different one; read its `melt_pending_batch_in_flight` line."
+      );
+    }
+    const ageMs = Math.max(0, Date.now() - found.entry.ts);
+    if (ageMs < IN_FLIGHT_MELT_ALARM_AFTER_MS) {
+      throw new DvmError(
+        "melt_quote_too_young",
+        `The melt for quote ${quoteId} has been in flight for ${Math.floor(ageMs / 3_600_000)}h; only one past the 24h alarm can be acknowledged.`,
+        "A young pending melt usually settles on its own: the next sweeps keep checking it at the mint. Acknowledge it only once it has stayed stuck past 24h and the mint will not resolve it."
+      );
+    }
 
-  const record = appendAcknowledgement({
-    dvm_id: canonicalDvmId,
-    acknowledged_quote_id: quoteId,
-    reason,
+    const record = appendAcknowledgement({
+      dvm_id: canonicalDvmId,
+      acknowledged_quote_id: quoteId,
+      reason,
+    });
+    const result = {
+      acknowledged: true,
+      dvm_id: canonicalDvmId,
+      dvmId: canonicalDvmId,
+      slug: handle,
+      quote_id: quoteId,
+      mint_url: found.entry.mintUrl,
+      row_ids: found.entry.rowIds,
+      total_sats: found.entry.totalSats,
+      age_ms: ageMs,
+      reason,
+      acknowledged_at: new Date(record.ts).toISOString(),
+    };
+    if (opts.human) {
+      info(
+        `Acknowledged stuck melt ${quoteId} (${found.entry.totalSats} sats, ${Math.floor(ageMs / 3_600_000)}h in flight). ` +
+          "Its rows stay held and later sweeps keep checking the quote, but it no longer fails the run."
+      );
+    } else {
+      json(result);
+    }
   });
-  const result = {
-    acknowledged: true,
-    dvm_id: canonicalDvmId,
-    dvmId: canonicalDvmId,
-    slug: handle,
-    quote_id: quoteId,
-    mint_url: found.entry.mintUrl,
-    row_ids: found.entry.rowIds,
-    total_sats: found.entry.totalSats,
-    age_ms: ageMs,
-    reason,
-    acknowledged_at: new Date(record.ts).toISOString(),
-  };
-  if (opts.human) {
-    info(
-      `Acknowledged stuck melt ${quoteId} (${found.entry.totalSats} sats, ${Math.floor(ageMs / 3_600_000)}h in flight). ` +
-        "Its rows stay held and later sweeps keep checking the quote, but it no longer fails the run."
-    );
-  } else {
-    json(result);
-  }
 }
 
 async function resolveKeyring(handle: string, opts: MeltPendingOptions) {
@@ -437,6 +440,10 @@ async function resolveEndpoint(
  * Record each drain-state response so holdSustained can alarm on a lasting outage.
  */
 async function runTick(ctx: MeltContext): Promise<TickSummary> {
+  return withMeltPendingLock(ctx.dvmId, () => runLockedTick(ctx));
+}
+
+async function runLockedTick(ctx: MeltContext): Promise<TickSummary> {
   const recovery = await runRecovery(ctx);
   const drains = await serviceDrains(ctx.drainCtx);
   const meltHeld = !drains.fetched || drains.cashu_liability_sats_after > 0;
@@ -594,7 +601,7 @@ async function meltBatchChunks(
       row_ids: entry.rowIds,
       age_ms: ageMs,
       pending_reason: entry.pendingReason,
-      ...(alarmed && entry.pendingReason === "mint_pending"
+      ...(alarmed && (entry.pendingReason === "mint_pending" || entry.pendingReason === "mint_unpaid")
         ? {
             hint: `If the mint will not resolve this quote, record that with \`dvmctl melt-pending ${ctx.handle} --acknowledge-stuck ${entry.quoteId} --reason "<why>"\`; its rows stay held and recovery keeps checking it.`,
           }
@@ -791,22 +798,21 @@ async function meltBatch(
     );
   } catch (err) {
     const recoveryDiagnostic = missingDleqRecoveryDiagnostic(proofs, err);
-    appendPostMelt({
-      dvm_id: ctx.dvmId,
-      row_ids: batch.row_ids,
-      quote_id: quote.rawQuote.quote,
-      status: "failed",
-      error: err instanceof Error ? err.message : String(err),
-    });
-    // SDK wallets may carry a separate cashu-ts copy; inspect the protocol code
-    // rather than relying on error constructor identity across package boundaries.
-    if (
-      batch.proofs.length > 1 &&
-      typeof err === "object" && err !== null && "code" in err &&
-      (err.code === 11014 || err.code === 11015)
-    ) {
-      return "input_cap_exceeded";
+    const rejectionCode = noSpendRejectionCode(err);
+    if (rejectionCode !== null) {
+      appendPostMelt({
+        dvm_id: ctx.dvmId,
+        row_ids: batch.row_ids,
+        quote_id: quote.rawQuote.quote,
+        status: "failed",
+        error: err instanceof Error ? err.message : String(err),
+      });
+      if (batch.proofs.length > 1 && (rejectionCode === 11014 || rejectionCode === 11015)) {
+        return "input_cap_exceeded";
+      }
     }
+    // An unclassified failure may follow acceptance, payment, or change
+    // reconstruction. Leave the pre-melt open so its original quote is checked.
     logErr(ctx, "melt_pending_melt_failed", err, {
       mint_url: batch.mint_url,
       row_ids: batch.row_ids,
@@ -825,13 +831,13 @@ async function meltBatch(
     return "skipped";
   }
 
-  if (!meltResult.preimage) {
+  if (meltResult.state !== "PAID" || !meltResult.preimage) {
     // Keep the pre-melt unpaired: the mint may still settle or release the
     // proofs, and only a later quote-state lookup can distinguish those.
     logErr(
       ctx,
       "melt_pending_missing_preimage_after_success",
-      new Error(`mint returned ${meltResult.state} without payment_preimage`),
+      new Error(`mint returned ${meltResult.state} without confirmed PAID state and payment_preimage`),
       {
         mint_url: batch.mint_url,
         row_ids: batch.row_ids,
@@ -878,6 +884,39 @@ async function meltBatch(
   return "melted";
 }
 
+/** Only explicit final submission rejections prove this request cannot later pay. */
+function noSpendRejectionCode(err: unknown): number | null {
+  // cashu-ts wraps a mint's keyset rejection after attempting a snapshot
+  // refresh. Both repair outcomes still prove rejection; arbitrary causes
+  // (especially a MeltChangeError after payment) do not.
+  if (
+    err instanceof Error && err.name === "StaleKeysetError" &&
+    "repaired" in err && typeof err.repaired === "boolean"
+  ) {
+    const code = mintOperationCode(err.cause);
+    return code === 12001 || code === 12002 || code === 12003 ? code : null;
+  }
+  const code = mintOperationCode(err);
+  // Only assigned integer rejections establish finality. A direct failed
+  // payment or expired-quote rejection differs from observing UNPAID/expiry
+  // after a response was lost: this submission cannot later settle.
+  return code !== null &&
+    Number.isInteger(code) &&
+    (code === 10001 || (code >= 11005 && code <= 11015) ||
+      code === 12001 || code === 12002 || code === 12003 || code === 20004 || code === 20007)
+    ? code
+    : null;
+}
+
+function mintOperationCode(err: unknown): number | null {
+  // SDK wallets may use another cashu-ts copy. Match its protocol error shape,
+  // not constructor identity; never classify transport errors by message text.
+  if (!(err instanceof Error) || err.name !== "MintOperationError" || !("code" in err)) {
+    return null;
+  }
+  return typeof err.code === "number" ? err.code : null;
+}
+
 /**
  * Melt the given proofs against an issued quote, passing the per-DVM lock
  * privkey so cashu-ts signs NUT-11 witnesses on the inputs internally. The
@@ -900,8 +939,8 @@ async function meltProofsWithQuoteSigned(
 /**
  * On every run, check the log for melts that started but didn't reach a
  * post-melt record. For each: query the mint for the quote's state and
- * either forward the preimage to `mark-melted` (PAID), abandon the entry
- * (UNPAID), or leave it for the next tick (PENDING).
+ * either forward the preimage to `mark-melted` (PAID) or keep the entry
+ * held for the next tick.
  */
 async function runRecovery(
   ctx: MeltContext
@@ -913,31 +952,38 @@ async function runRecovery(
   for (const entry of inFlight) {
     const result = await recoverOne(ctx, entry);
     if (result === "recovered") recovered++;
-    else if (result !== "abandoned") unresolved.push({ ...entry, pendingReason: result });
+    else unresolved.push({ ...entry, pendingReason: result });
   }
   return { recovered, unresolved };
 }
 
 /**
- * Why recovery left a melt unresolved. Only `mint_pending` is the stuck quote
- * an operator can acknowledge: the others mean the mint was unreachable, broke
- * protocol, or paid while the DVM refused the preimage, so sats may already
- * have left without the rows being marked melted. Those keep alarming.
+ * Why recovery left a melt unresolved. Acknowledgement silences alarms for
+ * PENDING and UNPAID observations without releasing rows. The other reasons
+ * mean the mint was unreachable, broke protocol, or paid while the DVM refused
+ * the preimage, so sats may already have left without the rows being marked
+ * melted. Those keep alarming.
  */
-type PendingReason = "mint_pending" | "check_failed" | "paid_no_preimage" | "mark_melted_failed";
+type PendingReason =
+  | "mint_pending"
+  | "mint_unpaid"
+  | "check_failed"
+  | "paid_no_preimage"
+  | "mark_melted_failed";
 
 type UnresolvedMelt = InFlightMelt & { pendingReason: PendingReason };
 
 function isAcknowledgedPending(
   entry: UnresolvedMelt
 ): entry is UnresolvedMelt & Required<Pick<InFlightMelt, "acknowledged">> {
-  return !!entry.acknowledged && entry.pendingReason === "mint_pending";
+  return !!entry.acknowledged &&
+    (entry.pendingReason === "mint_pending" || entry.pendingReason === "mint_unpaid");
 }
 
 async function recoverOne(
   ctx: MeltContext,
   entry: InFlightMelt
-): Promise<"recovered" | "abandoned" | PendingReason> {
+): Promise<"recovered" | PendingReason> {
   let quote: MeltQuoteBolt11Response;
   try {
     quote = await checkMeltQuoteState(entry.mintUrl, entry.quoteId);
@@ -956,19 +1002,18 @@ async function recoverOne(
     return "mint_pending";
   }
   if (quote.state === "UNPAID") {
-    appendPostMelt({
-      dvm_id: ctx.dvmId,
-      row_ids: entry.rowIds,
-      quote_id: entry.quoteId,
-      status: "failed",
-      error: "ln_unpaid_on_recovery",
-    });
-    logEvent(ctx, "melt_pending_recovery_abandoned", {
+    // UNPAID is an observation, not request finality: a timed-out submission
+    // can still arrive after this check, even after quote expiry. Neither time
+    // nor repeated UNPAID checks prove cancellation. Only an explicit no-spend
+    // rejection at submission closes a failure; otherwise hold indefinitely
+    // until PAID with a preimage can be acknowledged. Never re-quote these rows.
+    logEvent(ctx, "melt_pending_recovery_unpaid", {
       mint_url: entry.mintUrl,
       quote_id: entry.quoteId,
     });
-    return "abandoned";
+    return "mint_unpaid";
   }
+  if (quote.state !== "PAID") return "check_failed";
   // PAID — forward preimage to the DVM so the rows transition to melted.
   const preimage = quote.payment_preimage;
   if (!preimage) {

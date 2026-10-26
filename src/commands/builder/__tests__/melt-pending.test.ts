@@ -751,7 +751,7 @@ describe("dvmctl melt-pending", () => {
     });
     const meltProofsBolt11 = vi
       .fn()
-      .mockResolvedValue({ quote: { payment_preimage: "preimage-retired" }, change: [] });
+      .mockResolvedValue({ quote: { state: "PAID", payment_preimage: "preimage-retired" }, change: [] });
     vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
 
     await meltPending("dvm", { endpoint: "https://dvm.example" });
@@ -805,7 +805,7 @@ describe("dvmctl melt-pending", () => {
       if (!proofs.every((proof: { dleq?: unknown }) => proof.dleq)) {
         throw new Error("panic mode requires DLEQ data for every input");
       }
-      return Promise.resolve({ quote: { payment_preimage: "preimage123" }, change: [] });
+      return Promise.resolve({ quote: { state: "PAID", payment_preimage: "preimage123" }, change: [] });
     });
     vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
     markMelted.mockResolvedValue({ melted: 1 });
@@ -833,7 +833,7 @@ describe("dvmctl melt-pending", () => {
     );
   });
 
-  it("counts a melt failure as a failed batch and records the failure in the log", async () => {
+  it("counts an uncertain melt failure without closing recovery and preserves its diagnostic", async () => {
     const stderr = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const { getPendingBatches, markMelted } = setHappyPath();
     getPendingBatches.mockResolvedValue({
@@ -863,9 +863,7 @@ describe("dvmctl melt-pending", () => {
       code: "batches_failed",
     });
     expect(markMelted).not.toHaveBeenCalled();
-    expect(meltLog.appendPostMelt).toHaveBeenCalledWith(
-      expect.objectContaining({ status: "failed" })
-    );
+    expect(meltLog.appendPostMelt).not.toHaveBeenCalled();
     expect(stderr.mock.calls.flat().join("\n")).toContain(
       "The NUT-11 key can authorize the spend but cannot recreate DLEQ"
     );
@@ -937,7 +935,7 @@ describe("dvmctl melt-pending", () => {
     expect(melt.fetchMeltQuote).not.toHaveBeenCalled();
   });
 
-  it("recovery: abandons an UNPAID quote with a failed post-melt entry", async () => {
+  it("recovery: keeps an UNPAID quote held for a possibly outstanding submission", async () => {
     const { getPendingBatches } = setHappyPath();
     getPendingBatches.mockResolvedValue({ batches: [] });
     vi.mocked(meltLog.readInFlight).mockReturnValue([
@@ -958,9 +956,7 @@ describe("dvmctl melt-pending", () => {
 
     await meltPending("dvm", { endpoint: "https://dvm.example" });
 
-    expect(meltLog.appendPostMelt).toHaveBeenCalledWith(
-      expect.objectContaining({ status: "failed", error: "ln_unpaid_on_recovery" })
-    );
+    expect(meltLog.appendPostMelt).not.toHaveBeenCalled();
   });
 
   it("leaves entry in-flight (no post-melt) when mark-melted fails after a successful melt", async () => {
@@ -988,7 +984,7 @@ describe("dvmctl melt-pending", () => {
     });
     const meltProofsBolt11 = vi
       .fn()
-      .mockResolvedValue({ quote: { payment_preimage: "preimage123" }, change: [] });
+      .mockResolvedValue({ quote: { state: "PAID", payment_preimage: "preimage123" }, change: [] });
     vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
     markMelted.mockRejectedValue(new Error("DVM unreachable"));
 
@@ -1154,7 +1150,7 @@ describe("dvmctl melt-pending", () => {
       });
     const meltProofsBolt11 = vi
       .fn()
-      .mockResolvedValue({ quote: { payment_preimage: "preimage-twopass" }, change: [] });
+      .mockResolvedValue({ quote: { state: "PAID", payment_preimage: "preimage-twopass" }, change: [] });
     vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
     markMelted.mockResolvedValue({ melted: 1 });
 
@@ -1251,7 +1247,7 @@ describe("dvmctl melt-pending", () => {
     });
     const meltProofsBolt11 = vi
       .fn()
-      .mockResolvedValue({ quote: { payment_preimage: "preimage-input-fee" }, change: [] });
+      .mockResolvedValue({ quote: { state: "PAID", payment_preimage: "preimage-input-fee" }, change: [] });
     vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
     markMelted.mockResolvedValue({ melted: 1 });
 
@@ -1303,7 +1299,7 @@ describe("dvmctl melt-pending", () => {
     });
     const meltProofsBolt11 = vi
       .fn()
-      .mockResolvedValue({ quote: { payment_preimage: "preimage-hub" }, change: [] });
+      .mockResolvedValue({ quote: { state: "PAID", payment_preimage: "preimage-hub" }, change: [] });
     vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
     markMelted.mockResolvedValue({ melted: 1 });
 
@@ -1410,7 +1406,7 @@ describe("dvmctl melt-pending", () => {
     });
     const meltProofsBolt11 = vi
       .fn()
-      .mockResolvedValue({ quote: { payment_preimage: null }, change: [] });
+      .mockResolvedValue({ quote: { state: "PAID", payment_preimage: null }, change: [] });
     vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
 
     await expect(meltPending("dvm", { endpoint: "https://dvm.example" })).rejects.toMatchObject({
@@ -1561,7 +1557,7 @@ describe("dvmctl melt-pending", () => {
       });
     });
 
-    it("abandons an acknowledged quote the mint later reports UNPAID and melts its rows afresh", async () => {
+    it("holds an acknowledged quote without alarming when the mint later reports UNPAID", async () => {
       const { getPendingBatches, markMelted } = setHappyPath();
       getPendingBatches.mockResolvedValue({ batches: [BATCH] });
       markMelted.mockResolvedValue({ melted: 1 });
@@ -1570,32 +1566,16 @@ describe("dvmctl melt-pending", () => {
         state: "UNPAID",
         payment_preimage: null,
       } as never);
-      vi.mocked(lnurl.fetchLnurlPayInvoice).mockResolvedValue("lnbc...");
-      vi.mocked(melt.fetchMeltQuote).mockResolvedValue({
-        amountSats: 60,
-        feeReserveSats: 0,
-        rawQuote: { quote: "q-new" } as never,
-      });
-      vi.mocked(wallet.getWallet).mockResolvedValue({
-        meltProofsBolt11: vi.fn().mockResolvedValue({
-          quote: { state: "PAID", payment_preimage: "fresh" },
-          change: [],
-        }),
-      } as never);
-
       await meltPending("dvm", { endpoint: "https://dvm.example" });
 
-      expect(meltLog.appendPostMelt).toHaveBeenCalledWith(
-        expect.objectContaining({ quote_id: "q1", status: "failed", error: "ln_unpaid_on_recovery" })
-      );
-      expect(markMelted).toHaveBeenCalledExactlyOnceWith({
-        row_ids: ["r1"],
-        melt_quote_id: "q-new",
-        payment_preimage: "fresh",
-      });
+      expect(meltLog.appendPostMelt).not.toHaveBeenCalled();
+      expect(markMelted).not.toHaveBeenCalled();
+      expect(melt.fetchMeltQuote).not.toHaveBeenCalled();
+      expect(wallet.getWallet).not.toHaveBeenCalled();
       expect(vi.mocked(output.json).mock.calls[0][0]).toMatchObject({
-        batches_melted: 1,
-        acknowledged_melts: 0,
+        batches_melted: 0,
+        batches_failed: 0,
+        acknowledged_melts: 1,
       });
     });
 
