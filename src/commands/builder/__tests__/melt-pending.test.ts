@@ -6,6 +6,12 @@ import type * as adminCashuClientModule from "../../../lib/admin-cashu-client";
 import type { AdminBatch } from "../../../lib/admin-cashu-client";
 import type * as drainHoldStateModule from "../../../lib/drain-hold-state";
 
+// Watch-loop tests advance virtual time; real filesystem locking is exercised
+// by the separate cross-process suite with a durable journal and real clocks.
+vi.mock("proper-lockfile", () => ({
+  default: { lock: vi.fn(async () => async () => undefined) },
+}));
+
 vi.mock("../../../lib/builder-mnemonic", () => ({
   readBuilderMnemonic: vi.fn(),
 }));
@@ -1557,7 +1563,7 @@ describe("dvmctl melt-pending", () => {
       });
     });
 
-    it("holds and alarms on an acknowledged quote the mint later reports UNPAID", async () => {
+    it("holds an acknowledged quote without alarming when the mint later reports UNPAID", async () => {
       const { getPendingBatches, markMelted } = setHappyPath();
       getPendingBatches.mockResolvedValue({ batches: [BATCH] });
       markMelted.mockResolvedValue({ melted: 1 });
@@ -1566,9 +1572,7 @@ describe("dvmctl melt-pending", () => {
         state: "UNPAID",
         payment_preimage: null,
       } as never);
-      await expect(meltPending("dvm", { endpoint: "https://dvm.example" })).rejects.toMatchObject({
-        code: "batches_failed",
-      });
+      await meltPending("dvm", { endpoint: "https://dvm.example" });
 
       expect(meltLog.appendPostMelt).not.toHaveBeenCalled();
       expect(markMelted).not.toHaveBeenCalled();
@@ -1576,7 +1580,8 @@ describe("dvmctl melt-pending", () => {
       expect(wallet.getWallet).not.toHaveBeenCalled();
       expect(vi.mocked(output.json).mock.calls[0][0]).toMatchObject({
         batches_melted: 0,
-        acknowledged_melts: 0,
+        batches_failed: 0,
+        acknowledged_melts: 1,
       });
     });
 

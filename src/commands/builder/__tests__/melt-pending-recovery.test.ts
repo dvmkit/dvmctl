@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { MeltChangeError, MintOperationError } from "@cashu/cashu-ts";
+import { MeltChangeError, MintOperationError, StaleKeysetError, Wallet } from "@cashu/cashu-ts";
 import type * as SdkInternal from "@dvmkit/sdk/internal";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -54,7 +54,24 @@ async function loadProcess() {
   vi.resetModules();
   const { meltPending } = await import("../melt-pending");
   const journal = await import("../../../lib/melt-pending-log");
-  return { run: () => meltPending("fixture", { endpoint: "https://dvm.invalid" }), journal };
+  return { command: meltPending, run: () => meltPending("fixture", { endpoint: "https://dvm.invalid" }), journal };
+}
+
+// Keep the wallet's real HTTP decoder, rejection wrapper, and completion path.
+// The empty preview bypasses unrelated proof preparation and signing.
+function submitHttpRejection(code: number, repaired = false) {
+  const wallet = new Wallet(BATCH.mint_url);
+  const repair = vi.spyOn(wallet as unknown as {
+    repairStaleSnapshot: () => Promise<boolean>;
+  }, "repairStaleSnapshot").mockResolvedValue(repaired);
+  vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+    code, detail: "mint rejected submission",
+  }, { status: 400 })));
+  mint.submit.mockImplementation(() => wallet.completeMelt({
+    method: "bolt11", inputs: [], outputData: [], keysetId: "keyset",
+    quote: { quote: "original-quote" },
+  }));
+  return repair;
 }
 
 describe("uncertain melt recovery with a durable journal", () => {
@@ -85,6 +102,7 @@ describe("uncertain melt recovery with a durable journal", () => {
 
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
     rmSync(stateDir, { recursive: true, force: true });
   });
 
@@ -224,6 +242,77 @@ describe("uncertain melt recovery with a durable journal", () => {
     expect(process.journal.readInFlight(DVM_ID)).toEqual([]);
     expect(mint.check).not.toHaveBeenCalled();
     expect(admin.markMelted).not.toHaveBeenCalled();
+  });
+
+  it.each([20004, 20007])("closes final payment rejection %i decoded by the mint transport", async (code) => {
+    submitHttpRejection(code);
+    const process = await loadProcess();
+    await expect(process.run()).rejects.toMatchObject({ code: "batches_failed" });
+    expect(process.journal.lookupMeltQuote(DVM_ID, "original-quote")).toEqual({ state: "resolved" });
+    expect(process.journal.readInFlight(DVM_ID)).toEqual([]);
+    expect(admin.markMelted).not.toHaveBeenCalled();
+  });
+
+  it.each([12001, 12002, 12003].flatMap(code => [false, true].map(repaired => ({ code, repaired }))))(
+    "closes wallet-wrapped keyset rejection $code with repaired=$repaired",
+    async ({ code, repaired }) => {
+      const repair = submitHttpRejection(code, repaired);
+      const process = await loadProcess();
+      await expect(process.run()).rejects.toMatchObject({ code: "batches_failed" });
+      expect(repair).toHaveBeenCalledOnce();
+      expect(process.journal.readInFlight(DVM_ID)).toEqual([]);
+      expect(admin.markMelted).not.toHaveBeenCalled();
+    }
+  );
+
+  it("holds a fractional rejection code decoded by the mint transport", async () => {
+    submitHttpRejection(11005.5);
+    let process = await loadProcess();
+    await expect(process.run()).rejects.toMatchObject({ code: "batches_failed" });
+    expect(process.journal.readInFlight(DVM_ID)).toHaveLength(1);
+    process = await loadProcess();
+    await process.run();
+    expect(mint.quote).toHaveBeenCalledTimes(1);
+    expect(mint.submit).toHaveBeenCalledTimes(1);
+    expect(admin.markMelted).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    new Error("unrelated wrapper", { cause: new MintOperationError(12003, "expired keyset") }),
+    new StaleKeysetError(false, { cause: new MintOperationError(12999, "unknown keyset error") }),
+    new StaleKeysetError(true, { cause: new Error("response lost") }),
+    new MeltChangeError([], { state: "PAID" } as never, {
+      cause: new MintOperationError(12003, "change keyset expired"),
+    }),
+  ])("does not release inputs for $name without proven submission rejection", async (error) => {
+    mint.submit.mockRejectedValue(error);
+    const process = await loadProcess();
+    await expect(process.run()).rejects.toMatchObject({ code: "batches_failed" });
+    expect(process.journal.readInFlight(DVM_ID)).toHaveLength(1);
+    expect(admin.markMelted).not.toHaveBeenCalled();
+  });
+
+  it("acknowledges an old UNPAID alarm while retaining recovery and row holds", async () => {
+    const process = await loadProcess();
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() - 3 * 86_400_000);
+    process.journal.appendPreMelt({
+      dvm_id: DVM_ID, row_ids: BATCH.row_ids, quote_id: "original-quote",
+      mint_url: BATCH.mint_url, lock_pubkey: PUBKEY, total_sats: 60,
+    });
+    clock.mockRestore();
+    await process.command("fixture", {
+      endpoint: "https://dvm.invalid", acknowledgeStuck: "original-quote", reason: "mint support investigating",
+    });
+    await process.run();
+    expect(process.journal.readInFlight(DVM_ID)).toHaveLength(1);
+    expect(mint.quote).not.toHaveBeenCalled();
+    expect(mint.submit).not.toHaveBeenCalled();
+    paid = true;
+    await process.run();
+    expect(admin.markMelted).toHaveBeenCalledExactlyOnceWith({
+      row_ids: BATCH.row_ids, melt_quote_id: "original-quote", payment_preimage: "payment-receipt",
+    });
+    expect(process.journal.readInFlight(DVM_ID)).toEqual([]);
   });
 
 });
