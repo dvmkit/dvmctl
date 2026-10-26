@@ -13,6 +13,8 @@ import { BUILDER_CONFIG_DIR } from "../shared/defaults.ts";
  * Only ESRCH on the same host proves death: heartbeat age cannot distinguish
  * a crash from sleep or SIGSTOP. A reused PID deliberately blocks reclamation.
  * Unknown/remote owners and interrupted lock creation require manual clearance.
+ * Hostname identifies the machine, so a config directory shared between hosts
+ * that report the same hostname is unsupported.
  */
 export async function withMeltPendingLock<T>(
   dvmId: string,
