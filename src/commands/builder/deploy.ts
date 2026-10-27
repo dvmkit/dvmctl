@@ -36,8 +36,11 @@ import {
 import { DIRTY_SUFFIX, shortSha, splitDirtySha } from "../../shared/git-sha.ts";
 import { info, json, progress } from "../../shared/output.ts";
 import { dockerfileTemplate } from "./create/templates/shared.ts";
+import { createTarball, packagedTreeDirtyPaths } from "./deploy-context.ts";
 import { identityCreate } from "./identity.ts";
 import { validateManifest } from "./validate.ts";
+
+export { createTarball, TARBALL_EXCLUDES } from "./deploy-context.ts";
 
 export interface DeployOptions {
   target?: "cloud" | "self-host" | "local";
@@ -1007,59 +1010,6 @@ export function findContextRoot(cwd: string): string {
 }
 
 /**
- * Paths the tarball never ships, matched by name at any depth (tar's
- * `--exclude` semantics).
- *
- * The list matters more than it looks: when the build context is the repo root
- * (monorepo deploys), the tarball walks sibling subtrees the operator never
- * intended to upload. Without .env.* and .vercel, deploying from
- * packages/example/ would ship web/.env.local, web/.vercel/project.json, and any
- * sibling project.env.local to the platform.
- *
- * Shared with {@link isPackagedTreeDirty}, which needs the same answer to the
- * same question — "would this path actually ship?" — and would produce a
- * permanently-dirty signal if the two ever drifted.
- */
-export const TARBALL_EXCLUDES = [
-  "node_modules",
-  ".git",
-  "dist",
-  ".env",
-  ".env.*",
-  ".vercel",
-  ".next",
-  ".turbo",
-  "coverage",
-  "*.tsbuildinfo",
-  ".cache",
-  // Verification transcripts are durable local evidence, not image inputs.
-  // Full-suite and production-acceptance logs can exceed the CLI's archive
-  // buffer and the platform's extraction deadline on an otherwise clean tree.
-  ".verify-logs",
-  // Playwright screenshot baselines (`<spec file>-snapshots/`) are test
-  // fixtures, not image inputs. dvmkit's own web/tests baselines alone pushed
-  // the first-party DVM tarball past the 50 MiB archive buffer (ENOBUFS).
-  "*.spec.*-snapshots",
-  "*.test.*-snapshots",
-  // Agent worktrees can balloon to GBs of parallel-session checkouts; agent
-  // session state isn't a deploy input at any depth. Excluded wholesale by
-  // name match.
-  ".claude",
-  ".codex",
-] as const;
-
-/**
- * Create a gzipped tarball of the project directory.
- * Excludes node_modules, .git, dist, and known secret/local-state files.
- */
-export function createTarball(cwd: string): Buffer {
-  return execFileSync("tar", ["czf", "-", ...TARBALL_EXCLUDES.map((e) => `--exclude=${e}`), "."], {
-    cwd,
-    maxBuffer: 50 * 1024 * 1024,
-  });
-}
-
-/**
  * Materialize precisely the archive uploaded by a cloud deploy for a local
  * Docker build. Docker then applies the archived project's `.dockerignore`
  * (including Dockerfile-specific ignore files) in its normal way.
@@ -1094,62 +1044,9 @@ export interface LocalGitCommit {
   authorName: string | null;
 }
 
-/**
- * True when the tree the tarball would package differs from HEAD.
- *
- * The label baked into an image is `git rev-parse HEAD`, but the content is a
- * `tar` of the working tree — so a dirty tree yields an image asserting a
- * commit it doesn't match. This is the check that makes the
- * assertion honest.
- *
- * "Differs" is scoped to what actually ships, which is narrower than
- * `git status` in both directions:
- *
- *  - Excluded paths don't count, even when tracked and modified. `.claude/` is
- *    the live case: it's in git but never in the tarball, so an uncommitted
- *    settings edit cannot change the image. Counting it would mark deploys
- *    dirty for a file that provably didn't ship, and a signal that fires on
- *    every deploy is worthless.
- *  - Gitignored-but-packaged local state (`pgdata/`, `.cache/`, `.temp/`) is
- *    invisible here and stays that way. It ships on *every* deploy, clean or
- *    not, so it can't discriminate — that's the exclude list's problem,
- * not the label's.
- *
- * Scoped to `packagedRoot` via pathspec: `git status` reports the whole repo
- * regardless of cwd, but a context root below the repo root packages only its
- * own subtree, and changes outside it can't reach the image.
- *
- * One rough edge, pinned by test: git reports the *shallowest* untracked
- * directory rather than its contents, so a brand-new directory whose content
- * is entirely excluded (`web/` holding only `.next/`) reads as packaged and
- * marks dirty. Left as-is — the directory itself does ship, and over-reporting
- * keeps the sha from over-claiming. `-uall` would resolve it precisely, at the
- * cost of enumerating every untracked file in repos that don't gitignore
- * `node_modules`. The common shape (tracked parent, excluded child) recurses
- * and filters correctly.
- *
- * Returns false when `packagedRoot` isn't a git repo or git is unavailable —
- * there's no commit claim to contradict, and `readGitHead` already returns
- * null there, so the image reports "unknown" rather than a sha.
- */
+/** True when packaged working-tree files differ from HEAD. */
 export function isPackagedTreeDirty(packagedRoot: string): boolean {
   return packagedTreeDirtyPaths(packagedRoot).length > 0;
-}
-
-/** Packaged paths whose working-tree content differs from HEAD. */
-function packagedTreeDirtyPaths(packagedRoot: string): string[] {
-  let raw: string;
-  try {
-    raw = execFileSync("git", ["status", "--porcelain", "-z", "--", "."], {
-      cwd: packagedRoot,
-      stdio: ["ignore", "pipe", "ignore"],
-      maxBuffer: 16 * 1024 * 1024,
-    }).toString("utf8");
-  } catch {
-    return [];
-  }
-
-  return raw.split("\0").filter(Boolean).map(statusEntryPath).filter(isPackaged).sort();
 }
 
 /**
@@ -1189,33 +1086,6 @@ export function readGitHead(cwd: string, packagedRoot?: string): LocalGitCommit 
     message,
     authorName: authorName && authorName.length > 0 ? authorName : null,
   };
-}
-
-/**
- * Path out of one `git status --porcelain -z` field.
- *
- * Entries are `XY <path>`; a rename/copy appends a bare `<origPath>` field
- * with no code. Both sides of a rename are real content changes, so the bare
- * field is returned as a path too rather than skipped.
- */
-function statusEntryPath(field: string): string {
-  return /^[ MADRCU?!][ MADRCU?!] /.test(field) ? field.slice(3) : field;
-}
-
-function isPackaged(path: string): boolean {
-  const segments = path.split("/").filter(Boolean);
-  return !segments.some((segment) =>
-    TARBALL_EXCLUDES.some((pattern) => matchesExclude(segment, pattern))
-  );
-}
-
-function matchesExclude(segment: string, pattern: string): boolean {
-  if (!pattern.includes("*")) return segment === pattern;
-  const source = pattern
-    .split("*")
-    .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-    .join(".*");
-  return new RegExp(`^${source}$`).test(segment);
 }
 
 /** Format milliseconds as `m:ss` for human-mode phase ticks. */
