@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
-import { closeSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { closeSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { DvmError } from "@dvmkit/sdk/internal";
 
@@ -29,10 +29,42 @@ function git(cwd: string, args: string[]): string {
   }).toString("utf8");
 }
 
-function gitVisiblePaths(cwd: string): string[] | null {
+function gitContextError(): DvmError {
+  return new DvmError("deploy_context_git_failed", "Could not inspect git-visible build context files.",
+    "Check that git rev-parse --is-inside-work-tree and git ls-files --cached --others --exclude-standard succeed in the build context, then retry.");
+}
+
+function hasGitBoundary(cwd: string): boolean {
+  if (process.env.GIT_DIR || process.env.GIT_WORK_TREE || process.env.GIT_COMMON_DIR) return true;
   try {
-    if (git(cwd, ["rev-parse", "--is-inside-work-tree"]).trim() !== "true") return null;
+    let dir = realpathSync(cwd);
+    for (;;) {
+      try {
+        lstatSync(join(dir, ".git"));
+        return true;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") return true;
+      }
+      const parent = dirname(dir);
+      if (parent === dir) return false;
+      dir = parent;
+    }
   } catch {
+    // An inaccessible boundary cannot establish that an unrestricted walk is safe.
+    return true;
+  }
+}
+
+function gitVisiblePaths(cwd: string): string[] | null {
+  let insideWorkTree = false;
+  try {
+    insideWorkTree = git(cwd, ["rev-parse", "--is-inside-work-tree"]).trim() === "true";
+  } catch {
+    // Only a context with no repository boundary may use the non-git fallback.
+  }
+  if (!insideWorkTree) {
+    if (hasGitBoundary(cwd)) throw gitContextError();
     return null;
   }
   try {
@@ -40,14 +72,19 @@ function gitVisiblePaths(cwd: string): string[] | null {
       .split("\0").filter(Boolean))].filter(isPackaged);
   } catch {
     // Do not silently fall back to shipping ignored files when enumeration fails.
-    throw new DvmError("deploy_context_git_failed", "Could not list git-visible build context files.",
-      "Check that git ls-files --cached --others --exclude-standard succeeds in the build context, then retry.");
+    throw gitContextError();
   }
 }
 
 function existingPaths(cwd: string, paths: string[]): string[] {
   return paths.filter((path) => {
     try {
+      // A leaf symlink may ship, but following a symlink ancestor could read outside the context.
+      let parent = cwd;
+      for (const segment of path.split("/").slice(0, -1)) {
+        parent = join(parent, segment);
+        if (!lstatSync(parent).isDirectory()) return false;
+      }
       lstatSync(join(cwd, path));
       return true;
     } catch (error) {
@@ -113,7 +150,7 @@ export function createTarball(cwd: string, maxBytes = MAX_ARCHIVE_BYTES): Buffer
 /** Deletions and both sides of renames matter even when the old file no longer exists. */
 export function packagedTreeDirtyPaths(cwd: string): string[] {
   try {
-    const prefix = git(cwd, ["rev-parse", "--show-prefix"]).trim();
+    const prefix = git(cwd, ["rev-parse", "--show-prefix"]).replace(/\n$/, "");
     const raw = git(cwd, ["status", "--porcelain", "-z", "--untracked-files=all", "--", "."]);
     return raw.split("\0").filter(Boolean)
       .map((field) => /^[ MADRCU?!][ MADRCU?!] /.test(field) ? field.slice(3) : field)

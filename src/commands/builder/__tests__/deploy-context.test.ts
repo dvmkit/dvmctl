@@ -8,6 +8,7 @@ import { DvmError } from "@dvmkit/sdk/internal";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { gitRunner } from "../../../test-support/git-sandbox.ts";
+import { SPAWN_HEAVY_TIMEOUT } from "../../../test-support/spawn-budget.ts";
 
 import { createTarball, packagedTreeDirtyPaths } from "../deploy-context.ts";
 
@@ -29,7 +30,7 @@ afterEach(() => {
   for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-describe("git-visible deploy context", () => {
+describe("git-visible deploy context", { timeout: SPAWN_HEAVY_TIMEOUT }, () => {
   it("ships tracked and untracked inputs without ignored output or deleted index entries", () => {
     const dir = fixture();
     git(dir, "init");
@@ -70,6 +71,58 @@ describe("git-visible deploy context", () => {
     rmSync(join(context, "handler.ts"));
     expect(packagedTreeDirtyPaths(context)).toEqual(["handler.ts", "new/input.txt"]);
     expect(entries(context)).toEqual(["new/input.txt"]);
+  });
+
+  it("does not follow a symlink replacing a tracked directory", () => {
+    const dir = fixture();
+    const external = fixture();
+    git(dir, "init");
+    mkdirSync(join(dir, "linked"));
+    writeFileSync(join(dir, "linked", "input.txt"), "tracked input");
+    git(dir, "add", ".");
+    git(dir, "commit", "-m", "seed");
+    writeFileSync(join(external, "input.txt"), "external secret marker");
+    rmSync(join(dir, "linked"), { recursive: true });
+    symlinkSync(external, join(dir, "linked"));
+
+    expect(entries(dir)).toEqual(["linked"]);
+  });
+
+  it.each([".", "nested/context"])("rejects a broken repository probe for context %s", (contextPath) => {
+    const dir = fixture();
+    git(dir, "init");
+    const context = join(dir, contextPath);
+    mkdirSync(context, { recursive: true });
+    writeFileSync(join(dir, ".gitignore"), "private-data/\n");
+    mkdirSync(join(context, "private-data"));
+    writeFileSync(join(context, "private-data", "secret.txt"), "must not ship");
+    writeFileSync(join(dir, ".git", "config"), "[invalid config\n");
+
+    let failure: unknown;
+    try {
+      createTarball(context);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(DvmError);
+    expect(failure).toMatchObject({
+      code: "deploy_context_git_failed",
+      hint: expect.stringContaining("git rev-parse"),
+    });
+  });
+
+  it.each([" app", "\napp", " app\n"])("preserves pathname whitespace in a dirty context prefix %j", (name) => {
+    const dir = fixture();
+    git(dir, "init");
+    const context = join(dir, name);
+    mkdirSync(context);
+    writeFileSync(join(context, "input.txt"), "committed input");
+    git(dir, "add", ".");
+    git(dir, "commit", "-m", "seed");
+    writeFileSync(join(context, "input.txt"), "changed input");
+
+    expect(entries(context)).toEqual(["input.txt"]);
+    expect(packagedTreeDirtyPaths(context)).toEqual(["input.txt"]);
   });
 
   it("retains exclude-list behavior outside git, including files named in .gitignore", () => {
