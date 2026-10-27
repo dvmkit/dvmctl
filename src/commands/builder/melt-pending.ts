@@ -35,8 +35,10 @@ import {
   type InFlightMelt,
   lookupMeltQuote,
   readInFlight,
+  readMeltHistory,
 } from "../../lib/melt-pending-log.ts";
 import { withMeltPendingLock } from "../../lib/melt-pending-lock.ts";
+import { canonicalMint, MeltCustody, prepareCustody, recoverCustody, type CustodyOperation } from "../../lib/melt-change-custody.ts";
 import { recordMeltSuccess } from "../../lib/melt-success-state.ts";
 import { requireAuth } from "../../lib/platform.ts";
 import * as platformClient from "../../lib/platform-client.ts";
@@ -440,10 +442,14 @@ async function resolveEndpoint(
  * Record each drain-state response so holdSustained can alarm on a lasting outage.
  */
 async function runTick(ctx: MeltContext): Promise<TickSummary> {
-  return withMeltPendingLock(ctx.dvmId, () => runLockedTick(ctx));
+  return withMeltPendingLock("builder-payout-custody", () =>
+    withMeltPendingLock(ctx.dvmId, () => runLockedTick({ ...ctx, custody: new MeltCustody() }))
+  );
 }
 
-async function runLockedTick(ctx: MeltContext): Promise<TickSummary> {
+type CustodyContext = MeltContext & { custody: MeltCustody };
+
+async function runLockedTick(ctx: CustodyContext): Promise<TickSummary> {
   const recovery = await runRecovery(ctx);
   const drains = await serviceDrains(ctx.drainCtx);
   const meltHeld = !drains.fetched || drains.cashu_liability_sats_after > 0;
@@ -522,7 +528,7 @@ async function runLockedTick(ctx: MeltContext): Promise<TickSummary> {
     throw new DvmError(
       "pending_batches_fetch_failed",
       "Failed to fetch pending batches from the DVM admin endpoint.",
-      err instanceof Error ? err.message : String(err)
+      "Check DVM connectivity and retry the same command."
     );
   }
 
@@ -557,14 +563,16 @@ type BatchOutcome = "melted" | "skipped" | "failed";
 
 /** Keep summary counters per server batch, even when only some chunks settle. */
 async function meltBatchChunks(
-  ctx: MeltContext,
+  ctx: CustodyContext,
   batch: AdminBatch,
   unresolvedByRow: Map<string, UnresolvedMelt>,
   inputCapsByMint: Map<string, number>
 ): Promise<{ outcome: BatchOutcome; satsMelted: number }> {
   // Slicing by position is safe only with the admin API's one-row-per-proof contract.
-  if (batch.row_ids.length !== batch.proofs.length) {
-    logErr(ctx, "melt_pending_invalid_batch", new Error("Row and proof counts differ"), {
+  if (batch.row_ids.length !== batch.proofs.length || new Set(batch.row_ids).size !== batch.row_ids.length ||
+      !Number.isSafeInteger(batch.total_sats) || batch.proofs.some(p => !Number.isSafeInteger(p.amount) || p.amount <= 0) ||
+      batch.proofs.reduce((sum, p) => sum + p.amount, 0) !== batch.total_sats) {
+    logErr(ctx, "melt_pending_invalid_batch", new Error("Invalid batch row or native amount mapping"), {
       mint_url: batch.mint_url,
     });
     return { outcome: "failed", satsMelted: 0 };
@@ -577,8 +585,18 @@ async function meltBatchChunks(
   const heldEntries = new Set<UnresolvedMelt>();
   batch.row_ids.forEach((rowId, index) => {
     const unresolved = unresolvedByRow.get(rowId);
-    if (unresolved) heldEntries.add(unresolved);
-    else availableIndices.push(index);
+    if (unresolved) { heldEntries.add(unresolved); return; }
+    const known = ctx.custody.operations(ctx.dvmId).find(op => op.submission !== "rejected" &&
+      op.mint === canonicalMint(batch.mint_url) && op.rows.includes(rowId));
+    if (!known) { availableIndices.push(index); return; }
+    if (known.acknowledged) {
+      skipped = true;
+      logEvent(ctx, "melt_pending_row_already_acknowledged", { quote_id: known.quote, row_id: rowId });
+    } else {
+      heldEntries.add({ ts: known.created, dvmId: known.dvm, rowIds: known.rows, mintUrl: known.mint,
+        quoteId: known.quote, lockPubkey: known.lock, totalSats: Number(known.gross),
+        pendingReason: known.payment === "PENDING" ? "mint_pending" : known.payment === "UNPAID" ? "mint_unpaid" : "check_failed" });
+    }
   });
   for (const entry of heldEntries) {
     const ageMs = Math.max(0, Date.now() - entry.ts);
@@ -644,7 +662,7 @@ async function meltBatchChunks(
 }
 
 async function meltBatch(
-  ctx: MeltContext,
+  ctx: CustodyContext,
   batch: AdminBatch
 ): Promise<BatchOutcome | "input_cap_exceeded"> {
   const batchKeypair = ctx.keypairsByPubkey.get(toLockPubkey(batch.lock_pubkey));
@@ -666,7 +684,7 @@ async function meltBatch(
   // in the melt quote:
   //   1. amount       — the bolt11 invoice amount the mint pays out to LN
   //   2. fee_reserve  — LN routing fee buffer (returned by quote)
-  //   3. input_fees   — NUT-12 per-proof swap fee (NOT in the quote; must be
+  //   3. input_fees   — NUT-02 per-proof input fee (NOT in the quote; must be
   //                     computed locally from the keyset's input_fee_ppk)
   // The mint requires `proofs_total >= amount + fee_reserve + input_fees`.
   // Two-pass flow: request invoice for `total - input_fees` (we know that up
@@ -682,6 +700,8 @@ async function meltBatch(
     });
     return "failed";
   }
+
+  if (!Number.isSafeInteger(inputFees) || inputFees < 0) return "failed";
 
   if (batch.total_sats <= inputFees) {
     logEvent(ctx, "melt_pending_input_fees_exceed_batch", {
@@ -779,50 +799,65 @@ async function meltBatch(
     ...(p.dleq ? { dleq: { ...p.dleq } } : {}),
   }));
 
-  appendPreMelt({
-    dvm_id: ctx.dvmId,
-    row_ids: batch.row_ids,
-    mint_url: batch.mint_url,
-    quote_id: quote.rawQuote.quote,
-    lock_pubkey: batch.lock_pubkey,
-    total_sats: batch.total_sats,
-  });
-
-  let meltResult: { state: string; preimage: string | null };
+  const { getWallet } = await import("@dvmkit/sdk/internal");
+  let wallet: Awaited<ReturnType<typeof getWallet>>;
+  try { wallet = await getWallet(batch.mint_url); }
+  catch {
+    logErr(ctx, "melt_pending_wallet_unavailable", new Error("Wallet metadata is unavailable"));
+    return "failed";
+  }
+  let prepared: Awaited<ReturnType<typeof prepareCustody>>;
   try {
-    meltResult = await meltProofsWithQuoteSigned(
-      batch.mint_url,
-      proofs,
-      quote,
-      batchKeypair.privkey
-    );
+    prepared = await prepareCustody(ctx.custody, wallet, {
+      dvm: ctx.dvmId, mint: batch.mint_url, rows: batch.row_ids, lock: batch.lock_pubkey,
+      gross: batch.total_sats, inputFee: inputFees, invoice: bolt11,
+    }, quote.rawQuote, proofs);
+  } catch {
+    logErr(ctx, "melt_pending_prepare_failed", new Error("Could not durably prepare melt outputs"));
+    return "failed";
+  }
+  const { op, preview } = prepared;
+  appendPreMelt({
+    dvm_id: ctx.dvmId, row_ids: batch.row_ids, mint_url: batch.mint_url,
+    quote_id: op.quote, lock_pubkey: batch.lock_pubkey, total_sats: batch.total_sats,
+  });
+  op.submission = "submission_possible";
+  ctx.custody.commit();
+  let submissionError = false;
+  try {
+    const result = await wallet.completeMelt(preview, batchKeypair.privkey);
+    ctx.custody.observe(op, "submission", result);
   } catch (err) {
+    submissionError = true;
+    // Persist evidence, never the signing key or an SDK error's public message/cause.
+    const evidence = err && typeof err === "object" && "quote" in err ? err.quote : null;
+    ctx.custody.observe(op, "submission", evidence);
     const recoveryDiagnostic = missingDleqRecoveryDiagnostic(proofs, err);
     const rejectionCode = noSpendRejectionCode(err);
     if (rejectionCode !== null) {
-      appendPostMelt({
-        dvm_id: ctx.dvmId,
-        row_ids: batch.row_ids,
-        quote_id: quote.rawQuote.quote,
-        status: "failed",
-        error: err instanceof Error ? err.message : String(err),
-      });
-      if (batch.proofs.length > 1 && (rejectionCode === 11014 || rejectionCode === 11015)) {
-        return "input_cap_exceeded";
-      }
+      op.submission = "rejected";
+      ctx.custody.commit();
+      appendPostMelt({ dvm_id: ctx.dvmId, row_ids: batch.row_ids, quote_id: op.quote,
+        status: "failed", error: `mint_rejection_${rejectionCode}` });
+      if (batch.proofs.length > 1 && (rejectionCode === 11014 || rejectionCode === 11015)) return "input_cap_exceeded";
+      return "failed";
     }
-    // An unclassified failure may follow acceptance, payment, or change
-    // reconstruction. Leave the pre-melt open so its original quote is checked.
-    logErr(ctx, "melt_pending_melt_failed", err, {
-      mint_url: batch.mint_url,
-      row_ids: batch.row_ids,
-      quote_id: quote.rawQuote.quote,
+    logErr(ctx, "melt_pending_melt_failed", new Error("Submission outcome requires recovery"), {
+      mint_url: batch.mint_url, row_ids: batch.row_ids, quote_id: op.quote,
       ...(recoveryDiagnostic ? { recovery: recoveryDiagnostic } : {}),
     });
+  }
+  let meltResult: { state: string; preimage: string | null };
+  try {
+    const state = await recoverCustody(ctx.custody, op, wallet);
+    meltResult = { state, preimage: op.preimage ?? null };
+    logEvent(ctx, "melt_pending_change_custody", ctx.custody.status(op));
+  } catch {
+    logErr(ctx, "melt_pending_recovery_check_failed", new Error("Fresh quote validation failed"), { quote_id: op.quote });
     return "failed";
   }
-
   if (meltResult.state === "PENDING") {
+    if (submissionError) return "failed";
     logEvent(ctx, "melt_pending_payment_pending", {
       mint_url: batch.mint_url,
       row_ids: batch.row_ids,
@@ -868,6 +903,8 @@ async function meltBatch(
     return "failed";
   }
 
+  op.acknowledged = true;
+  ctx.custody.commit();
   appendPostMelt({
     dvm_id: ctx.dvmId,
     row_ids: batch.row_ids,
@@ -918,38 +955,39 @@ function mintOperationCode(err: unknown): number | null {
 }
 
 /**
- * Melt the given proofs against an issued quote, passing the per-DVM lock
- * privkey so cashu-ts signs NUT-11 witnesses on the inputs internally. The
- * privkey stays in this process — never sent to the mint.
- */
-async function meltProofsWithQuoteSigned(
-  mintUrl: string,
-  proofs: ProofLike[],
-  quote: Awaited<ReturnType<typeof fetchMeltQuote>>,
-  privkeyHex: string
-): Promise<{ state: string; preimage: string | null }> {
-  const { getWallet } = await import("@dvmkit/sdk/internal");
-  const wallet = await getWallet(mintUrl);
-  const { quote: melted } = await wallet.meltProofsBolt11(quote.rawQuote, proofs, {
-    privkey: privkeyHex,
-  });
-  return { state: melted.state, preimage: melted.payment_preimage ?? null };
-}
-
-/**
  * On every run, check the log for melts that started but didn't reach a
  * post-melt record. For each: query the mint for the quote's state and
  * either forward the preimage to `mark-melted` (PAID) or keep the entry
  * held for the next tick.
  */
 async function runRecovery(
-  ctx: MeltContext
+  ctx: CustodyContext
 ): Promise<{ recovered: number; unresolved: UnresolvedMelt[] }> {
+  const allOwned = ctx.custody.operations(ctx.dvmId);
+  const owned = allOwned.filter(op => op.submission !== "rejected");
   const inFlight = readInFlight(ctx.dvmId);
-  if (inFlight.length === 0) return { recovered: 0, unresolved: [] };
   let recovered = 0;
   const unresolved: UnresolvedMelt[] = [];
+  for (const op of owned) {
+    const audit = inFlight.find(entry => entry.quoteId === op.quote && canonicalMint(entry.mintUrl) === op.mint);
+    const entry: InFlightMelt = audit ?? { ts: op.created, dvmId: op.dvm, rowIds: op.rows,
+      mintUrl: op.mint, quoteId: op.quote, lockPubkey: op.lock, totalSats: Number(op.gross) };
+    if (op.acknowledged && audit) appendPostMelt({ dvm_id: op.dvm, row_ids: op.rows, quote_id: op.quote,
+      status: "success", preimage: op.preimage });
+    if (op.acknowledged && op.complete && !ctx.custody.records(op).some(p => p.state === "held")) continue;
+    const wasAcknowledged = op.acknowledged;
+    const result = await recoverOwned(ctx, op);
+    if (result === "recovered") { if (!wasAcknowledged) recovered++; }
+    else if (!op.acknowledged) unresolved.push({ ...entry, pendingReason: result });
+  }
+  const isOwned = (entry: InFlightMelt) => allOwned.some(op => op.quote === entry.quoteId && op.mint === canonicalMint(entry.mintUrl));
+  for (const entry of readMeltHistory(ctx.dvmId)) {
+    if (!isOwned(entry)) logEvent(ctx, "melt_pending_change_legacy_missing_material", {
+      quote_id: entry.quoteId, change_recovery_status: "legacy_missing_material",
+    });
+  }
   for (const entry of inFlight) {
+    if (isOwned(entry)) continue;
     const result = await recoverOne(ctx, entry);
     if (result === "recovered") recovered++;
     else unresolved.push({ ...entry, pendingReason: result });
@@ -980,8 +1018,38 @@ function isAcknowledgedPending(
     (entry.pendingReason === "mint_pending" || entry.pendingReason === "mint_unpaid");
 }
 
+async function recoverOwned(ctx: CustodyContext, op: CustodyOperation): Promise<"recovered" | PendingReason> {
+  try {
+    const { getWallet } = await import("@dvmkit/sdk/internal");
+    const wallet = await getWallet(op.mint);
+    const needsSignatures = ctx.custody.records(op).some(proof => proof.state === "held" && proof.verification === "unverified");
+    if (op.payment === "PAID" && op.complete && op.preimage && !needsSignatures) await ctx.custody.refreshHeld(op, wallet);
+    else await recoverCustody(ctx.custody, op, wallet);
+  } catch {
+    logErr(ctx, "melt_pending_recovery_check_failed", new Error("Fresh quote or change evidence validation failed"), { quote_id: op.quote });
+    return "check_failed";
+  }
+  logEvent(ctx, "melt_pending_change_custody", ctx.custody.status(op));
+  if (op.acknowledged) return "recovered";
+  if (op.payment === "PENDING") return "mint_pending";
+  if (op.payment === "UNPAID") return "mint_unpaid";
+  if (op.payment !== "PAID") return "check_failed";
+  if (!op.preimage) return "paid_no_preimage";
+  try {
+    await ctx.client.markMelted({ row_ids: op.rows, melt_quote_id: op.quote, payment_preimage: op.preimage });
+  } catch (err) {
+    rethrowIfAdminStateUnavailable(err);
+    logErr(ctx, "melt_pending_recovery_mark_melted_failed", new Error("Payment acknowledgement failed"), { quote_id: op.quote });
+    return "mark_melted_failed";
+  }
+  op.acknowledged = true;
+  ctx.custody.commit();
+  appendPostMelt({ dvm_id: op.dvm, row_ids: op.rows, quote_id: op.quote, status: "success", preimage: op.preimage });
+  return "recovered";
+}
+
 async function recoverOne(
-  ctx: MeltContext,
+  ctx: CustodyContext,
   entry: InFlightMelt
 ): Promise<"recovered" | PendingReason> {
   let quote: MeltQuoteBolt11Response;
@@ -1311,15 +1379,14 @@ function logErr(
       ts: new Date().toISOString(),
       dvm_id: ctx.dvmId,
       handle: ctx.handle,
-      error: err instanceof Error ? err.message : String(err),
+      error: "The operation could not be completed. Retry recovery.",
       ...(err instanceof DvmError
         ? {
-            code: err.code,
-            ...(err.hint ? { hint: err.hint } : {}),
-            ...(err.display ? { display: err.display } : {}),
+            code: ["admin_bad_signature", "admin_state_unavailable", "batches_failed", "drains_unsettled", "drain_state_unknown", "drain_state_unknown_sustained"].includes(err.code) ? err.code : "melt_pending_error",
+            ...(err.code === "admin_state_unavailable" ? { hint: "Retry the same command; inspect database health, restart the DVM, and do not rotate the lock key." } : {}),
           }
         : err instanceof AdminApiError
-          ? { status: err.status, reason: err.body.reason, code: err.body.error }
+          ? { status: err.status, code: "admin_request_failed" }
           : {}),
       ...fields,
     })

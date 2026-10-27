@@ -2,6 +2,8 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mock } from "node:test";
 
+const { payoutWallet } = await import("../payout-wallet.ts");
+
 const sdk = await import("@dvmkit/sdk/internal");
 const adminModule = await import("../../src/lib/admin-cashu-client.ts");
 const dvmId = process.env.MELT_TEST_DVM_ID;
@@ -10,10 +12,11 @@ const keypair = { privkey: "11".repeat(32), pubkey };
 const marked = join(process.env.DVMKIT_CONFIG_DIR, `marked-${dvmId}`);
 const batch = {
   mint_url: "https://mint.invalid", lock_pubkey: pubkey, row_ids: ["row-1"],
-  proofs: [{ id: "keyset", amount: 60, secret: "synthetic-input", C: "synthetic-point" }],
+  proofs: [{ id: "keyset", amount: 60, secret: `${dvmId}-input`, C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
   total_sats: 60, t_expire: null,
 };
 const emit = (kind, data = {}) => process.send({ kind, ...data });
+let submitted = false;
 let resume;
 const resumed = new Promise(resolve => { resume = resolve; });
 process.on("message", () => resume());
@@ -29,17 +32,19 @@ mock.module("@dvmkit/sdk/internal", { namedExports: {
   fetchLnurlPayInvoice: async () => "synthetic-invoice",
   fetchMeltQuote: async () => {
     emit("quote");
-    return { amountSats: 60, feeReserveSats: 0, rawQuote: { quote: "original-quote" } };
+    return { amountSats: 60, feeReserveSats: 0, rawQuote: { quote: "original-quote", amount: 60, fee_reserve: 0, unit: "sat" } };
   },
   checkMeltQuoteState: async () => {
     emit("check");
     return { state: process.argv[3], payment_preimage: "original-preimage" };
   },
-  getWallet: async () => ({ meltProofsBolt11: async () => {
+  getWallet: async () => payoutWallet(async () => {
+    submitted = true;
     emit("submit");
     await pause("submit");
     throw new Error("submission response lost");
-  } }),
+  }, { mint: "https://mint.invalid", quote: async () => ({ amount: 60, fee_reserve: 0, unit: "sat" }),
+    check: async () => { emit("check"); if (submitted) throw new Error("check unavailable until restart"); return { state: process.argv[3], payment_preimage: "original-preimage" }; } }),
 } });
 const keyring = () => ({ canonicalDvmId: dvmId, currentKeypair: keypair,
   keypairsByPubkey: new Map([[pubkey, keypair]]) });

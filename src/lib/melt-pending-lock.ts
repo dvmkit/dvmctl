@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { fchmodSync, closeSync, constants, fstatSync, fsyncSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { join } from "node:path";
 
 import { DvmError } from "@dvmkit/sdk/internal";
+
+import { privateDirectory } from "./melt-change-custody.ts";
 
 import { BUILDER_CONFIG_DIR } from "../shared/defaults.ts";
 
@@ -20,7 +22,7 @@ export async function withMeltPendingLock<T>(
   dvmId: string,
   fn: () => Promise<T> | T
 ): Promise<T> {
-  mkdirSync(BUILDER_CONFIG_DIR, { recursive: true, mode: 0o700 });
+  privateDirectory(BUILDER_CONFIG_DIR);
   const key = createHash("sha256").update(dvmId).digest("hex");
   const path = join(BUILDER_CONFIG_DIR, `melt-pending-${key}.lock`);
   const owner = JSON.stringify({ pid: process.pid, host: hostname(), token: randomUUID() });
@@ -41,7 +43,15 @@ function locked(path: string, claim?: string): DvmError {
 }
 
 function readLock(path: string): string | undefined {
-  try { return readFileSync(path, "utf8"); } catch { return undefined; }
+  try {
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile() || stat.nlink !== 1 || stat.uid !== process.getuid?.()) return undefined;
+      fchmodSync(fd, 0o600);
+      return readFileSync(fd, "utf8");
+    } finally { closeSync(fd); }
+  } catch { return undefined; }
 }
 
 function deadLocalOwner(raw: string | undefined): { token: string } | undefined {
@@ -66,7 +76,10 @@ function hasCode(error: unknown, code: string): boolean {
 function acquire(path: string, owner: string): void {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      writeFileSync(path, owner, { flag: "wx", mode: 0o600 });
+      const fd = openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      try { fchmodSync(fd, 0o600); writeFileSync(fd, owner); fsyncSync(fd); } finally { closeSync(fd); }
+      const directory = openSync(BUILDER_CONFIG_DIR, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try { fsyncSync(directory); } finally { closeSync(directory); }
       return;
     } catch (error) {
       if (!hasCode(error, "EEXIST")) throw error;
