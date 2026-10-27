@@ -1,3 +1,4 @@
+import { payoutWallet } from "../../../../test-support/payout-wallet.ts";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +17,7 @@ const BATCH = {
   mint_url: "https://mint.invalid",
   lock_pubkey: PUBKEY,
   row_ids: ["row-1"],
-  proofs: [{ id: "keyset", amount: 60, secret: "synthetic-input", C: "synthetic-point" }],
+  proofs: [{ id: "keyset", amount: 60, secret: "synthetic-input", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
   total_sats: 60,
   t_expire: null,
 };
@@ -27,7 +28,7 @@ vi.mock("@dvmkit/sdk/internal", async (importOriginal) => ({
   fetchMeltQuote: mint.quote,
   checkMeltQuoteState: mint.check,
   getInputFeesForProofs: vi.fn(async () => 0),
-  getWallet: vi.fn(async () => ({ meltProofsBolt11: mint.submit })),
+  getWallet: vi.fn(async () => payoutWallet(mint.submit, { mint: BATCH.mint_url, quote: async () => ({ amount: 60, fee_reserve: 0, unit: "sat" }), check: async () => await mint.check(BATCH.mint_url, "original-quote") })),
   fetchLnurlPayInvoice: vi.fn(async () => "synthetic-invoice"),
 }));
 vi.mock("../../../lib/builder-mnemonic", () => ({
@@ -91,10 +92,10 @@ describe("uncertain melt recovery with a durable journal", () => {
     admin.getPendingBatches.mockImplementation(async () => ({ batches: acknowledged ? [] : [BATCH] }));
     admin.markMelted.mockImplementation(async () => { acknowledged = true; return { melted: 1 }; });
     mint.quote.mockResolvedValue({
-      amountSats: 60, feeReserveSats: 0, rawQuote: { quote: "original-quote" },
+      amountSats: 60, feeReserveSats: 0, rawQuote: { quote: "original-quote", amount: 60, fee_reserve: 0, unit: "sat" },
     });
     mint.check.mockImplementation(async () => ({
-      state: paid ? "PAID" : "UNPAID", payment_preimage: paid ? "payment-receipt" : null,
+      state: paid ? "PAID" : "PENDING", payment_preimage: paid ? "payment-receipt" : null,
     }));
     vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -119,6 +120,7 @@ describe("uncertain melt recovery with a durable journal", () => {
         if (failure === "malformed response") return {};
         throw new Error("transport timeout after acceptance");
       });
+      mint.check.mockRejectedValueOnce(new Error("quote temporarily unavailable"));
       let process = await loadProcess();
       await expect(process.run()).rejects.toMatchObject({ code: "batches_failed" });
       expect(process.journal.readInFlight(DVM_ID).map((entry) => entry.rowIds)).toEqual([["row-1"]]);
@@ -129,7 +131,7 @@ describe("uncertain melt recovery with a durable journal", () => {
       expect(admin.markMelted).toHaveBeenCalledExactlyOnceWith({
         row_ids: ["row-1"], melt_quote_id: "original-quote", payment_preimage: "payment-receipt",
       });
-      expect(mint.check).toHaveBeenCalledExactlyOnceWith(BATCH.mint_url, "original-quote");
+      expect(mint.check).toHaveBeenCalledWith(BATCH.mint_url, "original-quote");
       expect(mint.submit).toHaveBeenCalledTimes(1);
       expect(mint.quote).toHaveBeenCalledTimes(1);
       expect(process.journal.readInFlight(DVM_ID)).toEqual([]);
@@ -162,6 +164,7 @@ describe("uncertain melt recovery with a durable journal", () => {
 
   it("retries payment acknowledgement after a restart mid-recovery without re-submitting", async () => {
     mint.submit.mockImplementation(async () => { paid = true; throw new Error("response lost"); });
+    mint.check.mockRejectedValueOnce(new Error("quote temporarily unavailable"));
     let process = await loadProcess();
     await expect(process.run()).rejects.toMatchObject({ code: "batches_failed" });
     admin.markMelted.mockRejectedValueOnce(new Error("admin connection lost"));
@@ -207,6 +210,7 @@ describe("uncertain melt recovery with a durable journal", () => {
 
   it.each(["UNPAID", "unexpected"])("does not acknowledge a %s response carrying a preimage", async (state) => {
     mint.submit.mockResolvedValue({ quote: { state, payment_preimage: "unproven-receipt" } });
+    mint.check.mockResolvedValue({ state, payment_preimage: "unproven-receipt" });
     const process = await loadProcess();
     await expect(process.run()).rejects.toMatchObject({ code: "batches_failed" });
     expect(admin.markMelted).not.toHaveBeenCalled();

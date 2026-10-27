@@ -55,14 +55,14 @@
     "test:package": "node --test test/*.test.mjs"
   },
   "dependencies": {
-    "@dvmkit/sdk": "0.12.0"
+    "@dvmkit/sdk": "0.12.0",
+    "@cashu/cashu-ts": "4.10.2"
   },
   "optionalDependencies": {
     "pg": "8.20.0",
     "tsx": "^4"
   },
   "devDependencies": {
-    "@cashu/cashu-ts": "4.10.2",
     "@scure/bip39": "2.0.1",
     "commander": "^14",
     "mppx": "0.8.15",

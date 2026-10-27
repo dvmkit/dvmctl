@@ -1,3 +1,7 @@
+import { rmSync } from "node:fs";
+import { join } from "node:path";
+import { payoutWallet } from "../../../../test-support/payout-wallet.ts";
+import { BUILDER_CONFIG_DIR } from "../../../shared/defaults.ts";
 import type * as SdkInternal from "@dvmkit/sdk/internal";
 import { MintOperationError } from "@cashu/cashu-ts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -65,6 +69,7 @@ vi.mock("../../../lib/melt-pending-log", () => ({
   appendAcknowledgement: vi.fn((entry: object) => ({ ...entry, kind: "melt_acknowledged", ts: 0 })),
   lookupMeltQuote: vi.fn(() => ({ state: "unknown" })),
   readInFlight: vi.fn(() => []),
+  readMeltHistory: vi.fn(() => []),
 }));
 
 vi.mock("../../../lib/drain-park-log", () => ({
@@ -150,6 +155,14 @@ import { meltPending } from "../melt-pending";
 const PRIVKEY = "11".repeat(32);
 const PUBKEY = "02" + "aa".repeat(32);
 const REFUND_PUBKEY = "02" + "bb".repeat(32);
+
+function payoutWalletFixture(submit: Parameters<typeof payoutWallet>[0]) {
+  return payoutWallet(submit, {
+    mint: () => vi.mocked(wallet.getWallet).mock.calls.at(-1)?.[0] ?? "https://mint",
+    quote: async () => (await vi.mocked(melt.fetchMeltQuote).mock.results.at(-1)?.value)?.rawQuote ?? {},
+    fee: async () => await vi.mocked(melt.getInputFeesForProofs).mock.results.at(-1)?.value ?? 0,
+  });
+}
 
 function setHappyPath(): {
   getPendingBatches: ReturnType<typeof vi.fn>;
@@ -288,7 +301,10 @@ function emptyDrainSurface(): {
 describe("dvmctl melt-pending", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    rmSync(join(BUILDER_CONFIG_DIR, "melt-custody.json"), { force: true });
+    rmSync(join(BUILDER_CONFIG_DIR, "melt-custody.initialized"), { force: true });
     vi.mocked(meltLog.readInFlight).mockReturnValue([]);
+    vi.mocked(meltLog.readMeltHistory).mockReturnValue([]);
     vi.mocked(meltLog.lookupMeltQuote).mockReturnValue({ state: "unknown" });
     // `clearMocks` clears calls, not queued return values — a seeded park log
     // would otherwise recover into every test declared after it.
@@ -309,7 +325,7 @@ describe("dvmctl melt-pending", () => {
         lock_pubkey: PUBKEY,
         row_ids: Array.from({ length: count }, (_, i) => `r${i}`),
         proofs: Array.from({ length: count }, (_, i) => ({
-          id: "k", amount: 8, secret: `s${i}`, C: "c",
+          id: "k", amount: 8, secret: `s${i}`, C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
         })),
         total_sats: count * 8,
         t_expire: null,
@@ -323,13 +339,13 @@ describe("dvmctl melt-pending", () => {
       vi.mocked(melt.fetchMeltQuote).mockImplementation(async (_mint, invoice) => ({
         amountSats: Number(invoice.split(":")[1]) / 1000,
         feeReserveSats: 0,
-        rawQuote: { quote: `q${++quoteId}` } as never,
+        rawQuote: { quote: `q${++quoteId}`, amount: Number(invoice.split(":")[1]) / 1000, fee_reserve: 0, unit: "sat" } as never,
       }));
       const meltProofsBolt11 = vi.fn(async (_quote: unknown, proofs: AdminBatch["proofs"]) => {
         if (proofs.length > limit) throw new MintOperationError(errorCode, "Request limit");
         return { quote: { state: "PAID", payment_preimage: "paid" }, change: [] };
       });
-      vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
+      vi.mocked(wallet.getWallet).mockResolvedValue(payoutWalletFixture(meltProofsBolt11) as never);
       vi.spyOn(console, "error").mockImplementation(() => undefined);
       const stdout = vi.spyOn(console, "log").mockImplementation(() => undefined);
       return { batch, getPendingBatches, markMelted, meltProofsBolt11, stdout };
@@ -431,7 +447,7 @@ describe("dvmctl melt-pending", () => {
     it("continues siblings after failure and retries only the failed rows next run", async () => {
       const { batch, getPendingBatches, markMelted, meltProofsBolt11 } = setupChunks(450);
       meltProofsBolt11.mockImplementationOnce(async () => {
-        throw new MintOperationError(11000, "Rejected");
+        throw new MintOperationError(10001, "Rejected");
       });
       await expect(meltPending("dvm", { endpoint: "https://dvm.example" }))
         .rejects.toMatchObject({ code: "batches_failed" });
@@ -454,7 +470,7 @@ describe("dvmctl melt-pending", () => {
       vi.mocked(melt.fetchMeltQuote).mockImplementation(async (_mint, invoice) => ({
         amountSats: Number(invoice.split(":")[1]) / 1000,
         feeReserveSats: 2,
-        rawQuote: { quote: invoice } as never,
+        rawQuote: { quote: invoice, amount: Number(invoice.split(":")[1]) / 1000, fee_reserve: 2, unit: "sat" } as never,
       }));
       await meltPending("dvm", { endpoint: "https://dvm.example" });
       expect(vi.mocked(melt.getInputFeesForProofs).mock.calls.map(([, proofs]) => proofs.length))
@@ -674,7 +690,7 @@ describe("dvmctl melt-pending", () => {
           mint_url: "https://mint",
           lock_pubkey: "02" + "ff".repeat(32),
           row_ids: ["r1"],
-          proofs: [{ id: "k", amount: 10, secret: "s", C: "c" }],
+          proofs: [{ id: "k", amount: 10, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
           total_sats: 10,
           t_expire: null,
         },
@@ -731,8 +747,8 @@ describe("dvmctl melt-pending", () => {
               id: "k",
               amount: 60,
               secret: "s",
-              C: "c",
-              dleq: { e: "dleq-e", s: "dleq-s", r: "blind-r" },
+              C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+              dleq: { e: "1212121212121212121212121212121212121212121212121212121212121212", s: "1212121212121212121212121212121212121212121212121212121212121212", r: "1212121212121212121212121212121212121212121212121212121212121212" },
             },
           ],
           total_sats: 60,
@@ -747,12 +763,12 @@ describe("dvmctl melt-pending", () => {
     vi.mocked(melt.fetchMeltQuote).mockResolvedValue({
       amountSats: 60,
       feeReserveSats: 0,
-      rawQuote: { quote: "q-retired" } as never,
+      rawQuote: { quote: "q-retired", amount: 60, fee_reserve: 0, unit: "sat" } as never,
     });
     const meltProofsBolt11 = vi
       .fn()
       .mockResolvedValue({ quote: { state: "PAID", payment_preimage: "preimage-retired" }, change: [] });
-    vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
+    vi.mocked(wallet.getWallet).mockResolvedValue(payoutWalletFixture(meltProofsBolt11) as never);
 
     await meltPending("dvm", { endpoint: "https://dvm.example" });
 
@@ -786,8 +802,8 @@ describe("dvmctl melt-pending", () => {
               id: "k",
               amount: 60,
               secret: "s",
-              C: "c",
-              dleq: { e: "dleq-e", s: "dleq-s", r: "blind-r" },
+              C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+              dleq: { e: "1212121212121212121212121212121212121212121212121212121212121212", s: "1212121212121212121212121212121212121212121212121212121212121212", r: "1212121212121212121212121212121212121212121212121212121212121212" },
             },
           ],
           total_sats: 60,
@@ -799,7 +815,7 @@ describe("dvmctl melt-pending", () => {
     vi.mocked(melt.fetchMeltQuote).mockResolvedValue({
       amountSats: 60,
       feeReserveSats: 0,
-      rawQuote: { quote: "q1" } as never,
+      rawQuote: { quote: "q1", amount: 60, fee_reserve: 0, unit: "sat" } as never,
     });
     const meltProofsBolt11 = vi.fn().mockImplementation((_quote, proofs) => {
       if (!proofs.every((proof: { dleq?: unknown }) => proof.dleq)) {
@@ -807,7 +823,7 @@ describe("dvmctl melt-pending", () => {
       }
       return Promise.resolve({ quote: { state: "PAID", payment_preimage: "preimage123" }, change: [] });
     });
-    vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
+    vi.mocked(wallet.getWallet).mockResolvedValue(payoutWalletFixture(meltProofsBolt11) as never);
     markMelted.mockResolvedValue({ melted: 1 });
 
     await meltPending("dvm", { endpoint: "https://dvm.example" });
@@ -817,7 +833,7 @@ describe("dvmctl melt-pending", () => {
       expect.arrayContaining([
         expect.objectContaining({
           secret: "s",
-          dleq: { e: "dleq-e", s: "dleq-s", r: "blind-r" },
+          dleq: { e: "1212121212121212121212121212121212121212121212121212121212121212", s: "1212121212121212121212121212121212121212121212121212121212121212", r: "1212121212121212121212121212121212121212121212121212121212121212" },
         }),
       ]),
       expect.objectContaining({ privkey: PRIVKEY })
@@ -842,7 +858,7 @@ describe("dvmctl melt-pending", () => {
           mint_url: "https://mint",
           lock_pubkey: PUBKEY,
           row_ids: ["r1"],
-          proofs: [{ id: "k", amount: 60, secret: "s", C: "c" }],
+          proofs: [{ id: "k", amount: 60, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
           total_sats: 60,
           t_expire: null,
         },
@@ -852,12 +868,12 @@ describe("dvmctl melt-pending", () => {
     vi.mocked(melt.fetchMeltQuote).mockResolvedValue({
       amountSats: 60,
       feeReserveSats: 0,
-      rawQuote: { quote: "q1" } as never,
+      rawQuote: { quote: "q1", amount: 60, fee_reserve: 0, unit: "sat" } as never,
     });
     const meltProofsBolt11 = vi
       .fn()
       .mockRejectedValue(new Error("panic mode requires DLEQ data for every input"));
-    vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
+    vi.mocked(wallet.getWallet).mockResolvedValue(payoutWalletFixture(meltProofsBolt11) as never);
 
     await expect(meltPending("dvm", { endpoint: "https://dvm.example" })).rejects.toMatchObject({
       code: "batches_failed",
@@ -970,7 +986,7 @@ describe("dvmctl melt-pending", () => {
           mint_url: "https://mint",
           lock_pubkey: PUBKEY,
           row_ids: ["r1"],
-          proofs: [{ id: "k", amount: 60, secret: "s", C: "c" }],
+          proofs: [{ id: "k", amount: 60, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
           total_sats: 60,
           t_expire: null,
         },
@@ -980,12 +996,12 @@ describe("dvmctl melt-pending", () => {
     vi.mocked(melt.fetchMeltQuote).mockResolvedValue({
       amountSats: 60,
       feeReserveSats: 0,
-      rawQuote: { quote: "q1" } as never,
+      rawQuote: { quote: "q1", amount: 60, fee_reserve: 0, unit: "sat" } as never,
     });
     const meltProofsBolt11 = vi
       .fn()
       .mockResolvedValue({ quote: { state: "PAID", payment_preimage: "preimage123" }, change: [] });
-    vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
+    vi.mocked(wallet.getWallet).mockResolvedValue(payoutWalletFixture(meltProofsBolt11) as never);
     markMelted.mockRejectedValue(new Error("DVM unreachable"));
 
     await expect(meltPending("dvm", { endpoint: "https://dvm.example" })).rejects.toMatchObject({
@@ -1031,7 +1047,7 @@ describe("dvmctl melt-pending", () => {
           mint_url: "https://mint",
           lock_pubkey: PUBKEY,
           row_ids: ["r1"],
-          proofs: [{ id: "k", amount: 60, secret: "s", C: "c" }],
+          proofs: [{ id: "k", amount: 60, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
           total_sats: 60,
           t_expire: null,
         },
@@ -1041,14 +1057,13 @@ describe("dvmctl melt-pending", () => {
     vi.mocked(melt.fetchMeltQuote).mockResolvedValue({
       amountSats: 60,
       feeReserveSats: 0,
-      rawQuote: { quote: "q1" } as never,
+      rawQuote: { quote: "q1", amount: 60, fee_reserve: 0, unit: "sat" } as never,
     });
-    vi.mocked(wallet.getWallet).mockResolvedValue({
-      meltProofsBolt11: vi.fn().mockResolvedValue({
+    vi.mocked(wallet.getWallet).mockResolvedValue(payoutWallet( vi.fn().mockResolvedValue({
         quote: { state: "PENDING", payment_preimage: null },
         change: [],
       }),
-    } as never);
+    ) as never);
 
     await meltPending("dvm", { endpoint: "https://dvm.example" });
 
@@ -1069,7 +1084,7 @@ describe("dvmctl melt-pending", () => {
           mint_url: "https://mint",
           lock_pubkey: PUBKEY,
           row_ids: ["r1"],
-          proofs: [{ id: "k", amount: 60, secret: "s", C: "c" }],
+          proofs: [{ id: "k", amount: 60, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
           total_sats: 60,
           t_expire: null,
         },
@@ -1125,7 +1140,7 @@ describe("dvmctl melt-pending", () => {
           mint_url: "https://mint",
           lock_pubkey: PUBKEY,
           row_ids: ["r1"],
-          proofs: [{ id: "k", amount: 152, secret: "s", C: "c" }],
+          proofs: [{ id: "k", amount: 152, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
           total_sats: 152,
           t_expire: null,
         },
@@ -1141,17 +1156,17 @@ describe("dvmctl melt-pending", () => {
       .mockResolvedValueOnce({
         amountSats: 152,
         feeReserveSats: 2,
-        rawQuote: { quote: "q-pass1" } as never,
+        rawQuote: { quote: "q-pass1", amount: 152, fee_reserve: 2, unit: "sat" } as never,
       })
       .mockResolvedValueOnce({
         amountSats: 150,
         feeReserveSats: 2,
-        rawQuote: { quote: "q-pass2" } as never,
+        rawQuote: { quote: "q-pass2", amount: 150, fee_reserve: 2, unit: "sat" } as never,
       });
     const meltProofsBolt11 = vi
       .fn()
       .mockResolvedValue({ quote: { state: "PAID", payment_preimage: "preimage-twopass" }, change: [] });
-    vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
+    vi.mocked(wallet.getWallet).mockResolvedValue(payoutWalletFixture(meltProofsBolt11) as never);
     markMelted.mockResolvedValue({ melted: 1 });
 
     await meltPending("dvm", { endpoint: "https://dvm.example" });
@@ -1185,7 +1200,7 @@ describe("dvmctl melt-pending", () => {
           mint_url: "https://mint",
           lock_pubkey: PUBKEY,
           row_ids: ["r1"],
-          proofs: [{ id: "k", amount: 50, secret: "s", C: "c" }],
+          proofs: [{ id: "k", amount: 50, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
           total_sats: 50,
           t_expire: null,
         },
@@ -1199,12 +1214,12 @@ describe("dvmctl melt-pending", () => {
       .mockResolvedValueOnce({
         amountSats: 50,
         feeReserveSats: 5,
-        rawQuote: { quote: "q-pass1" } as never,
+        rawQuote: { quote: "q-pass1", amount: 50, fee_reserve: 5, unit: "sat" } as never,
       })
       .mockResolvedValueOnce({
         amountSats: 45,
         feeReserveSats: 6,
-        rawQuote: { quote: "q-pass2" } as never,
+        rawQuote: { quote: "q-pass2", amount: 45, fee_reserve: 6, unit: "sat" } as never,
       });
 
     await meltPending("dvm", { endpoint: "https://dvm.example" });
@@ -1227,8 +1242,8 @@ describe("dvmctl melt-pending", () => {
           lock_pubkey: PUBKEY,
           row_ids: ["r1", "r2"],
           proofs: [
-            { id: "k", amount: 100, secret: "s1", C: "c1" },
-            { id: "k", amount: 52, secret: "s2", C: "c2" },
+            { id: "k", amount: 100, secret: "s1", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" },
+            { id: "k", amount: 52, secret: "s2", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" },
           ],
           total_sats: 152,
           t_expire: null,
@@ -1243,12 +1258,12 @@ describe("dvmctl melt-pending", () => {
     vi.mocked(melt.fetchMeltQuote).mockResolvedValue({
       amountSats: 149,
       feeReserveSats: 0,
-      rawQuote: { quote: "q-input-fee" } as never,
+      rawQuote: { quote: "q-input-fee", amount: 149, fee_reserve: 0, unit: "sat" } as never,
     });
     const meltProofsBolt11 = vi
       .fn()
       .mockResolvedValue({ quote: { state: "PAID", payment_preimage: "preimage-input-fee" }, change: [] });
-    vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
+    vi.mocked(wallet.getWallet).mockResolvedValue(payoutWalletFixture(meltProofsBolt11) as never);
     markMelted.mockResolvedValue({ melted: 1 });
 
     await meltPending("dvm", { endpoint: "https://dvm.example" });
@@ -1279,7 +1294,7 @@ describe("dvmctl melt-pending", () => {
           mint_url: "https://mint",
           lock_pubkey: PUBKEY,
           row_ids: ["r1"],
-          proofs: [{ id: "k", amount: 100, secret: "s1", C: "c1" }],
+          proofs: [{ id: "k", amount: 100, secret: "s1", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
           total_sats: 100,
           t_expire: null,
         },
@@ -1295,12 +1310,12 @@ describe("dvmctl melt-pending", () => {
     vi.mocked(melt.fetchMeltQuote).mockResolvedValue({
       amountSats: 100,
       feeReserveSats: 0,
-      rawQuote: { quote: "q-hub" } as never,
+      rawQuote: { quote: "q-hub", amount: 100, fee_reserve: 0, unit: "sat" } as never,
     });
     const meltProofsBolt11 = vi
       .fn()
       .mockResolvedValue({ quote: { state: "PAID", payment_preimage: "preimage-hub" }, change: [] });
-    vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
+    vi.mocked(wallet.getWallet).mockResolvedValue(payoutWalletFixture(meltProofsBolt11) as never);
     markMelted.mockResolvedValue({ melted: 1 });
 
     await meltPending("dvm", {
@@ -1339,7 +1354,7 @@ describe("dvmctl melt-pending", () => {
           mint_url: "https://mint",
           lock_pubkey: PUBKEY,
           row_ids: ["r1"],
-          proofs: [{ id: "k", amount: 2, secret: "s", C: "c" }],
+          proofs: [{ id: "k", amount: 2, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
           total_sats: 2,
           t_expire: null,
         },
@@ -1362,7 +1377,7 @@ describe("dvmctl melt-pending", () => {
           mint_url: "https://mint",
           lock_pubkey: PUBKEY,
           row_ids: ["r1"],
-          proofs: [{ id: "k", amount: 3, secret: "s", C: "c" }],
+          proofs: [{ id: "k", amount: 3, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
           total_sats: 3,
           t_expire: null,
         },
@@ -1374,7 +1389,7 @@ describe("dvmctl melt-pending", () => {
     vi.mocked(melt.fetchMeltQuote).mockResolvedValue({
       amountSats: 3,
       feeReserveSats: 5,
-      rawQuote: { quote: "q1" } as never,
+      rawQuote: { quote: "q1", amount: 3, fee_reserve: 5, unit: "sat" } as never,
     });
 
     await meltPending("dvm", { endpoint: "https://dvm.example" });
@@ -1392,7 +1407,7 @@ describe("dvmctl melt-pending", () => {
           mint_url: "https://mint",
           lock_pubkey: PUBKEY,
           row_ids: ["r1"],
-          proofs: [{ id: "k", amount: 60, secret: "s", C: "c" }],
+          proofs: [{ id: "k", amount: 60, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
           total_sats: 60,
           t_expire: null,
         },
@@ -1402,12 +1417,12 @@ describe("dvmctl melt-pending", () => {
     vi.mocked(melt.fetchMeltQuote).mockResolvedValue({
       amountSats: 60,
       feeReserveSats: 0,
-      rawQuote: { quote: "q1" } as never,
+      rawQuote: { quote: "q1", amount: 60, fee_reserve: 0, unit: "sat" } as never,
     });
     const meltProofsBolt11 = vi
       .fn()
       .mockResolvedValue({ quote: { state: "PAID", payment_preimage: null }, change: [] });
-    vi.mocked(wallet.getWallet).mockResolvedValue({ meltProofsBolt11 } as never);
+    vi.mocked(wallet.getWallet).mockResolvedValue(payoutWalletFixture(meltProofsBolt11) as never);
 
     await expect(meltPending("dvm", { endpoint: "https://dvm.example" })).rejects.toMatchObject({
       code: "batches_failed",
@@ -1434,7 +1449,7 @@ describe("dvmctl melt-pending", () => {
       mint_url: "https://mint",
       lock_pubkey: PUBKEY,
       row_ids: ["r1"],
-      proofs: [{ id: "k", amount: 60, secret: "s", C: "c" }],
+      proofs: [{ id: "k", amount: 60, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
       total_sats: 60,
       t_expire: null,
     };
@@ -1484,7 +1499,7 @@ describe("dvmctl melt-pending", () => {
     it("still fails the run for an unacknowledged melt past the alarm beside an acknowledged one", async () => {
       const { getPendingBatches } = setHappyPath();
       getPendingBatches.mockResolvedValue({
-        batches: [BATCH, { ...BATCH, row_ids: ["r2"], proofs: [{ id: "k", amount: 60, secret: "s2", C: "c" }] }],
+        batches: [BATCH, { ...BATCH, row_ids: ["r2"], proofs: [{ id: "k", amount: 60, secret: "s2", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }] }],
       });
       vi.mocked(meltLog.readInFlight).mockReturnValue([
         stuck(3 * DAY_MS),
@@ -2144,7 +2159,7 @@ describe("dvmctl melt-pending", () => {
           .map(([line]) => JSON.parse(line as string) as Record<string, unknown>)
           .find((entry) => entry.level === "melt_pending_tick_error");
         expect(tickError).toMatchObject({
-          error: "The requested DVM operation did not run.",
+          error: "The operation could not be completed. Retry recovery.",
           code: "admin_state_unavailable",
           hint: unavailable.hint,
         });

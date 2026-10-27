@@ -147,6 +147,12 @@ export function readInFlight(dvmId: string): InFlightMelt[] {
   return out;
 }
 
+/** Quote-only history cannot regenerate random secrets that were never saved. */
+export function readMeltHistory(dvmId: string): InFlightMelt[] {
+  const journal = scanJournal(dvmId);
+  return [...journal.pre.keys()].map(quote => toInFlight(journal, quote));
+}
+
 interface ScannedJournal {
   pre: Map<string, PreMeltEntry>;
   done: Set<string>;

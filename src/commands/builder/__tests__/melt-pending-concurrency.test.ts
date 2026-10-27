@@ -223,13 +223,16 @@ describe("cross-process melt exclusion", () => {
     expect(readdirSync(stateDir).filter(name => name.includes(".lock"))).toEqual([]);
   }, 20_000);
 
-  it("allows a different DVM to sweep while one DVM is locked", async () => {
+  it("serializes different DVMs sharing the same proof inventory", async () => {
     const first = start("batches");
     await first.wait("paused");
     const other = start("none", "UNPAID", "other-fixture");
-    expect(await other.done()).toMatchObject({ code: "batches_failed" });
-    expect(other.events.filter(event => event.kind === "submit")).toHaveLength(1);
+    expect(await other.done()).toMatchObject({ code: "melt_pending_locked" });
+    expect(other.events.filter(event => event.kind === "submit")).toHaveLength(0);
     first.release();
     await first.done();
+    const next = start("none", "UNPAID", "other-fixture");
+    expect(await next.done()).toMatchObject({ code: "batches_failed" });
+    expect(next.events.filter(event => event.kind === "submit")).toHaveLength(1);
   }, 20_000);
 });
