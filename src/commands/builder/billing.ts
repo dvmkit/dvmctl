@@ -175,7 +175,7 @@ function topupOutput(result: HostingTopup, opts: BillingOptions): void {
 export async function billingTopup(amount: string, opts: BillingOptions): Promise<void> {
   const ctx = context(opts);
   topupOutput(await billingRequest<HostingTopup>(ctx, `${billingPath(ctx.org)}/hosting/topups`, "POST",
-    { usdCents: integer(amount, "hosting value in USD cents", 1000) }, key(opts.idempotencyKey)), opts);
+    { usdCents: integer(amount, "hosting value in USD cents", 100) }, key(opts.idempotencyKey)), opts);
 }
 
 export async function topupStatus(id: string, opts: BillingOptions): Promise<void> {
@@ -312,7 +312,7 @@ export function registerBillingCommands(program: Command): void {
     .requiredOption("--expected-version <version>", "Version from budget get")
     .requiredOption("--idempotency-key <key>", "Saved key; reuse for the same retry")
     .action((limit: string, opts: BillingOptions) => catchErrors(() => budgetSet(limit, opts), opts.human));
-  add(billing, "topup <usd-cents>", "Explicitly create a Lightning hosting top-up (minimum 1000 USD cents)")
+  add(billing, "topup <usd-cents>", "Explicitly create a Lightning hosting top-up (minimum 100 USD cents)")
     .requiredOption("--idempotency-key <key>", "Saved key; reuse for the same retry")
     .action((amount: string, opts: BillingOptions) => catchErrors(() => billingTopup(amount, opts), opts.human));
   add(billing, "topup-status <id>", "Read or reconcile a saved top-up; never create another invoice")
