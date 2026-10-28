@@ -106,11 +106,11 @@ describe("billing command HTTP contracts", () => {
   it("sends budget and top-up replay keys with the observed version and requested amount", async () => {
     vi.mocked(fetch).mockImplementation(async (url) => reply(String(url).endsWith("/budget") ? budget : topup));
     await budgetSet("1000", { expectedVersion: "1", idempotencyKey: requestKey, org: "team" });
-    await billingTopup("1000", { idempotencyKey: requestKey });
+    await billingTopup("100", { idempotencyKey: requestKey });
     expect(fetch).toHaveBeenCalledTimes(2);
     expect(sent()).toMatchObject({ method: "PUT", body: { expected_version: 1, limit_cents: 1000 } });
     expect(sent().headers.get("Idempotency-Key")).toBe(requestKey);
-    expect(sent(1)).toMatchObject({ method: "POST", body: { usdCents: 1000 } });
+    expect(sent(1)).toMatchObject({ method: "POST", body: { usdCents: 100 } });
     expect(sent(1).headers.get("Idempotency-Key")).toBe(requestKey);
   });
 
@@ -185,8 +185,8 @@ describe("billing command HTTP contracts", () => {
   it.each([
     () => budgetSet("1.5", { expectedVersion: "1", idempotencyKey: requestKey }),
     () => budgetSet("1000", { expectedVersion: "-1", idempotencyKey: requestKey }),
-    () => billingTopup("999", { idempotencyKey: requestKey }),
-    () => billingTopup("1000", { idempotencyKey: "short" }),
+    () => billingTopup("100", { idempotencyKey: "short" }),
+    () => billingTopup("99", { idempotencyKey: requestKey }),
     () => planQuote("builder-monthly", {}),
     () => billingCheckout("builder-monthly", { rail: "lightning", months: "2" }),
   ])("rejects invalid money or replay arguments before HTTP", async (run) => {
