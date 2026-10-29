@@ -7,6 +7,7 @@ import type { DVMServeResult, PaidJobCompletion } from "@dvmkit/sdk/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { DevPaymentTracker, printStartup, resolveDevEnvironment } from "../dev";
+import { SDK_VERSION } from "../../lib/version.ts";
 
 const noRails = {
   mount: "/",
@@ -38,6 +39,7 @@ describe("dvmctl dev output", () => {
     });
     printStartup(descriptor, 3210, [noRails]);
     const output = log.mock.calls.map(([line]) => String(line)).join("\n");
+    expect(output).toContain(`Serving SDK: @dvmkit/sdk ${SDK_VERSION}`);
     expect(output).toContain("Payments: skipped; no payment rail is configured");
     expect(output).toContain("DVMKIT_CASHU_MINTS");
     expect(output).toContain(

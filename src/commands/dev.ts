@@ -6,11 +6,14 @@ import { format } from "node:util";
 
 import type { DVMDescriptor, ZodLike } from "@dvmkit/sdk";
 import { DvmError } from "@dvmkit/sdk/internal";
-import { type DVMServeResult, type PaidJobCompletion, serve } from "@dvmkit/sdk/server";
+import type { DVMServeResult, PaidJobCompletion } from "@dvmkit/sdk/server";
 
 import { loadProjectEnvironment, mergeProjectEnvironment } from "../lib/dev-environment.ts";
 import { blockUntilShutdown } from "../lib/keep-alive.ts";
 import { loadDescriptor } from "../lib/load-handler.ts";
+import { createDevHost } from "../lib/serve-dev.ts";
+import { warnSdkMismatch } from "../lib/serving-sdk.ts";
+import { SDK_VERSION } from "../lib/version.ts";
 import { info } from "../shared/output.ts";
 
 export interface DevOptions {
@@ -36,6 +39,7 @@ export async function dev(handlerPath: string, opts: DevOptions): Promise<void> 
     const loaded = await loadTracked(absPath);
     if (!loaded.ok) throw handlerLoadFailed(loaded.message);
     const { descriptor } = loaded;
+    warnSdkMismatch(absPath);
     const server = await startServer(descriptor, port, env, (event) => {
       payments.observe(event);
     });
@@ -269,6 +273,7 @@ export function printStartup(
 ): void {
   console.log("");
   console.log(`  Dev server running at http://localhost:${port}`);
+  console.log(`  Serving SDK: @dvmkit/sdk ${SDK_VERSION} (dvmctl's pinned SDK)`);
   console.log(`  Name:   ${descriptor.name}`);
   console.log(`  Tags:   ${descriptor.tags.join(", ")}`);
   if (descriptor.price !== undefined) console.log(`  Price:  ${JSON.stringify(descriptor.price)}`);
@@ -534,6 +539,7 @@ async function runDevWorker(entry: string): Promise<void> {
   await send({ type: "loaded", files: loaded.files });
 
   await messages.next("listen");
+  warnSdkMismatch(entry);
   try {
     server = await startServer(descriptor, start.port, start.env, (event) =>
       forward({ type: "paid", event })
@@ -764,13 +770,13 @@ async function startServer(
   let listenError = false;
   let started = false;
   try {
-    const server = await serve(descriptor, {
+    const server = await createDevHost(descriptor, {
       port,
       env,
       devMode: true,
       mints,
       onPaidJobCompleted: onPaid,
-    });
+    }).serve();
     started = true;
     return server;
   } catch (err) {

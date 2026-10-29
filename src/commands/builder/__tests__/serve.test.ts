@@ -1,3 +1,7 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import type * as SdkInternal from "@dvmkit/sdk/internal";
 import { deriveBuilderLockKeypair, deriveReceiptKeypair, DvmError, generateIdentity, loadIdentitySecret, receiptPubkeyFromSecret, verifyAttestation } from "@dvmkit/sdk/internal";
 import type * as SdkServerModule from "@dvmkit/sdk/server";
@@ -8,6 +12,8 @@ import { readBuilderMnemonic } from "../../../lib/builder-mnemonic";
 import type { BuilderLockIdentity } from "../../../lib/cashu/builder-lock-identity";
 import { ATTESTATION_ENV_KEYS, signDeployAttestation } from "../../../lib/deploy-attestation";
 import { loadDescriptor } from "../../../lib/load-handler";
+import { SDK_VERSION } from "../../../lib/version";
+import * as output from "../../../shared/output";
 import { loadIdentityPubkey, requireBuilderDvmByHandle } from "../../../shared/builder-store";
 import {
   assertProductionDatabase,
@@ -59,6 +65,22 @@ describe("builderServe identity resolution", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.resetAllMocks();
+  });
+
+  it.each([SDK_VERSION, "0.16.1"])("names the serving SDK and warns only for a mismatched project (%s)", async (version) => {
+    const project = mkdtempSync(join(tmpdir(), "dvmctl-serve-sdk-"));
+    const info = vi.spyOn(output, "info").mockImplementation(() => {});
+    try {
+      mkdirSync(join(project, "node_modules/@dvmkit/sdk"), { recursive: true });
+      writeFileSync(join(project, "node_modules/@dvmkit/sdk/package.json"), JSON.stringify({ name: "@dvmkit/sdk", version }));
+      await builderServe(join(project, "handler.ts"), {});
+      expect(console.log).toHaveBeenCalledWith(expect.stringContaining(`Serving SDK: @dvmkit/sdk ${SDK_VERSION}`));
+      if (version === SDK_VERSION) expect(info).not.toHaveBeenCalled();
+      else {
+        expect(info).toHaveBeenCalledWith(expect.stringContaining(`dvmctl serves with @dvmkit/sdk ${SDK_VERSION}`));
+        expect(info).toHaveBeenCalledWith(expect.stringContaining("project has @dvmkit/sdk 0.16.1 installed"));
+      }
+    } finally { rmSync(project, { recursive: true, force: true }); }
   });
 
   it("attests the durable receipt identity without a Cashu mnemonic", async () => {

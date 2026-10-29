@@ -34,6 +34,7 @@ await preservePrimaryFailure(async () => {
   await command(cliPath, ["validate"], { cwd: project });
   await assertProjectEnvironment(cliPath, project);
   await live(cliPath, project, "dev", false);
+  await live(cliPath, project, "dev", false, true);
   await assertDevReload(cliPath, project);
   await expectMissingDatabase(cliPath, project);
   if (full) {
@@ -66,6 +67,7 @@ CMD ["node", "-e", "process.exit(0)"]
     await install(runtime);
     await assertRuntimeImage(runtime);
   }
+  await assertSdkMismatch(cliPath, project);
 }, async () => {
   await cleanupAll([...servers].map((child) => async () => { if (!await stopProcess(child)) fail("a server process did not stop, so its temporary directory was retained"); }));
   if (platformServer) await closeServer(platformServer.server);
@@ -124,8 +126,48 @@ async function assertProjectEnvironment(cli, project) {
     if (`${doctor.stdout}\n${doctor.stderr}`.includes(privateValue)) fail("unreadable project .env error exposed file content");
   } finally { rmSync(envPath, { recursive: true, force: true }); }
 }
-/** @param {string} cli @param {string} project @param {"dev" | "serve"} mode @param {boolean} database */
-async function live(cli, project, mode, database) { const port = await availablePort(); const child = start(cli, [mode, "handler.ts", "--port", String(port)], { cwd: project, database }); await preservePrimaryFailure(async () => { await waitFor(child, port, "/health", true); if (mode === "dev") { await waitFor(child, port, "/_dev", false); } else { const response = await getResponse(port, "/_dev"); if (response?.statusCode !== 404) fail("production serve did not return 404 for the development page"); } await assertTypedJob(port); }, async () => { await stop(child); }); }
+/** @param {string} cli @param {string} project @param {"dev" | "serve"} mode @param {boolean} database @param {boolean} [noReload] */
+async function live(cli, project, mode, database, noReload = false) {
+  const port = await availablePort();
+  const args = [mode, "handler.ts", "--port", String(port), ...(noReload ? ["--no-reload"] : [])];
+  const child = start(cli, args, { cwd: project, database });
+  let stdout = "";
+  let stderr = "";
+  child.stdout?.setEncoding("utf8");
+  child.stderr?.setEncoding("utf8");
+  child.stdout?.on("data", (chunk) => { stdout += chunk; });
+  child.stderr?.on("data", (chunk) => { stderr += chunk; });
+  const cliManifest = JSON.parse(readFileSync(resolve(cli, "../../package.json"), "utf8"));
+  const servingVersion = cliManifest.dependencies["@dvmkit/sdk"];
+  const projectVersion = JSON.parse(readFileSync(join(project, "node_modules/@dvmkit/sdk/package.json"), "utf8")).version;
+  await preservePrimaryFailure(async () => {
+    await waitFor(child, port, "/health", true);
+    await until(() => stdout.includes(`Serving SDK: @dvmkit/sdk ${servingVersion}`), { child, output: () => stdout + stderr }, () => "serving banner did not name the CLI SDK");
+    if (mode === "dev") {
+      await waitFor(child, port, "/_dev", false);
+      const page = await getResponse(port, "/_dev");
+      if (!page?.body.includes(`Serving @dvmkit/sdk ${servingVersion}`)) fail("development page did not name the serving SDK");
+    } else {
+      const response = await getResponse(port, "/_dev");
+      if (response?.statusCode !== 404) fail("production serve did not return 404 for the development page");
+    }
+    await assertTypedJob(port);
+    if (projectVersion !== servingVersion) {
+      await until(() => stderr.includes(`dvmctl serves with @dvmkit/sdk ${servingVersion}`) && stderr.includes(`project has @dvmkit/sdk ${projectVersion} installed`), { child, output: () => stdout + stderr }, () => "SDK mismatch warning did not name both versions");
+    } else if (stderr.includes("Warning: dvmctl serves with @dvmkit/sdk")) fail("matching SDK versions produced a mismatch warning");
+  }, async () => { await stop(child); });
+}
+/** @param {string} cli @param {string} project */
+async function assertSdkMismatch(cli, project) {
+  const manifestPath = join(project, "package.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.dependencies["@dvmkit/sdk"] = "0.16.1";
+  writeFileSync(manifestPath, JSON.stringify(manifest));
+  await install(project);
+  await live(cli, project, "dev", false);
+  await live(cli, project, "dev", false, true);
+  if (full) await live(cli, project, "serve", true);
+}
 /** @param {string} cli @param {string} project */
 async function assertDevReload(cli, project) {
   const handlerPath = join(project, "handler.ts");
@@ -224,7 +266,7 @@ function portClosed(port) { return new Promise((done) => { const socket = connec
 /** @param {string} cli @param {string} project */
 async function expectMissingDatabase(cli, project) { const result = await processCommand(process.execPath, [resolve(cli), "serve", "handler.ts", "--port", String(await availablePort())], { cwd: project, env: environment(false), capture: true, allowFailure: true, timeout: 20_000 }); const body = lastJson(result.stdout); if (result.code === 0 || body.error?.code !== "production_database_required" || !body.error?.hint?.includes("DATABASE_URL")) fail("serve did not fail with the actionable PostgreSQL configuration error"); }
 /** @param {string} cli @param {string[]} args @param {{cwd?: string, capture?: boolean}} [options] */ function command(cli, args, options = {}) { return processCommand(process.execPath, [resolve(cli), ...args], { ...options, env: environment(false) }); }
-/** @param {string} cli @param {string[]} args @param {{cwd: string, database: boolean}} options */ function start(cli, args, options) { const child = spawn(process.execPath, [resolve(cli), ...args], { cwd: options.cwd, detached: process.platform !== "win32", env: environment(options.database), stdio: "ignore" }); observeProcess(child); servers.add(child); child.once("close", () => { servers.delete(child); }); return child; }
+/** @param {string} cli @param {string[]} args @param {{cwd: string, database: boolean}} options */ function start(cli, args, options) { const child = spawn(process.execPath, [resolve(cli), ...args], { cwd: options.cwd, detached: process.platform !== "win32", env: environment(options.database), stdio: ["ignore", "pipe", "pipe"] }); observeProcess(child); servers.add(child); child.once("close", () => { servers.delete(child); }); return child; }
 /** @param {import("node:child_process").ChildProcess} child @param {number} port @param {string} path @param {boolean} health */ async function waitFor(child, port, path, health) { for (let attempt = 0; attempt < 100; attempt += 1) { if (child.exitCode !== null) throw new Error(`server exited before ${path} became ready (${child.exitCode})`); if (await get(port, path, health)) return; await new Promise((done) => setTimeout(done, 100)); } throw new Error(`server did not make ${path} ready`); }
 /** @param {number} port @param {string} path @param {boolean} health */ async function get(port, path, health) { const response = await getResponse(port, path); return response !== null && (health ? isHealthyResponse(response.statusCode, response.body) : response.statusCode === 200); }
 /** @param {number} port @param {string} path @returns {Promise<{ statusCode: number | undefined, body: string } | null>} */ function getResponse(port, path) { return new Promise((done) => { const probe = request({ host: "127.0.0.1", port, path, timeout: 500 }, (response) => { let body = ""; response.setEncoding("utf8"); response.on("data", (chunk) => { body += chunk; }); response.on("end", () => { done({ statusCode: response.statusCode, body }); }); }); probe.once("error", () => done(null)); probe.once("timeout", () => { probe.destroy(); done(null); }); probe.end(); }); }
