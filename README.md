@@ -41,7 +41,7 @@ Commands return structured output by default. Use `--human` for terminal output 
 
 Payment setup, secrets, content holds, financial export, and retirement are covered by the skill's task procedures and the [dvmctl reference](https://dvmkit.com/docs/cli-dvmctl).
 
-The CLI and bundled skill use the exact SDK dependency recorded in [package.json](package.json). Scaffolds inherit that selection.
+The CLI pins `@dvmkit/sdk` to `0.16.2` in [package.json](package.json), and new scaffolds inherit that exact version. `dvmctl dev` and `dvmctl serve` use the CLI's pinned SDK, print its version, and warn when the project's installed SDK differs. The local `/_dev` test page also shows the serving SDK version.
 
 ## Security
 

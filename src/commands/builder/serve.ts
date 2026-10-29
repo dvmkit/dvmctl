@@ -16,6 +16,8 @@ import {
 } from "../../lib/deploy-attestation.ts";
 import { blockUntilShutdown } from "../../lib/keep-alive.ts";
 import { loadDescriptor } from "../../lib/load-handler.ts";
+import { warnSdkMismatch } from "../../lib/serving-sdk.ts";
+import { SDK_VERSION } from "../../lib/version.ts";
 import { loadIdentityPubkey, requireBuilderDvmByHandle } from "../../shared/builder-store.ts";
 
 export interface BuilderServeOptions {
@@ -59,9 +61,11 @@ export async function builderServe(handlerPath: string, opts: BuilderServeOption
     attestation
   );
   assertProductionDatabase(serveOpts);
+  warnSdkMismatch(absPath);
 
   const { url, close } = await sdkServe(descriptor, serveOpts);
   console.log(`Serving ${descriptor.name} at ${url}`);
+  console.log(`  Serving SDK: @dvmkit/sdk ${SDK_VERSION} (dvmctl's pinned SDK)`);
   if (identity) {
     console.log(`  lock identity: ${identity.handle} (rotation ${identity.rotationIndex})`);
     console.log(`  lock pubkey:   ${identity.lockPubkey}`);
