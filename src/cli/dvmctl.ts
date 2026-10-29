@@ -238,6 +238,10 @@ export function buildProgram(): Command {
       "Create the builder signing identity when it is missing (required for noninteractive first deploys)"
     )
     .option("--allow-dirty", "Allow a cloud image to include uncommitted packaged files")
+    .option(
+      "--context <dir>",
+      "Build context folder relative to the DVM folder, which it must contain (default: the DVM folder; overrides package.json#dvmkit.buildContext)"
+    )
     .option("--env-stdin", "Read cloud environment overrides as JSON from stdin (64 KiB maximum; overrides project .env)")
     .option("--org <handle>", "Deploy under this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")

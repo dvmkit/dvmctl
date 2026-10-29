@@ -6,12 +6,13 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import type * as SdkInternal from "@dvmkit/sdk/internal";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -80,11 +81,11 @@ import { SPAWN_HEAVY_TIMEOUT } from "../../../test-support/spawn-budget";
 import {
   createTarball,
   deploy,
-  findContextRoot,
   isPackagedTreeDirty,
   probeLocalDvm,
   readGitHead,
   readVmConfig,
+  resolveBuildContext,
   withDeployBuildContext,
 } from "../deploy";
 import { identityCreate } from "../identity";
@@ -196,6 +197,24 @@ describe("dvmctl deploy --dry-run", () => {
     expect(out).toContain('"slug":"my-dvm"');
     expect(out).toContain('"runtime":"isolate"');
     expect(out).toContain('"docker_built":false');
+    expect(jsonMock.mock.calls[0]?.[0]).toMatchObject({ context_root: realpathSync(dir) });
+  });
+
+  it("refuses a lockfile-less DVM under a repository folder that holds one, before any build", async () => {
+    const git = gitRunner(() => dir);
+    git("init", "--initial-branch=master");
+    writeFileSync(join(dir, "package-lock.json"), "{}", "utf-8");
+    const dvmDir = join(dir, "apps", "weather");
+    mkdirSync(dvmDir, { recursive: true });
+    writeFileSync(join(dvmDir, "handler.ts"), "export default {};", "utf-8");
+    writeFileSync(join(dvmDir, "package.json"), JSON.stringify({ name: "weather" }), "utf-8");
+    writeFileSync(join(dvmDir, "Dockerfile"), "FROM scratch\n", "utf-8");
+
+    await expect(deploy({ dryRun: true }, dvmDir)).rejects.toMatchObject({
+      code: "build_context_required",
+      hint: expect.stringContaining("buildContext"),
+    });
+    expect(jsonMock).not.toHaveBeenCalled();
   });
 
   it("accepts a 20-machine declaration during offline dry-run", async () => {
@@ -454,31 +473,102 @@ function sumContextBytes(root: string, prefix = ""): number {
   }, 0);
 }
 
-describe("findContextRoot", () => {
+describe("resolveBuildContext", { timeout: SPAWN_HEAVY_TIMEOUT }, () => {
   let root: string;
+  let dvmDir: string;
+  const git = gitRunner(() => root);
+
+  /** A repository whose root holds a lockfile, with the DVM two folders down. */
+  const seed = (inGit = true, dvmPackage: Record<string, unknown> = {}): void => {
+    root = realpathSync(mkdtempSync(join(tmpdir(), "ctx-root-")));
+    if (inGit) git("init", "--initial-branch=master");
+    writeFileSync(join(root, "package-lock.json"), "{}", "utf-8");
+    dvmDir = join(root, "apps", "weather");
+    mkdirSync(dvmDir, { recursive: true });
+    mkdirSync(join(root, "apps", "sibling"));
+    writeFileSync(join(dvmDir, "handler.ts"), "export default {};", "utf-8");
+    writeFileSync(join(dvmDir, "package.json"), JSON.stringify({ name: "weather", ...dvmPackage }), "utf-8");
+  };
 
   afterEach(() => {
     if (root) rmSync(root, { recursive: true, force: true });
   });
 
-  it("returns the parent dir that holds package-lock.json", () => {
-    root = mkdtempSync(join(tmpdir(), "ctx-root-"));
-    writeFileSync(join(root, "package-lock.json"), "{}", "utf-8");
-    const sub = join(root, "src", "dvms", "cast");
-    mkdirSync(sub, { recursive: true });
-
-    expect(findContextRoot(sub)).toBe(root);
+  it("defaults to the DVM folder when it has its own lockfile", () => {
+    seed();
+    writeFileSync(join(dvmDir, "pnpm-lock.yaml"), "", "utf-8");
+    expect(resolveBuildContext(dvmDir)).toEqual({ contextRoot: dvmDir, dockerfilePath: "Dockerfile" });
   });
 
-  it("falls back to cwd when no parent has package-lock.json", () => {
-    root = mkdtempSync(join(tmpdir(), "ctx-root-none-"));
-    expect(findContextRoot(root)).toBe(root);
+  it("defaults to the DVM folder when it is the repository root", () => {
+    seed();
+    expect(resolveBuildContext(root)).toEqual({ contextRoot: root, dockerfilePath: "Dockerfile" });
   });
 
-  it("returns cwd itself when it contains package-lock.json (single-DVM repo)", () => {
-    root = mkdtempSync(join(tmpdir(), "ctx-root-single-"));
-    writeFileSync(join(root, "package-lock.json"), "{}", "utf-8");
-    expect(findContextRoot(root)).toBe(root);
+  it("refuses to guess when only a repository parent has a lockfile", () => {
+    seed();
+    let failure: unknown;
+    try {
+      resolveBuildContext(dvmDir);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      code: "build_context_required",
+      message: expect.stringContaining(join(root, "package-lock.json")),
+      hint: expect.stringContaining('`dvmkit.buildContext` in package.json (or pass --context) to "../.."'),
+      data: { dvm_dir: dvmDir, lockfile_dir: root },
+    });
+  });
+
+  it("does not look past the repository boundary for a parent lockfile", () => {
+    seed(false);
+    expect(resolveBuildContext(dvmDir)).toEqual({ contextRoot: dvmDir, dockerfilePath: "Dockerfile" });
+    const nested = join(root, "apps");
+    gitRunner(() => nested)("init", "--initial-branch=master");
+    expect(resolveBuildContext(dvmDir)).toEqual({ contextRoot: dvmDir, dockerfilePath: "Dockerfile" });
+  });
+
+  it("widens to the folder named by package.json#dvmkit.buildContext", () => {
+    seed(true, { dvmkit: { buildContext: "../.." } });
+    expect(resolveBuildContext(dvmDir)).toEqual({ contextRoot: root, dockerfilePath: "apps/weather/Dockerfile" });
+  });
+
+  it("lets --context override the package.json field", () => {
+    seed(true, { dvmkit: { buildContext: "../.." } });
+    expect(resolveBuildContext(dvmDir, "..")).toEqual({
+      contextRoot: join(root, "apps"),
+      dockerfilePath: "weather/Dockerfile",
+    });
+    expect(resolveBuildContext(dvmDir, ".")).toEqual({ contextRoot: dvmDir, dockerfilePath: "Dockerfile" });
+  });
+
+  it.each([
+    ["a sibling folder", "../sibling"],
+    ["a missing folder", "../../elsewhere"],
+    ["a folder above the repository", "../../.."],
+    ["an absolute path", "/"],
+    ["an empty value", " "],
+  ])("refuses %s as a build context", (_label, value) => {
+    seed();
+    let failure: unknown;
+    try {
+      resolveBuildContext(dvmDir, value);
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toMatchObject({
+      code: "invalid_build_context",
+      hint: expect.stringContaining("contains it"),
+      data: { value, source: "--context" },
+    });
+  });
+
+  it("refuses a non-string package.json field", () => {
+    seed(true, { dvmkit: { buildContext: 2 } });
+    expect(() => resolveBuildContext(dvmDir)).toThrow(
+      expect.objectContaining({ code: "invalid_build_context" })
+    );
   });
 });
 
@@ -861,6 +951,80 @@ describe("dvmctl deploy cloud dirty-tree guard", { timeout: SPAWN_HEAVY_TIMEOUT 
     expect(listing).not.toContain("production-acceptance.log");
   });
 
+  it("reports the uploaded folder and Dockerfile in the result", async () => {
+    await deploy({ target: "cloud" });
+
+    const [, , opts] = startDeployMock.mock.calls[0] ?? [];
+    expect(opts.dockerfilePath).toBeUndefined();
+    expect(json).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "deployed", context_root: dir, dockerfile: "Dockerfile" })
+    );
+  });
+
+  it("uploads the folder named by buildContext and never its credential stores", async () => {
+    const dvmDir = join(dir, "apps", "weather");
+    mkdirSync(dvmDir, { recursive: true });
+    writeFileSync(join(dvmDir, "handler.ts"), "export default {};", "utf-8");
+    writeFileSync(join(dvmDir, "Dockerfile"), "FROM scratch\n", "utf-8");
+    writeFileSync(
+      join(dvmDir, "package.json"),
+      JSON.stringify({ name: "weather", dvmkit: { buildContext: "../.." } }),
+      "utf-8"
+    );
+    writeFileSync(join(dir, "shared.ts"), "export const shared = true;", "utf-8");
+    for (const path of [".ssh/id_ed25519", ".dvmkit/builder.key", ".aws/credentials", "apps/.dvmctl/token"]) {
+      mkdirSync(join(dir, dirname(path)), { recursive: true });
+      writeFileSync(join(dir, path), "secret marker", "utf-8");
+    }
+    git("add", ".");
+    git("commit", "--message", "add nested dvm and credential stores");
+
+    await deploy({ target: "cloud" }, dvmDir);
+
+    expect(startDeployMock).toHaveBeenCalledTimes(1);
+    const [, , opts] = startDeployMock.mock.calls[0] ?? [];
+    expect(opts.dockerfilePath).toBe("apps/weather/Dockerfile");
+    const listing = execFileSync("tar", ["-tzf", "-"], { input: opts.tarball }).toString("utf-8");
+    expect(listing).toContain("./shared.ts");
+    expect(listing).toContain("./apps/weather/handler.ts");
+    expect(listing).not.toMatch(/\.ssh|\.dvmkit|\.aws|\.dvmctl|secret/);
+    expect(json).toHaveBeenCalledWith(
+      expect.objectContaining({ context_root: dir, dockerfile: "apps/weather/Dockerfile" })
+    );
+  });
+
+  it("refuses a lockfile-less nested DVM with a buildContext hint and uploads nothing", async () => {
+    const dvmDir = join(dir, "apps", "weather");
+    mkdirSync(dvmDir, { recursive: true });
+    writeFileSync(join(dvmDir, "handler.ts"), "export default {};", "utf-8");
+    writeFileSync(join(dvmDir, "Dockerfile"), "FROM scratch\n", "utf-8");
+    writeFileSync(join(dvmDir, "package.json"), JSON.stringify({ name: "weather" }), "utf-8");
+    git("add", ".");
+    git("commit", "--message", "add nested dvm");
+
+    await expect(deploy({ target: "cloud" }, dvmDir)).rejects.toMatchObject({
+      code: "build_context_required",
+      hint: expect.stringContaining("buildContext"),
+    });
+    expect(startDeployMock).not.toHaveBeenCalled();
+  });
+
+  it("accepts --context in place of the package.json field", async () => {
+    const dvmDir = join(dir, "apps", "weather");
+    mkdirSync(dvmDir, { recursive: true });
+    writeFileSync(join(dvmDir, "handler.ts"), "export default {};", "utf-8");
+    writeFileSync(join(dvmDir, "Dockerfile"), "FROM scratch\n", "utf-8");
+    writeFileSync(join(dvmDir, "package.json"), JSON.stringify({ name: "weather" }), "utf-8");
+    git("add", ".");
+    git("commit", "--message", "add nested dvm");
+
+    await deploy({ target: "cloud", context: "../.." }, dvmDir);
+
+    const [, , opts] = startDeployMock.mock.calls[0] ?? [];
+    expect(opts.dockerfilePath).toBe("apps/weather/Dockerfile");
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({ context_root: dir }));
+  });
+
   it("reports exhausted metadata verification as a typed partial success with the healthz check", async () => {
     streamDeployLogsMock.mockResolvedValueOnce({
       url: "https://word-counter.example",
@@ -1064,7 +1228,7 @@ describe("dirty-tree sha marking", { timeout: SPAWN_HEAVY_TIMEOUT }, () => {
     writeFileSync(join(dir, "handler.ts"), "export default { sibling: true };", "utf-8");
 
     const nested = join(dir, "packages", "dvm");
-    expect(findContextRoot(nested)).toBe(nested);
+    expect(resolveBuildContext(nested).contextRoot).toBe(realpathSync(nested));
     expect(isPackagedTreeDirty(nested)).toBe(false);
     expect(isPackagedTreeDirty(dir)).toBe(true);
   });

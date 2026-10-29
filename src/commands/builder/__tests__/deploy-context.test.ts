@@ -73,6 +73,20 @@ describe("git-visible deploy context", { timeout: SPAWN_HEAVY_TIMEOUT }, () => {
     expect(entries(context)).toEqual(["new/input.txt"]);
   });
 
+  it("drops credential stores at any depth even when they are tracked", () => {
+    const dir = fixture();
+    git(dir, "init");
+    writeFileSync(join(dir, "handler.ts"), "source");
+    for (const path of [".ssh/id_ed25519", ".aws/credentials", ".dvm/state.json", ".dvmkit/builder.key", "tools/.dvmctl/token"]) {
+      mkdirSync(join(dir, path, ".."), { recursive: true });
+      writeFileSync(join(dir, path), "secret marker");
+    }
+    git(dir, "add", "-f", ".");
+    git(dir, "commit", "-m", "seed");
+
+    expect(entries(dir)).toEqual(["handler.ts"]);
+  });
+
   it("does not follow a symlink replacing a tracked directory", () => {
     const dir = fixture();
     const external = fixture();
