@@ -426,15 +426,7 @@ export async function recoverCustody(store: MeltCustody, op: CustodyOperation, w
   requireValue(canonicalMint(wallet.mint.mintUrl) === op.mint && wallet.unit === op.unit);
   const quote = await wallet.mint.checkMeltQuoteBolt11(op.quote);
   store.observe(op, "quote", quote);
-  requireValue(quote.quote === op.quote && ["UNPAID", "PENDING", "PAID"].includes(quote.state));
-  requireValue(quote.unit === undefined || quote.unit === op.unit);
-  requireValue(quote.amount !== undefined && amount(quote.amount) === op.invoiceAmount);
-  requireValue(quote.fee_reserve !== undefined && amount(quote.fee_reserve) === op.reserve);
-  requireValue(quote.request === undefined || quote.request === op.invoice);
-  if (Object.hasOwn(quote, "change")) requireValue(Array.isArray(quote.change));
-  requireValue(quote.payment_preimage === undefined || quote.payment_preimage === null || typeof quote.payment_preimage === "string");
-  requireValue(!op.preimage || !quote.payment_preimage || op.preimage === quote.payment_preimage);
-  requireValue(op.payment !== "PAID" || quote.state === "PAID");
+  validateFreshQuote(op, quote);
   op.payment = quote.state;
   if (quote.payment_preimage) op.preimage = quote.payment_preimage;
   store.commit();
@@ -487,6 +479,30 @@ export async function recoverCustody(store: MeltCustody, op: CustodyOperation, w
     op.complete = false; store.commit();
   }
   return op.payment;
+}
+type FreshQuote = Awaited<ReturnType<Wallet["mint"]["checkMeltQuoteBolt11"]>>;
+function validateFreshQuote(op: CustodyOperation, quote: FreshQuote): void {
+  requireValue(quote.quote === op.quote && ["UNPAID", "PENDING", "PAID"].includes(quote.state));
+  requireValue(quote.unit === undefined || quote.unit === op.unit);
+  requireValue(quote.amount !== undefined && amount(quote.amount) === op.invoiceAmount);
+  requireValue(quote.fee_reserve !== undefined && amount(quote.fee_reserve) === op.reserve);
+  requireValue(quote.request === undefined || quote.request === op.invoice);
+  if (Object.hasOwn(quote, "change")) requireValue(Array.isArray(quote.change));
+  requireValue(quote.payment_preimage === undefined || quote.payment_preimage === null || typeof quote.payment_preimage === "string");
+  requireValue(!op.preimage || !quote.payment_preimage || op.preimage === quote.payment_preimage);
+  requireValue(op.payment !== "PAID" || quote.state === "PAID");
+}
+/**
+ * Whether one recorded fresh quote answer, on its own, shows this operation
+ * PAID with the preimage on record. Earlier observations do not count: a mint
+ * that now answers differently must not have its rows acknowledged.
+ */
+export function freshQuoteConfirmsPaid(op: CustodyOperation, observation: unknown): boolean {
+  if (!observation || typeof observation !== "object") return false;
+  const quote = observation as FreshQuote;
+  try { validateFreshQuote(op, quote); } catch { return false; }
+  return quote.state === "PAID" && typeof quote.payment_preimage === "string" &&
+    quote.payment_preimage.length > 0 && quote.payment_preimage === op.preimage;
 }
 function reconcileSignatureEvidence(
   op: CustodyOperation, current: { signature: SerializedBlindedSignature; output: number }[], final: boolean

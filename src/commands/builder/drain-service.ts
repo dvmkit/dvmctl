@@ -74,6 +74,12 @@ export interface DrainServiceContext {
   currentKeypair?: BuilderLockKeypair;
   /** The send-capable connection refunds are bought over; absent queues them. */
   refundNwc?: RefundNwcConfig;
+  /**
+   * Whether an accumulator row went into a payout melt this worker recorded
+   * (paid or pending). Only those rows prove who spent a swap's inputs;
+   * absent, no spent-input fallback is allowed.
+   */
+  isMeltedRow?: (mintUrl: string, rowId: string) => boolean;
   /** Test seam — cashu-ts wallet construction. */
   walletProvider?: typeof getWallet;
   /** Test seams — NIP-47 calls. */
@@ -453,13 +459,27 @@ async function parkOne(
       error: err instanceof Error ? err.message : String(err),
       ...(recoveryDiagnostic ? { recovery: recoveryDiagnostic } : {}),
     });
-    const spentRowIds = mintRejected(err) ? await spentRows(wallet, batch, inputProofs) : [];
+    const spentRowIds = isAlreadySpentRejection(err) ? await spentRows(wallet, batch, inputProofs) : [];
     if (spentRowIds.length === 0) return "failed";
-    // The accumulator still lists proofs the mint has spent, usually because a
-    // payout melt took them before its rows were acknowledged. Retrying the
-    // swap can never succeed, so buy the refund instead. The melt's recovery
-    // pass, which holds the quote and preimage mark-melted requires, retires
-    // these rows.
+    const unexplained = spentRowIds.filter((rowId) => !ctx.isMeltedRow?.(batch.mint_url, rowId));
+    if (unexplained.length > 0) {
+      // Something other than a recorded payout melt spent these, possibly an
+      // earlier swap for this very drain whose response was lost. Buying the
+      // refund now could pay it twice, so stop and alarm instead.
+      logDrainError(ctx, "drain_swap_inputs_spent_unexplained", {
+        credit_id: drain.credit_id,
+        drain_id: drain.drain_id,
+        mint_url: batch.mint_url,
+        spent_row_ids: spentRowIds,
+        unexplained_row_ids: unexplained,
+        hint: `The mint reports inputs of this refund's batch spent, and no payout melt recorded on this host used them. Nothing was bought. Find out what spent them (an earlier swap for drain ${drain.drain_id} that lost its response would) before settling this refund by hand.`,
+      });
+      return "failed";
+    }
+    // A payout melt took these proofs before its rows were acknowledged.
+    // Retrying the swap can never succeed, so buy the refund instead; the
+    // melt's recovery pass, which holds the quote and preimage mark-melted
+    // requires, retires the rows.
     logDrain(ctx, "drain_swap_inputs_spent", {
       credit_id: drain.credit_id,
       drain_id: drain.drain_id,
@@ -1375,15 +1395,14 @@ async function selectCoveringBatch(
 }
 
 /**
- * A 4xx answer is the mint refusing the swap, which is atomic, so nothing was
- * spent by this attempt. A transport failure is ambiguous: the swap may have
- * spent these inputs itself, so it never qualifies. Matched by shape because
- * the SDK wallet may carry its own cashu-ts copy.
+ * NUT error 11001 is the mint refusing the swap because an input is already
+ * spent, and a refused swap is atomic, so this attempt spent nothing. Any other
+ * failure, including other 4xx answers and transport loss, may come after the
+ * swap landed and never qualifies. Matched by shape because the SDK wallet may
+ * carry its own cashu-ts copy.
  */
-function mintRejected(err: unknown): boolean {
-  return err instanceof Error &&
-    (err.name === "MintOperationError" || err.name === "HttpResponseError") &&
-    "status" in err && typeof err.status === "number" && err.status >= 400 && err.status < 500;
+function isAlreadySpentRejection(err: unknown): boolean {
+  return err instanceof Error && err.name === "MintOperationError" && "code" in err && err.code === 11001;
 }
 
 /** NUT-07 rows the mint reports SPENT; an unanswered or mismatched check reports none. */
@@ -1404,6 +1423,18 @@ async function spentRows(wallet: Wallet, batch: AdminBatch, inputProofs: ProofLi
 /** 404 from the drain admin routes — the DVM predates tracked change. */
 function isMissingDrainSurface(err: unknown): boolean {
   return err instanceof AdminApiError && err.status === 404;
+}
+
+function logDrainError(ctx: DrainServiceContext, level: string, fields: Record<string, unknown>): void {
+  console.error(
+    JSON.stringify({
+      level,
+      ts: new Date().toISOString(),
+      dvm_id: ctx.dvmId,
+      handle: ctx.handle,
+      ...fields,
+    })
+  );
 }
 
 function logDrain(ctx: DrainServiceContext, level: string, fields: Record<string, unknown>): void {
