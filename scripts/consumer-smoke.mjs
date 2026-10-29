@@ -27,8 +27,10 @@ await preservePrimaryFailure(async () => {
   await assertTempoDrainDecisions(cliPath);
   const project = join(root, "first-project");
   await scaffold(cliPath, project);
-  await assertScaffold(cliPath, project);
   await install(project);
+  // The matrix also tests the CLI's Node 22.0 minimum; scaffold tools require 22.12+.
+  if (process.versions.node !== "22.0.0") await checkProject(project);
+  await assertScaffold(cliPath, project);
   await command(cliPath, ["validate"], { cwd: project });
   await assertProjectEnvironment(cliPath, project);
   await live(cliPath, project, "dev", false);
@@ -84,6 +86,15 @@ async function assertScaffold(cli, project) {
   writeFileSync(join(project, "handler.ts"), handler.replace(/\n {2}price: [^\n]+,/, ""));
 }
 /** @param {string} project */ async function install(project) { const command = scaffoldInstallCommand(); await processCommand(command.executable, command.args, { cwd: project, env: environment(false), timeout: command.timeout }); }
+/** @param {string} project */
+async function checkProject(project) {
+  if (process.platform === "win32") {
+    await processCommand("cmd.exe", ["/d", "/s", "/c", "npm.cmd run typecheck && npm.cmd test"], { cwd: project, env: environment(false) });
+  } else {
+    await processCommand("npm", ["run", "typecheck"], { cwd: project, env: environment(false) });
+    await processCommand("npm", ["test"], { cwd: project, env: environment(false) });
+  }
+}
 /** @param {string} cli @param {string} project */
 async function assertProjectEnvironment(cli, project) {
   const envPath = join(project, ".env");
