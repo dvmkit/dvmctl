@@ -76,8 +76,8 @@ export interface DrainServiceContext {
   refundNwc?: RefundNwcConfig;
   /**
    * Whether an accumulator row went into a payout melt this worker recorded
-   * (paid or pending). Only those rows prove who spent a swap's inputs;
-   * absent, no spent-input fallback is allowed.
+   * and the mint confirmed PAID. Only those rows prove who spent a swap's
+   * inputs; absent, no spent-input fallback is allowed.
    */
   isMeltedRow?: (mintUrl: string, rowId: string) => boolean;
   /** Test seam — cashu-ts wallet construction. */
@@ -472,11 +472,11 @@ async function parkOne(
         mint_url: batch.mint_url,
         spent_row_ids: spentRowIds,
         unexplained_row_ids: unexplained,
-        hint: `The mint reports inputs of this refund's batch spent, and no payout melt recorded on this host used them. Nothing was bought. Find out what spent them (an earlier swap for drain ${drain.drain_id} that lost its response would) before settling this refund by hand.`,
+        hint: `The mint reports inputs of this refund's batch spent, and no paid payout melt recorded on this host used them. Nothing was bought. If a payout melt of these rows is still pending, the next run retries once recovery sees it paid; otherwise find out what spent them (an earlier swap for drain ${drain.drain_id} that lost its response would) before settling this refund by hand.`,
       });
       return "failed";
     }
-    // A payout melt took these proofs before its rows were acknowledged.
+    // A paid payout melt took these proofs before its rows were acknowledged.
     // Retrying the swap can never succeed, so buy the refund instead; the
     // melt's recovery pass, which holds the quote and preimage mark-melted
     // requires, retires the rows.

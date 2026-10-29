@@ -470,6 +470,43 @@ describe("builder payout change at the command and private disk boundary", () =>
     expect((await reopened()).op.observations).toHaveLength(observations);
   });
 
+  it.each([
+    ["a PAID melt", (_op: Record<string, unknown>): void => undefined, MINT, "row-1", DVM, true],
+    ["the same mint written differently", (_op: Record<string, unknown>): void => undefined, `${MINT}/`, "row-2", DVM, true],
+    ["a PENDING melt", (op: Record<string, unknown>): void => { op.payment = "PENDING"; }, MINT, "row-1", DVM, false],
+    ["a quarantined UNPAID melt", (op: Record<string, unknown>): void => { op.payment = "UNPAID"; op.quarantine = true; }, MINT, "row-1", DVM, false],
+    ["an UNKNOWN melt", (op: Record<string, unknown>): void => { op.payment = "UNKNOWN"; }, MINT, "row-1", DVM, false],
+    ["a rejected submission", (op: Record<string, unknown>): void => { op.submission = "rejected"; }, MINT, "row-1", DVM, false],
+    ["a row outside the melt", (_op: Record<string, unknown>): void => undefined, MINT, "row-9", DVM, false],
+    ["another mint", (_op: Record<string, unknown>): void => undefined, "https://other-mint.invalid", "row-1", DVM, false],
+    ["another DVM", (_op: Record<string, unknown>): void => undefined, MINT, "row-1", "other-dvm", false],
+  ] as const)("counts spent inputs as explained only by a paid melt: %s", async (_case, alter, mintUrl, rowId, dvm, expected) => {
+    await (await processObjects()).run();
+    const { store, op } = await reopened();
+    expect(op.payment).toBe("PAID");
+    alter(op as unknown as Record<string, unknown>);
+    expect(store.spentByPaidMelt(dvm, mintUrl, rowId)).toBe(expected);
+  });
+
+  it("hands the drain service the custody check for melt-spent rows", async () => {
+    const seen: { isMeltedRow?: (mintUrl: string, rowId: string) => boolean }[] = [];
+    vi.doMock("../drain-service.ts", () => ({
+      serviceDrains: vi.fn(async (drainCtx: (typeof seen)[number]) => {
+        seen.push(drainCtx);
+        return { fetched: true, drains_seen: 0, drains_parked: 0, drains_jit_minted: 0, drains_failed: 0, drains_queued: 0,
+          drains_manual: 0, drains_channel: 0, recovered: 0, cashu_liability_sats_after: 0 };
+      }),
+    }));
+    try { await (await processObjects()).run(); }
+    finally { vi.doUnmock("../drain-service.ts"); }
+    expect(mocked.mark).toHaveBeenCalledOnce();
+    const check = seen[0]?.isMeltedRow;
+    expect(check).toBeTypeOf("function");
+    // Evaluated against the same tick's custody, which now holds the paid melt.
+    expect(check!(MINT, "row-1")).toBe(true);
+    expect(check!(MINT, "row-unrelated")).toBe(false);
+  });
+
   it("acknowledges a paid melt on recovery even when its change stays quarantined", async () => {
     mint.fixture.quoteAmounts = [];
     mocked.mark.mockRejectedValueOnce(new Error("admin endpoint unavailable"));

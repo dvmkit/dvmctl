@@ -451,10 +451,8 @@ type CustodyContext = MeltContext & { custody: MeltCustody };
 
 async function runLockedTick(ctx: CustodyContext): Promise<TickSummary> {
   const recovery = await runRecovery(ctx);
-  const drains = await serviceDrains({ ...ctx.drainCtx, isMeltedRow: (mintUrl, rowId) =>
-    ctx.custody.operations(ctx.dvmId).some(op => op.submission !== "rejected" &&
-      (op.payment === "PAID" || op.payment === "PENDING") &&
-      op.mint === canonicalMint(mintUrl) && op.rows.includes(rowId)) });
+  const drains = await serviceDrains({ ...ctx.drainCtx,
+    isMeltedRow: (mintUrl, rowId) => ctx.custody.spentByPaidMelt(ctx.dvmId, mintUrl, rowId) });
   const meltHeld = !drains.fetched || drains.cashu_liability_sats_after > 0;
   const unknownSince = recordDrainState(ctx.dvmId, drains.fetched);
   const heldForMs = drainHoldElapsedMs(unknownSince);

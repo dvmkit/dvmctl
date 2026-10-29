@@ -272,6 +272,18 @@ export class MeltCustody {
   }
   operations(dvm: string): CustodyOperation[] { return this.snapshot.operations.filter(op => op.dvm === dvm); }
   records(op: CustodyOperation): CustodyProof[] { return this.snapshot.proofs.filter(p => p.operation === op.id); }
+  /**
+   * Whether an accumulator row was spent by a payout melt the mint has
+   * confirmed PAID. A pending melt does not count: its inputs read PENDING, not
+   * SPENT, unless it failed and something else (such as a refund swap that lost
+   * its response) spent them, and buying a refund then would pay it twice.
+   */
+  spentByPaidMelt(dvm: string, mintUrl: string, rowId: string): boolean {
+    let mint: string;
+    try { mint = canonicalMint(mintUrl); } catch { return false; }
+    return this.snapshot.operations.some(op => op.dvm === dvm && op.mint === mint &&
+      op.submission !== "rejected" && op.payment === "PAID" && op.rows.includes(rowId));
+  }
   commit(): void {
     try {
       validate(this.snapshot, this.checked);
