@@ -38,7 +38,7 @@ import {
   readMeltHistory,
 } from "../../lib/melt-pending-log.ts";
 import { withMeltPendingLock } from "../../lib/melt-pending-lock.ts";
-import { canonicalMint, MeltCustody, prepareCustody, recoverCustody, type CustodyOperation } from "../../lib/melt-change-custody.ts";
+import { canonicalMint, freshQuoteConfirmsPaid, MeltCustody, prepareCustody, recoverCustody, type CustodyOperation } from "../../lib/melt-change-custody.ts";
 import { recordMeltSuccess } from "../../lib/melt-success-state.ts";
 import { requireAuth } from "../../lib/platform.ts";
 import * as platformClient from "../../lib/platform-client.ts";
@@ -451,7 +451,8 @@ type CustodyContext = MeltContext & { custody: MeltCustody };
 
 async function runLockedTick(ctx: CustodyContext): Promise<TickSummary> {
   const recovery = await runRecovery(ctx);
-  const drains = await serviceDrains(ctx.drainCtx);
+  const drains = await serviceDrains({ ...ctx.drainCtx,
+    isMeltedRow: (mintUrl, rowId) => ctx.custody.spentByPaidMelt(ctx.dvmId, mintUrl, rowId) });
   const meltHeld = !drains.fetched || drains.cashu_liability_sats_after > 0;
   const unknownSince = recordDrainState(ctx.dvmId, drains.fetched);
   const heldForMs = drainHoldElapsedMs(unknownSince);
@@ -848,13 +849,19 @@ async function meltBatch(
     });
   }
   let meltResult: { state: string; preimage: string | null };
+  let changeUnresolved = false;
+  const observed = op.observations.length;
   try {
     const state = await recoverCustody(ctx.custody, op, wallet);
     meltResult = { state, preimage: op.preimage ?? null };
     logEvent(ctx, "melt_pending_change_custody", ctx.custody.status(op));
-  } catch {
-    logErr(ctx, "melt_pending_recovery_check_failed", new Error("Fresh quote validation failed"), { quote_id: op.quote });
-    return "failed";
+  } catch (err) {
+    if (freshPayment(ctx, op, observed, err) !== "settled") {
+      logErr(ctx, "melt_pending_recovery_check_failed", new Error("Fresh quote validation failed"), { quote_id: op.quote });
+      return "failed";
+    }
+    changeUnresolved = true;
+    meltResult = { state: op.payment, preimage: op.preimage ?? null };
   }
   if (meltResult.state === "PENDING") {
     if (submissionError) return "failed";
@@ -905,6 +912,7 @@ async function meltBatch(
 
   op.acknowledged = true;
   ctx.custody.commit();
+  if (changeUnresolved) logChangeUnresolved(ctx, op);
   appendPostMelt({
     dvm_id: ctx.dvmId,
     row_ids: batch.row_ids,
@@ -918,7 +926,36 @@ async function meltBatch(
     total_sats: batch.total_sats,
     quote_id: quote.rawQuote.quote,
   });
-  return "melted";
+  // The payout landed, but its change did not reconcile: keep the run's alarm.
+  return changeUnresolved ? "failed" : "melted";
+}
+
+/**
+ * Whether this tick's own quote answer settles the payment after change
+ * custody failed. `recoverCustody` records the answer before validating it and
+ * commits PAID with its preimage before touching change, so a failure in the
+ * change phase leaves a confirming answer here; a change failure does not
+ * unspend the inputs, and the rows must still be acknowledged. No answer this
+ * tick (transport loss, a held-change refresh) is unknown. An answer that does
+ * not itself confirm PAID with the recorded preimage is a contradiction and
+ * never acknowledges, whatever an earlier tick recorded.
+ */
+function freshPayment(ctx: CustodyContext, op: CustodyOperation, observedBefore: number, err: unknown): "settled" | "contradicted" | "unknown" {
+  if (err instanceof DvmError && err.code === "melt_custody_io") return "unknown";
+  const answers = op.observations.slice(observedBefore).filter(o => o.kind === "quote");
+  if (answers.length === 0) return "unknown";
+  if (op.payment === "PAID" && freshQuoteConfirmsPaid(op, answers[answers.length - 1].data)) return "settled";
+  logErr(ctx, "melt_pending_fresh_quote_contradicts", new Error("Fresh quote contradicts the recorded payment"), {
+    quote_id: op.quote, recorded_payment_state: op.payment,
+    hint: "The mint's answer for this quote no longer matches what was recorded, so its rows were not acknowledged. Inspect the quote at the mint before acting.",
+  });
+  return "contradicted";
+}
+
+function logChangeUnresolved(ctx: CustodyContext, op: CustodyOperation): void {
+  logErr(ctx, "melt_pending_change_unresolved",
+    new Error("Payment settled but its change could not be reconciled"),
+    { ...ctx.custody.status(op), hint: "The payout is paid and mark-melted acknowledged its rows. This melt's change did not reconcile with the mint's answer, so it stays quarantined in melt-custody.json for inspection, and recovery no longer re-checks it." });
 }
 
 /** Only explicit final submission rejections prove this request cannot later pay. */
@@ -975,6 +1012,9 @@ async function runRecovery(
     if (op.acknowledged && audit) appendPostMelt({ dvm_id: op.dvm, row_ids: op.rows, quote_id: op.quote,
       status: "success", preimage: op.preimage });
     if (op.acknowledged && op.complete && !ctx.custody.records(op).some(p => p.state === "held")) continue;
+    // Quarantine is terminal and its rows are acknowledged: re-checking only
+    // appends an observation to the custody file on every tick.
+    if (op.acknowledged && op.quarantine) continue;
     const wasAcknowledged = op.acknowledged;
     const result = await recoverOwned(ctx, op);
     if (result === "recovered") { if (!wasAcknowledged) recovered++; }
@@ -1019,17 +1059,22 @@ function isAcknowledgedPending(
 }
 
 async function recoverOwned(ctx: CustodyContext, op: CustodyOperation): Promise<"recovered" | PendingReason> {
+  let changeUnresolved = false;
+  const observed = op.observations.length;
   try {
     const { getWallet } = await import("@dvmkit/sdk/internal");
     const wallet = await getWallet(op.mint);
     const needsSignatures = ctx.custody.records(op).some(proof => proof.state === "held" && proof.verification === "unverified");
     if (op.payment === "PAID" && op.complete && op.preimage && !needsSignatures) await ctx.custody.refreshHeld(op, wallet);
     else await recoverCustody(ctx.custody, op, wallet);
-  } catch {
-    logErr(ctx, "melt_pending_recovery_check_failed", new Error("Fresh quote or change evidence validation failed"), { quote_id: op.quote });
-    return "check_failed";
+    logEvent(ctx, "melt_pending_change_custody", ctx.custody.status(op));
+  } catch (err) {
+    if (freshPayment(ctx, op, observed, err) !== "settled") {
+      logErr(ctx, "melt_pending_recovery_check_failed", new Error("Fresh quote or change evidence validation failed"), { quote_id: op.quote });
+      return "check_failed";
+    }
+    changeUnresolved = true;
   }
-  logEvent(ctx, "melt_pending_change_custody", ctx.custody.status(op));
   if (op.acknowledged) return "recovered";
   if (op.payment === "PENDING") return "mint_pending";
   if (op.payment === "UNPAID") return "mint_unpaid";
@@ -1044,6 +1089,7 @@ async function recoverOwned(ctx: CustodyContext, op: CustodyOperation): Promise<
   }
   op.acknowledged = true;
   ctx.custody.commit();
+  if (changeUnresolved) logChangeUnresolved(ctx, op);
   appendPostMelt({ dvm_id: op.dvm, row_ids: op.rows, quote_id: op.quote, status: "success", preimage: op.preimage });
   return "recovered";
 }

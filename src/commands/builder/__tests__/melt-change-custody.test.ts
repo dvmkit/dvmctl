@@ -452,12 +452,103 @@ describe("builder payout change at the command and private disk boundary", () =>
 
   it("does not classify excess input value as a routing fee above the reserve ceiling", async () => {
     mint.fixture.quoteAmounts = [];
-    await (await processObjects()).run().catch(error => expect(error).toMatchObject({ code: "batches_failed" }));
+    await expect((await processObjects()).run()).rejects.toMatchObject({ code: "batches_failed" });
     const { op, store } = await reopened();
     expect(op.complete).toBe(false);
     expect(store.status(op)).toMatchObject({ returned_change_amount: null, routing_fee_amount: null,
       change_recovery_status: "quarantined" });
     expect(mint.fixture.submitCount).toBe(1);
+    // Unreconciled change does not unspend the inputs: the paid rows must leave pending-batches.
+    expect(mocked.mark).toHaveBeenCalledExactlyOnceWith({ row_ids: ["row-1", "row-2", "row-3"],
+      melt_quote_id: "original-quote", payment_preimage: "receipt" });
+    expect(op.acknowledged).toBe(true);
+    const checks = mint.fixture.checkCount; const observations = op.observations.length;
+    await (await processObjects()).run(); await (await processObjects()).run();
+    expect(mocked.mark).toHaveBeenCalledTimes(1); expect(mint.fixture.submitCount).toBe(1);
+    // Terminal quarantine: later ticks neither query the mint nor grow the custody file.
+    expect(mint.fixture.checkCount).toBe(checks);
+    expect((await reopened()).op.observations).toHaveLength(observations);
+  });
+
+  it.each([
+    ["a PAID melt", (_op: Record<string, unknown>): void => undefined, MINT, "row-1", DVM, true],
+    ["the same mint written differently", (_op: Record<string, unknown>): void => undefined, `${MINT}/`, "row-2", DVM, true],
+    ["a PENDING melt", (op: Record<string, unknown>): void => { op.payment = "PENDING"; }, MINT, "row-1", DVM, false],
+    ["a quarantined UNPAID melt", (op: Record<string, unknown>): void => { op.payment = "UNPAID"; op.quarantine = true; }, MINT, "row-1", DVM, false],
+    ["an UNKNOWN melt", (op: Record<string, unknown>): void => { op.payment = "UNKNOWN"; }, MINT, "row-1", DVM, false],
+    ["a rejected submission", (op: Record<string, unknown>): void => { op.submission = "rejected"; }, MINT, "row-1", DVM, false],
+    ["a row outside the melt", (_op: Record<string, unknown>): void => undefined, MINT, "row-9", DVM, false],
+    ["another mint", (_op: Record<string, unknown>): void => undefined, "https://other-mint.invalid", "row-1", DVM, false],
+    ["another DVM", (_op: Record<string, unknown>): void => undefined, MINT, "row-1", "other-dvm", false],
+  ] as const)("counts spent inputs as explained only by a paid melt: %s", async (_case, alter, mintUrl, rowId, dvm, expected) => {
+    await (await processObjects()).run();
+    const { store, op } = await reopened();
+    expect(op.payment).toBe("PAID");
+    alter(op as unknown as Record<string, unknown>);
+    expect(store.spentByPaidMelt(dvm, mintUrl, rowId)).toBe(expected);
+  });
+
+  it("hands the drain service the custody check for melt-spent rows", async () => {
+    const seen: { isMeltedRow?: (mintUrl: string, rowId: string) => boolean }[] = [];
+    vi.doMock("../drain-service.ts", () => ({
+      serviceDrains: vi.fn(async (drainCtx: (typeof seen)[number]) => {
+        seen.push(drainCtx);
+        return { fetched: true, drains_seen: 0, drains_parked: 0, drains_jit_minted: 0, drains_failed: 0, drains_queued: 0,
+          drains_manual: 0, drains_channel: 0, recovered: 0, cashu_liability_sats_after: 0 };
+      }),
+    }));
+    try { await (await processObjects()).run(); }
+    finally { vi.doUnmock("../drain-service.ts"); }
+    expect(mocked.mark).toHaveBeenCalledOnce();
+    const check = seen[0]?.isMeltedRow;
+    expect(check).toBeTypeOf("function");
+    // Evaluated against the same tick's custody, which now holds the paid melt.
+    expect(check!(MINT, "row-1")).toBe(true);
+    expect(check!(MINT, "row-unrelated")).toBe(false);
+  });
+
+  it("acknowledges a paid melt on recovery even when its change stays quarantined", async () => {
+    mint.fixture.quoteAmounts = [];
+    mocked.mark.mockRejectedValueOnce(new Error("admin endpoint unavailable"));
+    await expect((await processObjects()).run()).rejects.toMatchObject({ code: "batches_failed" });
+    expect((await reopened()).op).toMatchObject({ payment: "PAID", acknowledged: false, quarantine: true });
+    expect(captured()).not.toContain("melt_pending_change_unresolved");
+    await (await processObjects()).run();
+    const { op } = await reopened();
+    expect(op.acknowledged).toBe(true);
+    expect(mocked.mark).toHaveBeenLastCalledWith({ row_ids: ["row-1", "row-2", "row-3"],
+      melt_quote_id: "original-quote", payment_preimage: "receipt" });
+    expect(mint.fixture.submitCount).toBe(1);
+    expect(captured()).not.toContain("melt_pending_recovery_check_failed");
+    expect(captured()).toContain("melt_pending_change_unresolved");
+  });
+
+  it.each(["a different preimage", "no answer"])("does not acknowledge on recovery when the fresh quote gives %s", async variant => {
+    mint.fixture.quoteAmounts = [];
+    mocked.mark.mockRejectedValueOnce(new Error("admin endpoint unavailable"));
+    await expect((await processObjects()).run()).rejects.toMatchObject({ code: "batches_failed" });
+    if (variant === "no answer") mint.fixture.onCheck = async () => { throw new Error("mint unreachable"); };
+    else mint.fixture.alterQuote = quote => ({ ...quote, payment_preimage: "another-receipt" });
+    await (await processObjects()).run().catch(() => undefined);
+    expect((await reopened()).op.acknowledged).toBe(false);
+    expect(mocked.mark).toHaveBeenCalledTimes(1);
+    expect(captured()).toContain("melt_pending_recovery_check_failed");
+    if (variant !== "no answer") expect(captured()).toContain("melt_pending_fresh_quote_contradicts");
+  });
+
+  it("keeps a failed held-change refresh on an acknowledged melt at error level", async () => {
+    const states = vi.spyOn(mint.wallet, "checkProofsStates").mockRejectedValueOnce(new Error("checkstate unavailable"));
+    await (await processObjects()).run();
+    const first = await reopened();
+    expect(first.op).toMatchObject({ acknowledged: true, complete: true });
+    expect(first.records.every(r => r.state === "held")).toBe(true);
+    states.mockRestore();
+    vi.mocked(console.error).mockClear();
+    mocked.wallet.mockRejectedValueOnce(new Error("wallet metadata unavailable"));
+    await (await processObjects()).run().catch(() => undefined);
+    const errors = vi.mocked(console.error).mock.calls.flat().join("\n");
+    expect(errors).toContain("melt_pending_recovery_check_failed");
+    expect((await reopened()).op.acknowledged).toBe(true);
   });
 
   it.each(["bad DLEQ", "too many", "foreign keyset", "bad point"])("never credits %s signature evidence", async defect => {

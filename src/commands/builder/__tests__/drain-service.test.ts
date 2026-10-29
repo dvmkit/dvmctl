@@ -6,7 +6,7 @@
  * worklist versus the channel's own close. Cashu is the only rail this job
  * settles — direct Lightning payout is unsupported.
  */
-import { Amount, getDecodedToken, getEncodedToken, type Token } from "@cashu/cashu-ts";
+import { Amount, getDecodedToken, getEncodedToken, hashToCurve, type Token } from "@cashu/cashu-ts";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../../lib/drain-park-log", () => ({
@@ -1157,6 +1157,85 @@ describe("serviceDrains — just-in-time mint", () => {
     const line = logs.find((l) => l.includes("drain_jit_unconfigured"));
     expect(line).toBeDefined();
     expect(String(JSON.parse(line ?? "{}").hint)).toContain("--refund-nwc");
+  });
+
+  /** An accumulator batch whose proofs the mint reports SPENT under NUT-07. */
+  function spentBatchCtx(swapError: Error, isMeltedRow: DrainServiceContext["isMeltedRow"] = () => true) {
+    const { wallet: swapWallet, run } = opsWallet(vi.fn().mockRejectedValue(swapError));
+    const jit = jitCtx({ isMeltedRow });
+    const checkProofsStates = vi.fn(async (proofs: { secret: string }[]) =>
+      proofs.map((p) => ({
+        Y: hashToCurve(new TextEncoder().encode(p.secret)).toHex(true),
+        state: "SPENT",
+        witness: null,
+      }))
+    );
+    Object.assign(jit.wallet, swapWallet as object, { checkProofsStates });
+    jit.client.getPendingBatches.mockResolvedValue({ batches: [batch()] });
+    return { ...jit, run };
+  }
+
+  const alreadySpent = () =>
+    Object.assign(new Error("proofs already spent"), {
+      name: "MintOperationError",
+      status: 400,
+      code: 11001,
+    });
+
+  it("buys the refund in the same tick when the mint rejects a swap of already-spent proofs", async () => {
+    const isMeltedRow = vi.fn(() => true);
+    const { ctx, client, run, payInvoice } = spentBatchCtx(alreadySpent(), isMeltedRow);
+    const summary = await serviceDrains(ctx);
+
+    expect(run).toHaveBeenCalledOnce();
+    expect(isMeltedRow).toHaveBeenCalledWith("https://mint.example.com", "r1");
+    expect(summary).toMatchObject({
+      drains_parked: 1,
+      drains_jit_minted: 1,
+      drains_failed: 0,
+      cashu_liability_sats_after: 0,
+    });
+    expect(payInvoice).toHaveBeenCalledOnce();
+    expect(client.parkDrain).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        consumed_row_ids: [],
+        mint_evidence: expect.objectContaining({ source: "jit_mint", quote_id: QUOTE_ID }),
+      })
+    );
+  });
+
+  // Each of these may follow a swap that landed, so the inputs reading spent
+  // proves nothing about who spent them.
+  it.each([
+    ["a transport failure", new Error("fetch failed")],
+    ["a gateway timeout", Object.assign(new Error("Gateway Timeout"), { name: "HttpResponseError", status: 504 })],
+    ["a 4xx that is not already-spent", Object.assign(new Error("Not Found"), { name: "HttpResponseError", status: 404 })],
+    [
+      "another mint error code",
+      Object.assign(new Error("keyset inactive"), { name: "MintOperationError", status: 400, code: 12002 }),
+    ],
+  ])("does not buy a refund after %s, even if its inputs read spent", async (_case, err) => {
+    const { ctx, client, payInvoice } = spentBatchCtx(err);
+    const summary = await serviceDrains(ctx);
+
+    expect(summary).toMatchObject({ drains_parked: 0, drains_failed: 1 });
+    expect(payInvoice).not.toHaveBeenCalled();
+    expect(client.parkDrain).not.toHaveBeenCalled();
+  });
+
+  it("alarms instead of buying when no recorded payout melt explains the spent inputs", async () => {
+    // e.g. an earlier swap for this drain that landed but lost its response.
+    const errors: string[] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((line: string) => void errors.push(line));
+    const { ctx, client, payInvoice } = spentBatchCtx(alreadySpent(), (_mint, rowId) => rowId === "r1");
+    const summary = await serviceDrains(ctx);
+    spy.mockRestore();
+
+    expect(summary).toMatchObject({ drains_parked: 0, drains_jit_minted: 0, drains_failed: 1 });
+    expect(payInvoice).not.toHaveBeenCalled();
+    expect(client.parkDrain).not.toHaveBeenCalled();
+    const alarm = errors.map((l) => JSON.parse(l)).find((l) => l.level === "drain_swap_inputs_spent_unexplained");
+    expect(alarm).toMatchObject({ drain_id: "d1", unexplained_row_ids: ["r2"] });
   });
 
   it("skips a mint that will not quote, naming its own error, and queues when none will", async () => {
