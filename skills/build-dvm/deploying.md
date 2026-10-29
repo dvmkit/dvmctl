@@ -27,6 +27,8 @@ Read [payments and payouts](https://dvmkit.com/docs/builder-payments.md) and the
 
 Run project checks, `dvmctl validate`, and `dvmctl doctor`. Preview with `dvmctl deploy --dry-run`; a container preview requires Docker. Resolve failures before a real submission. Do not bypass a dirty-source refusal without an explicit reason and authorization for the exact source being deployed.
 
+A Cloud deployment uploads the DVM folder and nothing above it. When the Dockerfile needs a containing folder, such as a workspace root that holds the lockfile, name that folder in `package.json` as `dvmkit.buildContext` (relative to the DVM folder, for example `"../.."`) or pass `--context`; the folder must contain the DVM folder and stay inside the repository. A DVM without its own lockfile under a repository folder that has one is refused until the context is named. Credential stores such as `.ssh` and `.dvmkit` are never uploaded. Both deploy and dry-run JSON report the uploaded folder as `context_root` and the Dockerfile as `dockerfile`.
+
 For Cloud, supply secret values through a secret manager into `dvmctl deploy --env-stdin` as the documented JSON string map. This option is Cloud-only and is not accepted by dry-run. Do not put secrets in command arguments, source, or logs. Inspect `.env` as an input boundary without printing its values: Cloud deployment reads it too.
 
 Submit the authorized deployment once and retain its deployment ID. For an ambiguous response, inspect `dvmctl deploy-status <id>` and the service before retrying; use [recovery](recovery.md) when the result remains unknown.

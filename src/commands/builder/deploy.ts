@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 
 import { deriveBuilderLockKeypair, DvmError, loadIdentitySecret } from "@dvmkit/sdk/internal";
@@ -36,11 +36,11 @@ import {
 import { DIRTY_SUFFIX, shortSha, splitDirtySha } from "../../shared/git-sha.ts";
 import { info, json, progress } from "../../shared/output.ts";
 import { dockerfileTemplate } from "./create/templates/shared.ts";
-import { createTarball, packagedTreeDirtyPaths } from "./deploy-context.ts";
+import { createTarball, packagedTreeDirtyPaths, resolveBuildContext } from "./deploy-context.ts";
 import { identityCreate } from "./identity.ts";
 import { validateManifest } from "./validate.ts";
 
-export { createTarball, TARBALL_EXCLUDES } from "./deploy-context.ts";
+export { createTarball, resolveBuildContext, TARBALL_EXCLUDES } from "./deploy-context.ts";
 
 export interface DeployOptions {
   target?: "cloud" | "self-host" | "local";
@@ -65,6 +65,8 @@ export interface DeployOptions {
   createIdentity?: boolean;
   /** Allow a cloud image to be built from packaged files that differ from HEAD. */
   allowDirty?: boolean;
+  /** Build context folder relative to the DVM folder, which it must contain. Overrides `package.json#dvmkit.buildContext`. */
+  context?: string;
   /** Read a bounded JSON string map from stdin before any deploy work. */
   envStdin?: boolean;
   /** Extra env vars merged on top of .env. */
@@ -424,7 +426,7 @@ async function deployCloud(cwd: string, opts: DeployOptions): Promise<void> {
   }
   const name = readDvmName(cwd) ?? slug;
   const env = { ...loadProjectEnvironment(cwd), ...(opts.extraEnv ?? {}) };
-  const contextRoot = findContextRoot(cwd);
+  const { contextRoot, dockerfilePath } = resolveBuildContext(cwd, opts.context);
   const dirtyPaths = packagedTreeDirtyPaths(contextRoot);
   if (dirtyPaths.length > 0 && !opts.allowDirty) {
     throw new DvmError(
@@ -435,8 +437,6 @@ async function deployCloud(cwd: string, opts: DeployOptions): Promise<void> {
     );
   }
   const tarball = createTarball(contextRoot);
-  const dockerfilePath =
-    contextRoot === cwd ? undefined : relative(contextRoot, resolve(cwd, "Dockerfile"));
   // Dirtiness is measured against contextRoot, not cwd: the tarball is rooted
   // there, so that's the tree the baked sha is actually claiming.
   const commit = readGitHead(cwd, contextRoot);
@@ -459,9 +459,7 @@ async function deployCloud(cwd: string, opts: DeployOptions): Promise<void> {
         info(`  Note: uncommitted changes in ${contextRoot} — image will report a -dirty sha`);
       }
     }
-    if (dockerfilePath) {
-      info(`  build context ${contextRoot} (Dockerfile: ${dockerfilePath})`);
-    }
+    info(`  build context ${contextRoot}${runtime === "container" ? ` (Dockerfile: ${dockerfilePath})` : ""}`);
     if (vmConfig) {
       const mem = vmConfig.memoryMb != null ? `${vmConfig.memoryMb} MB` : "(default)";
       const cpus = vmConfig.cpuCount ?? 1;
@@ -526,7 +524,7 @@ async function deployCloud(cwd: string, opts: DeployOptions): Promise<void> {
     vmConfig: vmConfig ?? undefined,
     inheritSecrets: inheritSecrets.length > 0 ? inheritSecrets : undefined,
     features: Object.keys(features).length > 0 ? features : undefined,
-    dockerfilePath,
+    dockerfilePath: dockerfilePath === "Dockerfile" ? undefined : dockerfilePath,
     orgHandle: activeOrg ?? undefined,
     lockPubkey: preComputedLockPubkey,
     // First deploy with a mnemonic: no `dvms` row yet, so we can't precompute
@@ -658,6 +656,8 @@ async function deployCloud(cwd: string, opts: DeployOptions): Promise<void> {
       dvmkitUrl: result.dvmkitUrl,
       slug,
       dvmId,
+      context_root: contextRoot,
+      dockerfile: runtime === "container" ? dockerfilePath : undefined,
       ...(verificationHint
         ? {
             outcome: "partial_success",
@@ -792,14 +792,19 @@ function deployDryRun(cwd: string, opts: DeployOptions): void {
 
   let dockerBuilt = false;
   let dockerfilePath: string | undefined;
-  if (!isConnect && runtime === "container") {
-    if (!hasDockerfile) throw missingDockerfileError();
-    const contextRoot = findContextRoot(cwd);
-    const buildDockerfilePath =
-      contextRoot === cwd ? "Dockerfile" : relative(contextRoot, resolve(cwd, "Dockerfile"));
-    dockerfilePath = buildDockerfilePath;
+  let contextRoot: string | undefined;
+  if (!isConnect) {
+    if (runtime === "container" && !hasDockerfile) throw missingDockerfileError();
+    // Every non-connect deploy uploads the context, so the isolate runtime reports it too.
+    const context = resolveBuildContext(cwd, opts.context);
+    contextRoot = context.contextRoot;
+    if (runtime === "container") dockerfilePath = context.dockerfilePath;
+  }
+  if (contextRoot && dockerfilePath) {
+    const buildDockerfilePath = dockerfilePath;
+    const buildRoot = contextRoot;
     try {
-      withDeployBuildContext(contextRoot, (buildContext) => {
+      withDeployBuildContext(buildRoot, (buildContext) => {
         execFileSync(
           "docker",
           ["build", "-q", "-f", resolve(buildContext, buildDockerfilePath), buildContext],
@@ -831,6 +836,7 @@ function deployDryRun(cwd: string, opts: DeployOptions): void {
     if (inheritSecrets.length > 0) {
       info(`  inheritSecrets ${inheritSecrets.length} pattern(s)`);
     }
+    if (contextRoot) info(`  build context ${contextRoot}`);
     if (dockerBuilt) info(`  docker build ok (${dockerfilePath ?? "Dockerfile"})`);
   } else {
     json({
@@ -840,6 +846,7 @@ function deployDryRun(cwd: string, opts: DeployOptions): void {
       runtime: isConnect ? "connect" : runtime,
       docker_built: dockerBuilt,
       dockerfile: dockerfilePath,
+      context_root: contextRoot,
       vm_config: vmConfig,
       inherit_secrets: inheritSecrets.length > 0 ? inheritSecrets : undefined,
     });
@@ -987,26 +994,6 @@ function missingDockerfileError(): DvmError {
 
 function readDvmName(cwd: string): string | null {
   return readPackageJson(cwd)?.name ?? null;
-}
-
-/**
- * Walk parents from `cwd` looking for a `package-lock.json` marker.
- * Returns the first matching directory, or `cwd` if none is found.
- *
- * Used to detect monorepo-style DVMs whose Dockerfile expects the repo root
- * as build context. When the marker lives above `cwd`, we tar from there and
- * pass an explicit `dockerfilePath` to the platform.
- */
-export function findContextRoot(cwd: string): string {
-  let dir = cwd;
-  let parent = dirname(dir);
-  while (parent !== dir) {
-    if (existsSync(resolve(dir, "package-lock.json"))) return dir;
-    dir = parent;
-    parent = dirname(dir);
-  }
-  if (existsSync(resolve(dir, "package-lock.json"))) return dir;
-  return cwd;
 }
 
 /**

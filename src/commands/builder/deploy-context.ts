@@ -1,9 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { closeSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { DvmError } from "@dvmkit/sdk/internal";
+
+import { readPackageJson } from "../../lib/deploy-attestation.ts";
 
 /** Extra exclusions apply even to tracked files, at any depth. */
 export const TARBALL_EXCLUDES = [
@@ -12,7 +14,95 @@ export const TARBALL_EXCLUDES = [
   // Verification logs, screenshot baselines, and agent state are not image inputs.
   ".verify-logs",
   "*.spec.*-snapshots", "*.test.*-snapshots", ".claude", ".codex",
+  // Credential stores never belong in an image, however wide the context is.
+  ".ssh", ".aws", ".dvm", ".dvmkit", ".dvmctl",
 ] as const;
+
+/** Markers that a folder installs its own dependencies, across package managers. */
+const LOCKFILES = ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"];
+
+export interface BuildContext {
+  /** Absolute folder uploaded for the remote build. */
+  contextRoot: string;
+  /** Dockerfile location relative to `contextRoot`, posix-separated. */
+  dockerfilePath: string;
+}
+
+function toPosix(path: string): string {
+  return path.split(sep).join("/");
+}
+
+function gitTopLevel(cwd: string): string | null {
+  try {
+    const top = git(cwd, ["rev-parse", "--show-toplevel"]).trim();
+    return top ? realpathSync(top) : null;
+  } catch {
+    return null;
+  }
+}
+
+function contains(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return !isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`);
+}
+
+function configuredBuildContext(cwd: string, override: string | undefined): { value: string; source: string } | null {
+  if (override !== undefined) return { value: override, source: "--context" };
+  const dvmkit = readPackageJson(cwd)?.dvmkit;
+  if (dvmkit == null || typeof dvmkit !== "object") return null;
+  const raw = (dvmkit as { buildContext?: unknown }).buildContext;
+  if (raw === undefined) return null;
+  if (typeof raw !== "string") {
+    throw new DvmError("invalid_build_context",
+      "`package.json#dvmkit.buildContext` must be a folder path relative to the DVM folder.",
+      "Set `dvmkit.buildContext` to a string such as \"..\" or remove it to upload the DVM folder alone.");
+  }
+  return { value: raw, source: "package.json#dvmkit.buildContext" };
+}
+
+/**
+ * Decide which folder a deploy uploads. The DVM folder itself unless `--context` or
+ * `package.json#dvmkit.buildContext` names a folder that contains it; never a guess.
+ * A lockfile-less DVM under a repository folder that has one is refused rather than
+ * silently widened, because that layout is where the whole parent used to ship.
+ */
+export function resolveBuildContext(cwd: string, override?: string): BuildContext {
+  const dvmDir = realpathSync(cwd);
+  const topLevel = gitTopLevel(dvmDir);
+  const configured = configuredBuildContext(cwd, override);
+  if (configured === null) {
+    if (topLevel !== null && !LOCKFILES.some((name) => existsSync(join(dvmDir, name)))) {
+      for (let dir = dirname(dvmDir); contains(topLevel, dir); dir = dirname(dir)) {
+        const lockfile = LOCKFILES.find((name) => existsSync(join(dir, name)));
+        if (lockfile) {
+          throw new DvmError("build_context_required",
+            `The DVM folder has no lockfile, but ${join(dir, lockfile)} is in the same repository. Only the DVM folder is uploaded unless a wider build context is named explicitly.`,
+            `Set \`dvmkit.buildContext\` in package.json (or pass --context) to "${toPosix(relative(dvmDir, dir))}" to upload that folder, or add the DVM's own lockfile to build it alone.`,
+            { dvm_dir: dvmDir, lockfile_dir: dir });
+        }
+        if (dir === topLevel) break;
+      }
+    }
+    return { contextRoot: dvmDir, dockerfilePath: "Dockerfile" };
+  }
+  const refuse = (reason: string): DvmError => new DvmError("invalid_build_context",
+    `Invalid build context ${JSON.stringify(configured.value)} from ${configured.source}: ${reason}`,
+    "Name a folder relative to the DVM folder that contains it, such as \"..\" or \"../..\", or remove the setting to upload the DVM folder alone.",
+    { value: configured.value, source: configured.source });
+  if (configured.value.trim() === "" || isAbsolute(configured.value)) throw refuse("expected a non-empty relative path.");
+  const candidate = resolve(dvmDir, configured.value);
+  let contextRoot: string;
+  try {
+    contextRoot = realpathSync(candidate);
+    if (!statSync(contextRoot).isDirectory()) throw refuse("not a folder.");
+  } catch (error) {
+    if (error instanceof DvmError) throw error;
+    throw refuse("the folder does not exist.");
+  }
+  if (!contains(contextRoot, dvmDir)) throw refuse("the build context must contain the DVM folder.");
+  if (topLevel !== null && !contains(topLevel, contextRoot)) throw refuse(`the build context must stay inside the repository at ${topLevel}.`);
+  return { contextRoot, dockerfilePath: toPosix(relative(contextRoot, join(dvmDir, "Dockerfile"))) };
+}
 
 const MAX_ARCHIVE_BYTES = 50 * 1024 * 1024;
 
