@@ -6,7 +6,7 @@
  * worklist versus the channel's own close. Cashu is the only rail this job
  * settles — direct Lightning payout is unsupported.
  */
-import { Amount, getDecodedToken, getEncodedToken, type Token } from "@cashu/cashu-ts";
+import { Amount, getDecodedToken, getEncodedToken, hashToCurve, type Token } from "@cashu/cashu-ts";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../../lib/drain-park-log", () => ({
@@ -1157,6 +1157,57 @@ describe("serviceDrains — just-in-time mint", () => {
     const line = logs.find((l) => l.includes("drain_jit_unconfigured"));
     expect(line).toBeDefined();
     expect(String(JSON.parse(line ?? "{}").hint)).toContain("--refund-nwc");
+  });
+
+  /** An accumulator batch whose proofs the mint reports SPENT under NUT-07. */
+  function spentBatchCtx(swapError: Error) {
+    const { wallet: swapWallet, run } = opsWallet(vi.fn().mockRejectedValue(swapError));
+    const jit = jitCtx();
+    const checkProofsStates = vi.fn(async (proofs: { secret: string }[]) =>
+      proofs.map((p) => ({
+        Y: hashToCurve(new TextEncoder().encode(p.secret)).toHex(true),
+        state: "SPENT",
+        witness: null,
+      }))
+    );
+    Object.assign(jit.wallet, swapWallet as object, { checkProofsStates });
+    jit.client.getPendingBatches.mockResolvedValue({ batches: [batch()] });
+    return { ...jit, run };
+  }
+
+  it("buys the refund in the same tick when the mint rejects a swap of already-spent proofs", async () => {
+    const rejection = Object.assign(new Error("proofs already spent"), {
+      name: "MintOperationError",
+      status: 400,
+      code: 11001,
+    });
+    const { ctx, client, run, payInvoice } = spentBatchCtx(rejection);
+    const summary = await serviceDrains(ctx);
+
+    expect(run).toHaveBeenCalledOnce();
+    expect(summary).toMatchObject({
+      drains_parked: 1,
+      drains_jit_minted: 1,
+      drains_failed: 0,
+      cashu_liability_sats_after: 0,
+    });
+    expect(payInvoice).toHaveBeenCalledOnce();
+    expect(client.parkDrain).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        consumed_row_ids: [],
+        mint_evidence: expect.objectContaining({ source: "jit_mint", quote_id: QUOTE_ID }),
+      })
+    );
+  });
+
+  it("does not buy a second refund when a swap failed in transit, even if its inputs read spent", async () => {
+    // A lost response may mean this very swap spent the inputs.
+    const { ctx, client, payInvoice } = spentBatchCtx(new Error("fetch failed"));
+    const summary = await serviceDrains(ctx);
+
+    expect(summary).toMatchObject({ drains_parked: 0, drains_failed: 1 });
+    expect(payInvoice).not.toHaveBeenCalled();
+    expect(client.parkDrain).not.toHaveBeenCalled();
   });
 
   it("skips a mint that will not quote, naming its own error, and queues when none will", async () => {

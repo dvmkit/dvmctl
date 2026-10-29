@@ -848,13 +848,19 @@ async function meltBatch(
     });
   }
   let meltResult: { state: string; preimage: string | null };
+  let changeUnresolved = false;
   try {
     const state = await recoverCustody(ctx.custody, op, wallet);
     meltResult = { state, preimage: op.preimage ?? null };
     logEvent(ctx, "melt_pending_change_custody", ctx.custody.status(op));
-  } catch {
-    logErr(ctx, "melt_pending_recovery_check_failed", new Error("Fresh quote validation failed"), { quote_id: op.quote });
-    return "failed";
+  } catch (err) {
+    if (!paymentSettled(op, err)) {
+      logErr(ctx, "melt_pending_recovery_check_failed", new Error("Fresh quote validation failed"), { quote_id: op.quote });
+      return "failed";
+    }
+    logChangeUnresolved(ctx, op);
+    changeUnresolved = true;
+    meltResult = { state: op.payment, preimage: op.preimage ?? null };
   }
   if (meltResult.state === "PENDING") {
     if (submissionError) return "failed";
@@ -918,7 +924,27 @@ async function meltBatch(
     total_sats: batch.total_sats,
     quote_id: quote.rawQuote.quote,
   });
-  return "melted";
+  // The payout landed, but its change did not reconcile: keep the run's alarm.
+  return changeUnresolved ? "failed" : "melted";
+}
+
+/**
+ * A PAID quote with a preimage is final, and `recoverCustody` records both from
+ * a validated same-quote GET before it touches change. A change-custody failure
+ * after that point does not unspend the inputs, so the rows must still be
+ * acknowledged; otherwise they stay in pending-batches and a refund swap picks
+ * proofs the mint has already spent. An uncommitted custody write is the one
+ * failure where the recorded payment may not be durable.
+ */
+function paymentSettled(op: CustodyOperation, err: unknown): boolean {
+  if (err instanceof DvmError && err.code === "melt_custody_io") return false;
+  return op.payment === "PAID" && !!op.preimage;
+}
+
+function logChangeUnresolved(ctx: CustodyContext, op: CustodyOperation): void {
+  logErr(ctx, "melt_pending_change_unresolved",
+    new Error("Payment settled but its change could not be reconciled"),
+    { ...ctx.custody.status(op), hint: "The payout is paid and its rows are acknowledged. This melt's change did not reconcile with the mint's answer, so it stays quarantined in melt-custody.json for inspection." });
 }
 
 /** Only explicit final submission rejections prove this request cannot later pay. */
@@ -1025,11 +1051,15 @@ async function recoverOwned(ctx: CustodyContext, op: CustodyOperation): Promise<
     const needsSignatures = ctx.custody.records(op).some(proof => proof.state === "held" && proof.verification === "unverified");
     if (op.payment === "PAID" && op.complete && op.preimage && !needsSignatures) await ctx.custody.refreshHeld(op, wallet);
     else await recoverCustody(ctx.custody, op, wallet);
-  } catch {
-    logErr(ctx, "melt_pending_recovery_check_failed", new Error("Fresh quote or change evidence validation failed"), { quote_id: op.quote });
-    return "check_failed";
+    logEvent(ctx, "melt_pending_change_custody", ctx.custody.status(op));
+  } catch (err) {
+    if (!paymentSettled(op, err)) {
+      logErr(ctx, "melt_pending_recovery_check_failed", new Error("Fresh quote or change evidence validation failed"), { quote_id: op.quote });
+      return "check_failed";
+    }
+    if (op.acknowledged) logEvent(ctx, "melt_pending_change_custody", ctx.custody.status(op));
+    else logChangeUnresolved(ctx, op);
   }
-  logEvent(ctx, "melt_pending_change_custody", ctx.custody.status(op));
   if (op.acknowledged) return "recovered";
   if (op.payment === "PENDING") return "mint_pending";
   if (op.payment === "UNPAID") return "mint_unpaid";

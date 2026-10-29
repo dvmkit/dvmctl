@@ -3,6 +3,7 @@ import type { MintQuoteBolt11Response } from "@cashu/cashu-ts";
 import {
   Amount,
   getEncodedToken,
+  hashToCurve,
   MintQuoteState,
   type Proof,
   type ProofLike,
@@ -452,7 +453,20 @@ async function parkOne(
       error: err instanceof Error ? err.message : String(err),
       ...(recoveryDiagnostic ? { recovery: recoveryDiagnostic } : {}),
     });
-    return "failed";
+    const spentRowIds = mintRejected(err) ? await spentRows(wallet, batch, inputProofs) : [];
+    if (spentRowIds.length === 0) return "failed";
+    // The accumulator still lists proofs the mint has spent, usually because a
+    // payout melt took them before its rows were acknowledged. Retrying the
+    // swap can never succeed, so buy the refund instead. The melt's recovery
+    // pass, which holds the quote and preimage mark-melted requires, retires
+    // these rows.
+    logDrain(ctx, "drain_swap_inputs_spent", {
+      credit_id: drain.credit_id,
+      drain_id: drain.drain_id,
+      mint_url: batch.mint_url,
+      spent_row_ids: spentRowIds,
+    });
+    return jitMintOne(ctx, drain, amountSats, refundPubkey, mints);
   }
 
   // `keep` is not all change: cashu-ts returns the inputs it never had to
@@ -1358,6 +1372,33 @@ async function selectCoveringBatch(
     hint: `No single accumulator batch covers this refund yet. ${nextStep || "It parks automatically once enough value accumulates on one lock key at one mint; to intervene, fund the DVM or settle manually."}`,
   });
   return undefined;
+}
+
+/**
+ * A 4xx answer is the mint refusing the swap, which is atomic, so nothing was
+ * spent by this attempt. A transport failure is ambiguous: the swap may have
+ * spent these inputs itself, so it never qualifies. Matched by shape because
+ * the SDK wallet may carry its own cashu-ts copy.
+ */
+function mintRejected(err: unknown): boolean {
+  return err instanceof Error &&
+    (err.name === "MintOperationError" || err.name === "HttpResponseError") &&
+    "status" in err && typeof err.status === "number" && err.status >= 400 && err.status < 500;
+}
+
+/** NUT-07 rows the mint reports SPENT; an unanswered or mismatched check reports none. */
+async function spentRows(wallet: Wallet, batch: AdminBatch, inputProofs: ProofLike[]): Promise<string[]> {
+  let states: Awaited<ReturnType<Wallet["checkProofsStates"]>>;
+  try {
+    states = await wallet.checkProofsStates(inputProofs);
+  } catch {
+    return [];
+  }
+  if (states.length !== inputProofs.length) return [];
+  return batch.row_ids.filter((_, i) => {
+    const Y = hashToCurve(new TextEncoder().encode(inputProofs[i].secret)).toHex(true);
+    return states[i]?.Y === Y && states[i].state === "SPENT";
+  });
 }
 
 /** 404 from the drain admin routes — the DVM predates tracked change. */

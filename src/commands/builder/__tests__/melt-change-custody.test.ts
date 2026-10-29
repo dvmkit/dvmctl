@@ -452,12 +452,32 @@ describe("builder payout change at the command and private disk boundary", () =>
 
   it("does not classify excess input value as a routing fee above the reserve ceiling", async () => {
     mint.fixture.quoteAmounts = [];
-    await (await processObjects()).run().catch(error => expect(error).toMatchObject({ code: "batches_failed" }));
+    await expect((await processObjects()).run()).rejects.toMatchObject({ code: "batches_failed" });
     const { op, store } = await reopened();
     expect(op.complete).toBe(false);
     expect(store.status(op)).toMatchObject({ returned_change_amount: null, routing_fee_amount: null,
       change_recovery_status: "quarantined" });
     expect(mint.fixture.submitCount).toBe(1);
+    // Unreconciled change does not unspend the inputs: the paid rows must leave pending-batches.
+    expect(mocked.mark).toHaveBeenCalledExactlyOnceWith({ row_ids: ["row-1", "row-2", "row-3"],
+      melt_quote_id: "original-quote", payment_preimage: "receipt" });
+    expect(op.acknowledged).toBe(true);
+    await (await processObjects()).run();
+    expect(mocked.mark).toHaveBeenCalledTimes(1); expect(mint.fixture.submitCount).toBe(1);
+  });
+
+  it("acknowledges a paid melt on recovery even when its change stays quarantined", async () => {
+    mint.fixture.quoteAmounts = [];
+    mocked.mark.mockRejectedValueOnce(new Error("admin endpoint unavailable"));
+    await expect((await processObjects()).run()).rejects.toMatchObject({ code: "batches_failed" });
+    expect((await reopened()).op).toMatchObject({ payment: "PAID", acknowledged: false, quarantine: true });
+    await (await processObjects()).run();
+    const { op } = await reopened();
+    expect(op.acknowledged).toBe(true);
+    expect(mocked.mark).toHaveBeenLastCalledWith({ row_ids: ["row-1", "row-2", "row-3"],
+      melt_quote_id: "original-quote", payment_preimage: "receipt" });
+    expect(mint.fixture.submitCount).toBe(1);
+    expect(captured()).not.toContain("melt_pending_recovery_check_failed");
   });
 
   it.each(["bad DLEQ", "too many", "foreign keyset", "bad point"])("never credits %s signature evidence", async defect => {
