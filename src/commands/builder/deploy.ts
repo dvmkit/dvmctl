@@ -6,7 +6,7 @@ import { createInterface } from "node:readline";
 
 import { deriveBuilderLockKeypair, DvmError, loadIdentitySecret } from "@dvmkit/sdk/internal";
 
-import { readBuilderMnemonic } from "../../lib/builder-mnemonic.ts";
+import { getBuilderMnemonicMigrationHint, readBuilderMnemonic } from "../../lib/builder-mnemonic.ts";
 import { feedbackHumanHint } from "../../lib/builder-feedback-nudges.ts";
 import {
   attestationEnv,
@@ -480,6 +480,11 @@ async function deployCloud(cwd: string, opts: DeployOptions): Promise<void> {
   // entry yet) we register it via a follow-up PUT once the platform has
   // handed us the dvmId.
   const mnemonic = readBuilderMnemonic();
+  const mnemonicHint = mnemonic ? null : getBuilderMnemonicMigrationHint();
+  if (mnemonicHint) {
+    if (opts.human) info(`  ${mnemonicHint}`);
+    else progress({ event: "warning", code: "legacy_builder_mnemonic", hint: mnemonicHint });
+  }
   const scopedDvms = mnemonic
     ? await platformClient.listDvms(platformUrl, creds.token, {
         ...(activeOrg ? { org: activeOrg } : {}),
@@ -657,6 +662,7 @@ async function deployCloud(cwd: string, opts: DeployOptions): Promise<void> {
       slug,
       dvmId,
       context_root: contextRoot,
+      ...(mnemonicHint ? { mnemonic_hint: mnemonicHint } : {}),
       dockerfile: runtime === "container" ? dockerfilePath : undefined,
       ...(verificationHint
         ? {

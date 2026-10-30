@@ -15,6 +15,7 @@ import { wordlist } from "@scure/bip39/wordlists/english.js";
 
 import {
   BUILDER_CONFIG_DIR,
+  BUILDER_CONFIG_DIR_EXPLICIT,
   BUILDER_MNEMONIC_FILE,
   LEGACY_BUILDER_MNEMONIC_FILE,
   RECOVERY_MNEMONIC_FILE,
@@ -43,16 +44,17 @@ export function isValidMnemonic(mnemonic: string): boolean {
  * Read the builder's BIP-39 mnemonic from `~/.dvmkit/builder.mnemonic`.
  * Auto-migrates the former `~/.dvmkit/recovery.mnemonic` name, or the older
  * pre-state-split `~/.dvm/recovery.mnemonic`, when the current path is absent.
- * Migration removes its source after the 0600 copy is in place, so a second
- * read is a no-op. Returns null when every location is absent.
+ * Migration is disabled when DVMKIT_CONFIG_DIR is explicitly set, even to the
+ * default directory. Otherwise it removes its source after the 0600 copy is
+ * in place, so a second read is a no-op. Returns null when no current or
+ * eligible legacy mnemonic exists.
  */
 export function readBuilderMnemonic(): string | null {
   if (existsSync(BUILDER_MNEMONIC_FILE)) {
     return readFileSync(BUILDER_MNEMONIC_FILE, "utf-8").trim();
   }
-  const legacyFile = [LEGACY_BUILDER_MNEMONIC_FILE, RECOVERY_MNEMONIC_FILE].find((path) =>
-    existsSync(path)
-  );
+  if (BUILDER_CONFIG_DIR_EXPLICIT) return null;
+  const legacyFile = findLegacyMnemonic();
   if (legacyFile) {
     mkdirSync(BUILDER_CONFIG_DIR, { recursive: true, mode: 0o700 });
     const tmp = `${BUILDER_MNEMONIC_FILE}.tmp`;
@@ -76,6 +78,19 @@ export function readBuilderMnemonic(): string | null {
   return null;
 }
 
+function findLegacyMnemonic(): string | undefined {
+  return [LEGACY_BUILDER_MNEMONIC_FILE, RECOVERY_MNEMONIC_FILE].find((path) => existsSync(path));
+}
+
+/** Explain a skipped migration without reading or exposing the recovery words. */
+export function getBuilderMnemonicMigrationHint(): string | null {
+  if (!BUILDER_CONFIG_DIR_EXPLICIT || existsSync(BUILDER_MNEMONIC_FILE)) return null;
+  const legacyFile = findLegacyMnemonic();
+  return legacyFile
+    ? `Legacy recovery mnemonic found at ${legacyFile}; it was left untouched because DVMKIT_CONFIG_DIR explicitly selects ${BUILDER_CONFIG_DIR}. To reuse those words in this tree, run \`dvmctl lock create --import <words>\` in a private terminal. DVMCTL_CONFIG_DIR controls authentication separately.`
+    : null;
+}
+
 /**
  * Write the builder's BIP-39 mnemonic to `~/.dvmkit/builder.mnemonic` (mode 0600).
  * Atomic tmp+rename so a crash mid-write never leaves a truncated file — a torn
@@ -83,10 +98,10 @@ export function readBuilderMnemonic(): string | null {
  *
  * Refuses to replace an existing mnemonic unless `force` is passed, so the
  * decision to destroy a derivation root is explicit and greppable at the call
- * site (tracked change; same shape as `writeIdentity`). "Existing" includes the
- * legacy `~/.dvmkit/recovery.mnemonic` and `~/.dvm/recovery.mnemonic` files
- * that {@link readBuilderMnemonic} migrates from: a caller that writes without
- * reading first would otherwise sail past the guard and leave those words
+ * site. "Existing" includes the legacy `recovery.mnemonic` in the selected
+ * builder directory, and (only
+ * without an explicit builder override) `~/.dvm/recovery.mnemonic`:
+ * a caller that writes without reading first would otherwise leave those words
  * shadowed by a root nothing derives from.
  * A forced overwrite copies the prior words aside first — see
  * {@link backupSecretFile} — and reports that path back, because the words
@@ -101,7 +116,7 @@ export function writeBuilderMnemonic(
     ? BUILDER_MNEMONIC_FILE
     : existsSync(LEGACY_BUILDER_MNEMONIC_FILE)
       ? LEGACY_BUILDER_MNEMONIC_FILE
-      : existsSync(RECOVERY_MNEMONIC_FILE)
+      : !BUILDER_CONFIG_DIR_EXPLICIT && existsSync(RECOVERY_MNEMONIC_FILE)
         ? RECOVERY_MNEMONIC_FILE
         : null;
   if (existing && !opts.force) {

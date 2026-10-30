@@ -48,6 +48,7 @@ vi.mock("@dvmkit/sdk/internal", async (importOriginal) => ({
 
 vi.mock("../../../lib/builder-mnemonic", () => ({
   readBuilderMnemonic: vi.fn(() => null),
+  getBuilderMnemonicMigrationHint: vi.fn(() => null),
 }));
 
 vi.mock("../identity", () => ({
@@ -70,6 +71,7 @@ vi.mock("../../../lib/platform-client", () => ({
 }));
 
 import { loadIdentitySecret } from "@dvmkit/sdk/internal";
+import { getBuilderMnemonicMigrationHint } from "../../../lib/builder-mnemonic";
 
 import { deriveSlug, slugify } from "../../../lib/deploy-attestation";
 import { resolveAuth } from "../../../lib/platform";
@@ -863,6 +865,24 @@ describe("dvmctl deploy cloud dirty-tree guard", { timeout: SPAWN_HEAVY_TIMEOUT 
     rmSync(dir, { recursive: true, force: true });
     vi.mocked(resolveAuth).mockReturnValue(null);
     vi.unstubAllGlobals();
+  });
+
+  it.each([false, true])("surfaces a skipped legacy mnemonic migration (human=%s) without registering a lock key", async (human) => {
+    const hint = "Legacy recovery mnemonic found at /legacy/recovery.mnemonic; use dvmctl lock create --import <words>.";
+    vi.mocked(getBuilderMnemonicMigrationHint).mockReturnValueOnce(hint);
+
+    await deploy({ target: "cloud", human });
+
+    expect(startDeployMock).toHaveBeenCalledWith(expect.any(String), expect.any(String), expect.objectContaining({
+      lockPubkey: undefined,
+      expectLockPubkey: false,
+    }));
+    if (human) {
+      expect(info).toHaveBeenCalledWith(expect.stringContaining(hint));
+    } else {
+      expect(progress).toHaveBeenCalledWith({ event: "warning", code: "legacy_builder_mnemonic", hint });
+      expect(json).toHaveBeenCalledWith(expect.objectContaining({ status: "deployed", mnemonic_hint: hint }));
+    }
   });
 
   it("refuses before queuing a build and names every packaged path", async () => {

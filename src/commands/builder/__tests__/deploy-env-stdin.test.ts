@@ -12,7 +12,10 @@ vi.mock("../../../lib/deploy-attestation.ts", async (original) => ({
   ...(await original<typeof import("../../../lib/deploy-attestation.ts")>()),
   requireBuilderIdentity: () => undefined,
 }));
-vi.mock("../../../lib/builder-mnemonic.ts", () => ({ readBuilderMnemonic: () => null }));
+vi.mock("../../../lib/builder-mnemonic.ts", () => ({
+  readBuilderMnemonic: () => null,
+  getBuilderMnemonicMigrationHint: () => null,
+}));
 vi.mock("../../../lib/platform.ts", () => ({ resolveAuth: () => ({ token: "test-token" }), resolveOrgScope: () => undefined }));
 vi.mock("../../../shared/builder-store.ts", async (original) => ({
   ...(await original<typeof import("../../../shared/builder-store.ts")>()),

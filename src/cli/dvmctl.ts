@@ -1,6 +1,7 @@
 import { registerBillingCommands } from "../commands/builder/billing.ts";
 
 import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { randomTraceId } from "@dvmkit/sdk/internal";
@@ -152,6 +153,7 @@ import { setFeedbackCommand } from "../lib/builder-feedback-nudges.ts";
 import { installGlobalAcceptEncoding } from "../lib/http.ts";
 import { CLI_VERSION } from "../lib/version.ts";
 import { setOutputTraceId } from "../shared/output.ts";
+import { BUILDER_CONFIG_DIR } from "../shared/defaults.ts";
 
 /** Build the fully-configured `dvmctl` commander program without parsing argv. Importing this module has no side effects; the CLI parse and trace-ID seeding happen only when the file is executed directly (see entrypoint guard at the bottom). */
 export function buildProgram(): Command {
@@ -606,7 +608,7 @@ export function buildProgram(): Command {
   identityCmd
     .command("create")
     .description(
-      "Generate a per-workstation secp256k1 identity keypair. Persists pubkey to ~/.dvmkit/builder.json and secret to ~/.dvmkit/builder.key (0600)."
+      `Generate a per-workstation secp256k1 identity keypair. Persists builder.json and builder.key (0600) in ${resolve(BUILDER_CONFIG_DIR)} (default ~/.dvmkit; override with DVMKIT_CONFIG_DIR, separate from authentication's DVMCTL_CONFIG_DIR).`
     )
     .option(
       "--force",
@@ -621,7 +623,7 @@ export function buildProgram(): Command {
 
   identityCmd
     .command("show")
-    .description("Print the builder identity pubkey from ~/.dvmkit/builder.json")
+    .description(`Print the builder identity pubkey from builder.json in ${resolve(BUILDER_CONFIG_DIR)} (default ~/.dvmkit; override with DVMKIT_CONFIG_DIR, separate from authentication's DVMCTL_CONFIG_DIR).`)
     .option("--human", "Human-readable output instead of JSON")
     .action((opts: IdentityShowOptions) => {
       catchErrors(() => {
@@ -635,7 +637,7 @@ export function buildProgram(): Command {
 
   lockCmd
     .command("create")
-    .description("Generate a BIP-39 mnemonic for builder Cashu lock keypairs")
+    .description(`Generate a BIP-39 mnemonic for builder Cashu lock keypairs. Saves builder.mnemonic in ${resolve(BUILDER_CONFIG_DIR)} (default ~/.dvmkit; override with DVMKIT_CONFIG_DIR, separate from authentication's DVMCTL_CONFIG_DIR).`)
     .option("--import <mnemonic>", "Import an existing 12-word BIP-39 mnemonic")
     .option(
       "--force",
