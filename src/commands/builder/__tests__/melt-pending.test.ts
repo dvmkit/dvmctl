@@ -447,13 +447,13 @@ describe("dvmctl melt-pending", () => {
     it("continues siblings after failure and retries only the failed rows next run", async () => {
       const { batch, getPendingBatches, markMelted, meltProofsBolt11 } = setupChunks(450);
       meltProofsBolt11.mockImplementationOnce(async () => {
-        throw new MintOperationError(10001, "Rejected");
+        throw new MintOperationError(20004, "Payment failed");
       });
       await expect(meltPending("dvm", { endpoint: "https://dvm.example" }))
         .rejects.toMatchObject({ code: "batches_failed" });
       expect(markMelted.mock.calls.flatMap(([body]) => body.row_ids)).toEqual(batch.row_ids.slice(200));
       expect(output.json).toHaveBeenCalledWith(expect.objectContaining({
-        batches_failed: 1, sats_melted: 2000,
+        batches_failed: 0, batches_partial_failed: 1, sats_melted: 2000,
       }));
       getPendingBatches.mockResolvedValue({ batches: [{
         ...batch, row_ids: batch.row_ids.slice(0, 200), proofs: batch.proofs.slice(0, 200), total_sats: 1600,

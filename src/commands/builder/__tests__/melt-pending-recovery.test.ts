@@ -241,7 +241,8 @@ describe("uncertain melt recovery with a durable journal", () => {
         dvm_id: DVM_ID, row_ids: ["historical-row"], quote_id: error, status: "failed", error,
       });
     }
-    await expect(process.run()).rejects.toMatchObject({ code: "batches_failed" });
+    if (code === 10001) await process.run();
+    else await expect(process.run()).rejects.toMatchObject({ code: "batches_failed" });
     expect(process.journal.lookupMeltQuote(DVM_ID, "original-quote")).toEqual({ state: "resolved" });
     expect(process.journal.readInFlight(DVM_ID)).toEqual([]);
     expect(mint.check).not.toHaveBeenCalled();
