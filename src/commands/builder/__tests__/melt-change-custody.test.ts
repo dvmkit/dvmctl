@@ -87,6 +87,19 @@ describe("builder payout change at the command and private disk boundary", () =>
     const [op] = store.operations(DVM);
     return { ...process, store, op, records: store.records(op) };
   }
+  async function legacySubmission() {
+    mint.fixture.invoiceAmount = 210;
+    const { MeltCustody, storeProof } = await processObjects();
+    const store = new MeltCustody();
+    const preview = await mint.wallet.prepareMelt("bolt11", mint.quote(), mint.inputs, { nut08Change: true }, { type: "random" });
+    const op = store.prepare({ dvm: DVM, mint: MINT, rows: ["row-1", "row-2", "row-3"], lock: LOCK,
+      gross: "224", inputFee: "1", invoice: "synthetic-invoice", invoiceAmount: "210", reserve: "10",
+      unit: "sat", method: "bolt11", quote: "original-quote", initialQuote: JSON.parse(JSON.stringify(mint.quote())),
+      inputs: mint.inputs.map(storeProof), feeRates: mint.inputs.map(p => ({ id: p.id, ppk: "100" })),
+      outputs: preview.outputData.map(OutputData.serialize), generation: "random" });
+    op.submission = "submission_possible"; store.commit();
+    store.observe(op, "submission", await mint.wallet.completeMelt(preview));
+  }
   function assertPrivate(outputs: string[]) {
     const publicText = captured() + readFileSync(join(root, "melt-pending.log"), "utf8");
     for (const secret of outputs) expect(publicText).not.toContain(secret);
@@ -94,7 +107,7 @@ describe("builder payout change at the command and private disk boundary", () =>
     expect(publicText).not.toContain("synthetic-invoice");
   }
 
-  it("durably owns 9 sat before acknowledgement and infers the independent 4 sat routing fee", async () => {
+  it("durably owns 9 sat before acknowledgement and infers the independent 1 sat routing fee", async () => {
     mocked.mark.mockImplementation(async () => {
       const { records } = await reopened();
       expect(records.map(r => r.proof.amount)).toEqual(["8", "1"]);
@@ -104,9 +117,9 @@ describe("builder payout change at the command and private disk boundary", () =>
     const { store, op, records } = await reopened();
     expect(records).toHaveLength(2);
     expect(records.every(r => r.state === "available" && hasValidDleq({ ...r.proof, amount: Amount.from(r.proof.amount) }, mint.wallet.getKeyset(KEYSET)))).toBe(true);
-    expect(store.status(op)).toMatchObject({ gross_input_amount: "224", input_fee_amount: "1", invoice_amount: "210",
-      fee_reserve_amount: "10", custodied_change_amount: "9", returned_change_amount: "9", routing_fee_amount: "4", fee_provenance: "inferred", change_recovery_status: "complete" });
-    expect(op.initialQuote).toMatchObject({ quote: "original-quote", amount: "210", fee_reserve: "10",
+    expect(store.status(op)).toMatchObject({ gross_input_amount: "224", input_fee_amount: "1", invoice_amount: "213",
+      fee_reserve_amount: "10", custodied_change_amount: "9", returned_change_amount: "9", routing_fee_amount: "1", fee_provenance: "inferred", change_recovery_status: "complete" });
+    expect(op.initialQuote).toMatchObject({ quote: "original-quote", amount: "213", fee_reserve: "10",
       unit: "sat", state: "UNPAID", expiry: 2_000_000_000, request: "synthetic-invoice", change: [] });
     expect(op.outputs).toHaveLength(4);
     expect(op.outputs.map(o => o.blindedMessage.B_)).toEqual(mint.fixture.outputs.map(o => o.B_));
@@ -117,7 +130,7 @@ describe("builder payout change at the command and private disk boundary", () =>
   });
 
   it.each([true, false])("requires explicit fresh empty change to establish zero (own field: %s)", async own => {
-    mint.fixture.invoiceAmount = 213; mint.fixture.quoteAmounts = []; mint.fixture.includeChange = own;
+    mint.fixture.quoteAmounts = []; mint.fixture.includeChange = own;
     await (await processObjects()).run();
     const { store, op } = await reopened();
     expect(op.complete).toBe(own);
@@ -294,11 +307,11 @@ describe("builder payout change at the command and private disk boundary", () =>
     await (await processObjects()).run();
     const { op, store } = await reopened();
     expect(op.feeRates).toEqual([{ id: KEYSET, ppk: "100" }, { id: KEYSET, ppk: "100" }, { id: ROTATED_KEYSET, ppk: "100" }]);
-    expect(store.status(op)).toMatchObject({ input_fee_amount: "1", gross_input_amount: "224", invoice_amount: "210" });
+    expect(store.status(op)).toMatchObject({ input_fee_amount: "1", gross_input_amount: "224", invoice_amount: "213" });
   });
 
   it("refuses foreign units before submitting", async () => {
-    mocked.quote.mockImplementation(async () => ({ amountSats: 210, feeReserveSats: 10, rawQuote: { ...mint.quote(), unit: "usd" } }));
+    mocked.quote.mockImplementation(async () => ({ amountSats: 213, feeReserveSats: 10, rawQuote: { ...mint.quote(), unit: "usd" } }));
     await expect((await processObjects()).run()).rejects.toMatchObject({ code: "batches_failed" });
     expect(mint.fixture.submitCount).toBe(0); expect(mocked.mark).not.toHaveBeenCalled();
   });
@@ -410,7 +423,7 @@ describe("builder payout change at the command and private disk boundary", () =>
   it.each([
     ["quote", []], ["restore", []], ["quote", [4, 1]], ["restore", [4, 1]],
   ] as const)("reconciles saved positive %s evidence before a conflicting final set %j", async (source, finalAmounts) => {
-    mint.fixture.invoiceAmount = 213; mint.fixture.timeout = true;
+    mint.fixture.timeout = true;
     mint.fixture.includeChange = source === "quote"; mint.fixture.restoreOrder = [0, 1];
     const ensure = vi.spyOn(mint.wallet, "ensureOperableKeysets");
     mint.fixture.onSubmit = async () => { ensure.mockRejectedValue(new Error("metadata temporarily unavailable")); };
@@ -440,7 +453,6 @@ describe("builder payout change at the command and private disk boundary", () =>
   });
 
   it("does not infer zero when a reconstruction error preserved positive change signatures", async () => {
-    mint.fixture.invoiceAmount = 213;
     mint.fixture.malformedPending = true; mint.fixture.malformedState = "PAID"; mint.fixture.quoteAmounts = [];
     await (await processObjects()).run().catch(error => expect(error).toMatchObject({ code: "batches_failed" }));
     const { op, store } = await reopened();
@@ -452,7 +464,8 @@ describe("builder payout change at the command and private disk boundary", () =>
 
   it("does not classify excess input value as a routing fee above the reserve ceiling", async () => {
     mint.fixture.quoteAmounts = [];
-    await expect((await processObjects()).run()).rejects.toMatchObject({ code: "batches_failed" });
+    await legacySubmission();
+    await (await processObjects()).run();
     const { op, store } = await reopened();
     expect(op.complete).toBe(false);
     expect(store.status(op)).toMatchObject({ returned_change_amount: null, routing_fee_amount: null,
@@ -462,12 +475,67 @@ describe("builder payout change at the command and private disk boundary", () =>
     expect(mocked.mark).toHaveBeenCalledExactlyOnceWith({ row_ids: ["row-1", "row-2", "row-3"],
       melt_quote_id: "original-quote", payment_preimage: "receipt" });
     expect(op.acknowledged).toBe(true);
-    const checks = mint.fixture.checkCount; const observations = op.observations.length;
+    const checks = mint.fixture.checkCount;
+    vi.mocked(console.error).mockClear();
+    await (await processObjects()).run();
+    const closed = await reopened();
+    expect(closed.op).toMatchObject({ closedEmpty: true, quarantine: false, complete: false, acknowledged: true });
+    expect(closed.store.status(closed.op)).toMatchObject({ returned_change_amount: "0", routing_fee_amount: null,
+      fee_provenance: "unavailable", unobserved_remainder: "13", change_recovery_status: "closed_empty" });
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining('"level":"melt_pending_change_closed_empty"'));
+    expect(vi.mocked(console.error)).not.toHaveBeenCalled();
+    expect(mint.fixture.checkCount).toBe(checks + 1);
+    const observations = closed.op.observations.length;
     await (await processObjects()).run(); await (await processObjects()).run();
     expect(mocked.mark).toHaveBeenCalledTimes(1); expect(mint.fixture.submitCount).toBe(1);
-    // Terminal quarantine: later ticks neither query the mint nor grow the custody file.
-    expect(mint.fixture.checkCount).toBe(checks);
+    expect(mint.fixture.checkCount).toBe(checks + 1);
     expect((await reopened()).op.observations).toHaveLength(observations);
+  });
+
+  it.each(["missing change", "foreign quote", "different preimage", "unpaid", "unreachable", "restore timeout", "nonempty restore", "malformed restore"])(
+    "keeps an old quarantine open after %s", async defect => {
+      mint.fixture.quoteAmounts = [];
+      await legacySubmission();
+      await (await processObjects()).run();
+      if (defect === "missing change") mint.fixture.includeChange = false;
+      if (defect === "foreign quote") mint.fixture.freshQuoteId = "foreign";
+      if (defect === "different preimage") mint.fixture.alterQuote = quote => ({ ...quote, payment_preimage: "another" });
+      if (defect === "unpaid") mint.fixture.freshState = "UNPAID";
+      if (defect === "unreachable") mint.fixture.onCheck = async () => { throw new Error("secret-transport-sentinel"); };
+      if (defect === "restore timeout") mint.fixture.alterRestore = () => { throw new Error("secret-transport-sentinel"); };
+      if (defect === "nonempty restore") mint.fixture.restoreOrder = [0];
+      if (defect === "malformed restore") mint.fixture.alterRestore = () => ({ outputs: [] });
+      await (await processObjects()).run().catch(() => undefined);
+      const { op, records, store } = await reopened();
+      expect(op).toMatchObject({ quarantine: true, complete: false, acknowledged: true });
+      expect(op.closedEmpty).toBeUndefined(); expect(records).toHaveLength(0);
+      expect(store.status(op)).toMatchObject({ routing_fee_amount: null, change_recovery_status: "quarantined" });
+      expect(mocked.mark).toHaveBeenCalledTimes(1); expect(mint.fixture.submitCount).toBe(1);
+      expect(captured()).not.toContain("melt_pending_change_closed_empty");
+      assertPrivate([]);
+    }
+  );
+
+  it.each(["submission", "quote", "restore", "imported"])("never closes a quarantine with positive %s evidence", async source => {
+    mint.fixture.quoteAmounts = [];
+    await legacySubmission();
+    await (await processObjects()).run();
+    const { op, store } = await reopened();
+    const signature = blindSignature(mint.fixture.outputs[0], 1);
+    if (source === "submission") store.observe(op, "submission", { quote: { change: [signature] } });
+    if (source === "quote") store.observe(op, "quote", { change: [signature] });
+    if (source === "restore") store.observe(op, "restore", { outputs: [mint.fixture.outputs[0]], signatures: [signature] });
+    if (source === "imported") {
+      const proof = mint.wallet.createMeltChangeProofs(op.outputs.map(OutputData.deserialize), [signature])[0];
+      store.import(op, [{ proof, output: 0, state: "held" }], false);
+    }
+    const checks = mint.fixture.checkCount;
+    await (await processObjects()).run();
+    const state = await reopened();
+    expect(state.op.quarantine).toBe(true); expect(state.op.closedEmpty).toBeUndefined();
+    expect(state.records).toHaveLength(source === "imported" ? 1 : 0);
+    expect(mint.fixture.checkCount).toBe(checks); expect(mint.fixture.submitCount).toBe(1);
+    expect(mocked.mark).toHaveBeenCalledTimes(1);
   });
 
   it.each([
@@ -508,7 +576,7 @@ describe("builder payout change at the command and private disk boundary", () =>
   });
 
   it("acknowledges a paid melt on recovery even when its change stays quarantined", async () => {
-    mint.fixture.quoteAmounts = [];
+    mint.fixture.alterQuote = quote => ({ ...quote, change: [] });
     mocked.mark.mockRejectedValueOnce(new Error("admin endpoint unavailable"));
     await expect((await processObjects()).run()).rejects.toMatchObject({ code: "batches_failed" });
     expect((await reopened()).op).toMatchObject({ payment: "PAID", acknowledged: false, quarantine: true });
@@ -524,7 +592,7 @@ describe("builder payout change at the command and private disk boundary", () =>
   });
 
   it.each(["a different preimage", "no answer"])("does not acknowledge on recovery when the fresh quote gives %s", async variant => {
-    mint.fixture.quoteAmounts = [];
+    mint.fixture.alterQuote = quote => ({ ...quote, change: [] });
     mocked.mark.mockRejectedValueOnce(new Error("admin endpoint unavailable"));
     await expect((await processObjects()).run()).rejects.toMatchObject({ code: "batches_failed" });
     if (variant === "no answer") mint.fixture.onCheck = async () => { throw new Error("mint unreachable"); };

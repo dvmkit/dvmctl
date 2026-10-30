@@ -40,7 +40,7 @@ if (checkpoint === "before_prepared") {
 const sdk = await import("@dvmkit/sdk/internal");
 mock.module("@dvmkit/sdk/internal", { namedExports: { ...sdk,
   getWallet: async () => wallet,
-  fetchMeltQuote: async () => ({ amountSats: 210, feeReserveSats: 10, rawQuote: quote() }),
+  fetchMeltQuote: async () => ({ amountSats: 213, feeReserveSats: 10, rawQuote: quote() }),
   getInputFeesForProofs: async () => 1,
   fetchLnurlPayInvoice: async () => "synthetic-invoice",
 } });

@@ -777,9 +777,8 @@ async function meltBatch(
   //   3. input_fees   — NUT-02 per-proof input fee (NOT in the quote; must be
   //                     computed locally from the keyset's input_fee_ppk)
   // The mint requires `proofs_total >= amount + fee_reserve + input_fees`.
-  // Two-pass flow: request invoice for `total - input_fees` (we know that up
-  // front); if the quote then needs even more for fee_reserve, re-issue for
-  // `total - input_fees - feeReserve` and re-quote.
+  // Reserves can shrink with the invoice amount. Require equality before
+  // submission so excess input value cannot become unreturnable change.
   let inputFees: number;
   try {
     inputFees = await getInputFeesForProofs(batch.mint_url, batch.proofs);
@@ -803,83 +802,52 @@ async function meltBatch(
     return "fee_starved";
   }
 
-  let bolt11: string;
-  try {
-    bolt11 = await payoutInvoice(ctx, (batch.total_sats - inputFees) * 1000);
-  } catch (err) {
-    logErr(ctx, "melt_pending_payout_invoice_failed", err, {
-      destination: ctx.payoutNwc ? "nwc" : "lnurl",
-      mint_url: batch.mint_url,
-      row_ids: batch.row_ids,
-      total_sats: batch.total_sats,
-      input_fees: inputFees,
-    });
-    return "failed";
-  }
-
-  let quote: Awaited<ReturnType<typeof fetchMeltQuote>>;
-  try {
-    quote = await fetchMeltQuote(batch.mint_url, bolt11);
-  } catch (err) {
-    logErr(ctx, "melt_pending_quote_failed", err, {
-      mint_url: batch.mint_url,
-      row_ids: batch.row_ids,
-    });
-    return "failed";
-  }
-
-  if (batch.total_sats < quote.amountSats + quote.feeReserveSats + inputFees) {
-    const target = batch.total_sats - quote.feeReserveSats - inputFees;
-    if (target <= 0) {
-      // Combined fee_reserve + input_fees meet or exceed the batch — no
-      // sendable invoice amount can fit. Skip; next tick may have a richer
-      // batch or different mint conditions.
-      logEvent(ctx, "melt_pending_fee_reserve_exceeds_batch", {
-        mint_url: batch.mint_url,
-        row_ids: batch.row_ids,
-        total_sats: batch.total_sats,
-        fee_reserve_sats: quote.feeReserveSats,
-        input_fees: inputFees,
-      });
-      return "fee_starved";
-    }
-
+  let bolt11 = "";
+  let quote: Awaited<ReturnType<typeof fetchMeltQuote>> | undefined;
+  let target = batch.total_sats - inputFees;
+  const targets = new Set<number>();
+  const maxQuotes = 4;
+  for (let attempt = 0; attempt < maxQuotes; attempt++) {
+    targets.add(target);
     try {
       bolt11 = await payoutInvoice(ctx, target * 1000);
     } catch (err) {
       logErr(ctx, "melt_pending_payout_invoice_failed", err, {
         destination: ctx.payoutNwc ? "nwc" : "lnurl",
-        mint_url: batch.mint_url,
-        row_ids: batch.row_ids,
-        total_sats: batch.total_sats,
-        target_sats: target,
+        mint_url: batch.mint_url, row_ids: batch.row_ids,
+        total_sats: batch.total_sats, input_fees: inputFees, target_sats: target,
       });
       return "failed";
     }
-
     try {
       quote = await fetchMeltQuote(batch.mint_url, bolt11);
     } catch (err) {
       logErr(ctx, "melt_pending_quote_failed", err, {
-        mint_url: batch.mint_url,
-        row_ids: batch.row_ids,
+        mint_url: batch.mint_url, row_ids: batch.row_ids,
       });
       return "failed";
     }
-
-    if (batch.total_sats < quote.amountSats + quote.feeReserveSats + inputFees) {
-      logEvent(ctx, "melt_pending_fee_reserve_too_high", {
-        mint_url: batch.mint_url,
-        row_ids: batch.row_ids,
-        total_sats: batch.total_sats,
-        amount_sats: quote.amountSats,
-        fee_reserve_sats: quote.feeReserveSats,
-        input_fees: inputFees,
-        retry: true,
+    if (!Number.isSafeInteger(quote.amountSats) || quote.amountSats <= 0 ||
+      !Number.isSafeInteger(quote.feeReserveSats) || quote.feeReserveSats < 0) return "failed";
+    if (quote.amountSats === batch.total_sats - inputFees - quote.feeReserveSats) break;
+    target = batch.total_sats - inputFees - quote.feeReserveSats;
+    if (target <= 0) {
+      logEvent(ctx, "melt_pending_fee_reserve_exceeds_batch", {
+        mint_url: batch.mint_url, row_ids: batch.row_ids, total_sats: batch.total_sats,
+        fee_reserve_sats: quote.feeReserveSats, input_fees: inputFees,
+      });
+      return "fee_starved";
+    }
+    if (targets.has(target) || attempt === maxQuotes - 1) {
+      logEvent(ctx, "melt_pending_quote_no_exact_fit", {
+        mint_url: batch.mint_url, row_ids: batch.row_ids, total_sats: batch.total_sats,
+        amount_sats: quote.amountSats, fee_reserve_sats: quote.feeReserveSats,
+        input_fees: inputFees, attempts: attempt + 1,
       });
       return "fee_starved";
     }
   }
+  if (!quote) return "failed";
 
   const proofs: ProofLike[] = batch.proofs.map((p) => ({
     id: p.id,
@@ -1056,7 +1024,7 @@ function freshPayment(ctx: CustodyContext, op: CustodyOperation, observedBefore:
 function logChangeUnresolved(ctx: CustodyContext, op: CustodyOperation): void {
   logErr(ctx, "melt_pending_change_unresolved",
     new Error("Payment settled but its change could not be reconciled"),
-    { ...ctx.custody.status(op), hint: "The payout is paid and mark-melted acknowledged its rows. This melt's change did not reconcile with the mint's answer, so it stays quarantined in melt-custody.json for inspection, and recovery no longer re-checks it." });
+    { ...ctx.custody.status(op), hint: "The payout is paid and mark-melted acknowledged its rows. This melt's change did not reconcile with the mint's answer, so it stays quarantined in melt-custody.json until empty-change closeout can be confirmed." });
 }
 
 /** Only explicit final submission rejections prove this request cannot later pay. */
@@ -1113,9 +1081,18 @@ async function runRecovery(
     if (op.acknowledged && audit) appendPostMelt({ dvm_id: op.dvm, row_ids: op.rows, quote_id: op.quote,
       status: "success", preimage: op.preimage });
     if (op.acknowledged && op.complete && !ctx.custody.records(op).some(p => p.state === "held")) continue;
-    // Quarantine is terminal and its rows are acknowledged: re-checking only
-    // appends an observation to the custody file on every tick.
-    if (op.acknowledged && op.quarantine) continue;
+    if (op.closedEmpty) continue;
+    if (op.acknowledged && op.quarantine) {
+      try {
+        const { getWallet } = await import("@dvmkit/sdk/internal");
+        if (await ctx.custody.closeEmptyQuarantine(op, await getWallet(op.mint))) {
+          logEvent(ctx, "melt_pending_change_closed_empty", ctx.custody.status(op));
+        }
+      } catch {
+        logErr(ctx, "melt_pending_change_closeout_failed", new Error("Empty-change closeout could not be confirmed"), { quote_id: op.quote });
+      }
+      continue;
+    }
     const wasAcknowledged = op.acknowledged;
     const result = await recoverOwned(ctx, op);
     if (result === "recovered") { if (!wasAcknowledged) recovered++; }

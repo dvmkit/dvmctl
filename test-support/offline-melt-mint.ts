@@ -24,7 +24,7 @@ export function blindSignature(output: Pick<SerializedBlindedMessage, "B_">, val
 export function offlineMint(options: NonNullable<ConstructorParameters<typeof Wallet>[1]> = {}) {
   const fixture = {
     state: "PAID", freshState: "PAID", quoteId: "original-quote", freshQuoteId: "original-quote",
-    invoiceAmount: 210, reserve: 10, includeChange: true, responseChange: true,
+    invoiceAmount: 213, reserve: 10, includeChange: true, responseChange: true,
     timeout: false, malformedPending: false, malformedState: "PENDING", useRotated: false, submitCount: 0, checkCount: 0,
     outputs: [] as SerializedBlindedMessage[], restoreOrder: [] as number[],
     restoreActualAmounts: false, restoreSignatureKeysets: false,

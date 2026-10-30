@@ -64,6 +64,7 @@ export interface CustodyOperation {
   evidence: "proofs" | "signatures_only" | "explicit_empty" | "partial" | "unavailable";
   signatureAmount: string | null;
   quarantine: boolean;
+  closedEmpty?: true;
 }
 interface Snapshot { version: 1; operations: CustodyOperation[]; proofs: CustodyProof[] }
 
@@ -186,6 +187,9 @@ function validate(snapshot: Snapshot, checked = new Set<string>()): void {
     requireValue(total <= residual(op) && (total === 0n || op.payment === "PAID"));
     requireValue(op.signatureAmount === null || BigInt(op.signatureAmount) <= residual(op));
     requireValue(!op.complete || (total.toString() === op.signatureAmount && residual(op) - total <= BigInt(op.reserve)));
+    requireValue(op.closedEmpty === undefined || (op.closedEmpty === true && op.acknowledged &&
+      !op.complete && !op.quarantine && op.payment === "PAID" && op.evidence === "explicit_empty" &&
+      op.signatureAmount === "0" && residual(op) > BigInt(op.reserve) && emptyCloseoutEvidence(op)));
   }
 }
 
@@ -303,7 +307,7 @@ export class MeltCustody {
       try { fsyncSync(directory); } finally { closeSync(directory); }
     } catch { throw new DvmError("melt_custody_io", "Private melt custody could not be committed. No further submission is authorized."); }
   }
-  prepare(details: Omit<CustodyOperation, "id" | "created" | "manifest" | "submission" | "payment" | "acknowledged" | "complete" | "imported" | "observations" | "evidence" | "signatureAmount" | "quarantine" | "inputIdentities">): CustodyOperation {
+  prepare(details: Omit<CustodyOperation, "id" | "created" | "manifest" | "submission" | "payment" | "acknowledged" | "complete" | "imported" | "observations" | "evidence" | "signatureAmount" | "quarantine" | "inputIdentities" | "closedEmpty">): CustodyOperation {
     requireValue(!this.snapshot.operations.some(op => op.dvm === details.dvm && op.mint === details.mint && op.quote === details.quote));
     const inputIdentities = details.inputs.map(p => identity(details.mint, p));
     requireValue(!this.snapshot.operations.some(op => op.submission !== "rejected" &&
@@ -386,19 +390,67 @@ export class MeltCustody {
     });
     this.commit();
   }
+  async closeEmptyQuarantine(op: CustodyOperation, wallet: Wallet): Promise<boolean> {
+    if (!op.quarantine || !op.acknowledged || op.payment !== "PAID" ||
+      residual(op) <= BigInt(op.reserve) || !noPositiveChange(op)) return false;
+    requireValue(canonicalMint(wallet.mint.mintUrl) === op.mint && wallet.unit === op.unit);
+    const quote = await wallet.mint.checkMeltQuoteBolt11(op.quote);
+    this.observe(op, "quote", quote);
+    requireValue(freshQuoteConfirmsPaid(op, quote));
+    if (!Object.hasOwn(quote, "change") || !Array.isArray(quote.change) || quote.change.length !== 0) return false;
+    const response = await wallet.mint.restore({ outputs: op.outputs.map(output => OutputData.deserialize(output).blindedMessage) });
+    this.observe(op, "restore", response);
+    if (!emptyCloseoutEvidence(op)) return false;
+    // This closes recovery, not the accounting gap: the reserve ceiling still
+    // forbids classifying the unexplained remainder as a routing fee.
+    op.closedEmpty = true; op.quarantine = false; op.evidence = "explicit_empty"; op.signatureAmount = "0";
+    this.commit();
+    return true;
+  }
   status(op: CustodyOperation): Record<string, unknown> {
     const custodied = this.records(op).reduce((n, p) => n + BigInt(p.proof.amount), 0n);
-    const returned = op.complete ? op.signatureAmount : null;
+    const returned = op.closedEmpty ? "0" : op.complete ? op.signatureAmount : null;
     return { quote_id: op.quote, unit: op.unit, gross_input_amount: op.gross, input_fee_amount: op.inputFee,
       invoice_amount: op.invoiceAmount, fee_reserve_amount: op.reserve, payment_state: op.payment,
       available_change_amount: this.records(op).filter(p => p.state === "available").reduce((n, p) => n + BigInt(p.proof.amount), 0n).toString(),
       change_evidence: op.evidence, custodied_change_amount: custodied.toString(), signature_change_amount: op.signatureAmount,
-      returned_change_amount: returned, routing_fee_amount: returned === null ? null : (residual(op) - BigInt(returned)).toString(),
-      fee_provenance: returned === null ? "unavailable" : "inferred", unobserved_remainder: (residual(op) - custodied).toString(),
-      change_recovery_status: op.quarantine ? "quarantined" : op.complete ? "complete" : "change_unresolved" };
+      returned_change_amount: returned, routing_fee_amount: !op.complete || returned === null ? null : (residual(op) - BigInt(returned)).toString(),
+      fee_provenance: op.complete ? "inferred" : "unavailable", unobserved_remainder: (residual(op) - custodied).toString(),
+      change_recovery_status: op.closedEmpty ? "closed_empty" : op.quarantine ? "quarantined" : op.complete ? "complete" : "change_unresolved" };
   }
 }
 function residual(op: CustodyOperation): bigint { return BigInt(op.gross) - BigInt(op.invoiceAmount) - BigInt(op.inputFee); }
+
+function noPositiveChange(op: CustodyOperation): boolean {
+  if (op.imported.length || (op.signatureAmount !== null && op.signatureAmount !== "0")) return false;
+  const emptyField = (data: object, key: string) => {
+    if (!Object.hasOwn(data, key)) return true;
+    const value: unknown = Reflect.get(data, key);
+    return Array.isArray(value) && value.length === 0;
+  };
+  return op.observations.every(observation => {
+    const data = observation.data;
+    if (!data || typeof data !== "object") return true;
+    if (!emptyField(data, "change")) return false;
+    if (observation.kind === "restore") return emptyField(data, "outputs") && emptyField(data, "signatures");
+    if (observation.kind === "submission" && "quote" in data && data.quote && typeof data.quote === "object") {
+      return emptyField(data.quote, "change");
+    }
+    return true;
+  });
+}
+function emptyCloseoutEvidence(op: CustodyOperation): boolean {
+  if (!noPositiveChange(op)) return false;
+  const quoteObservation = op.observations.at(-2);
+  const restoreObservation = op.observations.at(-1);
+  if (quoteObservation?.kind !== "quote" || restoreObservation?.kind !== "restore" ||
+    !freshQuoteConfirmsPaid(op, quoteObservation.data)) return false;
+  const quote = quoteObservation.data as { change?: unknown };
+  const restore = restoreObservation.data as { outputs?: unknown; signatures?: unknown } | null;
+  return Object.hasOwn(quote, "change") && Array.isArray(quote.change) && quote.change.length === 0 &&
+    !!restore && Array.isArray(restore.outputs) && restore.outputs.length === 0 &&
+    Array.isArray(restore.signatures) && restore.signatures.length === 0;
+}
 
 export async function prepareCustody(
   store: MeltCustody, wallet: Wallet,
@@ -420,7 +472,7 @@ export async function prepareCustody(
   const inputFee = ((feeRates.reduce((n, r) => n + BigInt(r.ppk), 0n) + 999n) / 1000n).toString();
   requireValue(inputFee === amount(details.inputFee));
   requireValue(proofs.reduce((n, p) => n + BigInt(amount(p.amount)), 0n).toString() === amount(details.gross));
-  requireValue(BigInt(amount(details.gross)) >= BigInt(invoiceAmount) + BigInt(reserve) + BigInt(inputFee));
+  requireValue(BigInt(amount(details.gross)) === BigInt(invoiceAmount) + BigInt(reserve) + BigInt(inputFee));
   const submissionQuote = { quote: quote.quote, amount: Amount.from(invoiceAmount), unit: "sat" };
   const preview = await wallet.prepareMelt("bolt11", submissionQuote, proofs, { nut08Change: true }, { type: "random" });
   for (const output of preview.outputData) requireValue(wallet.getKeyset(output.blindedMessage.id).unit === "sat");
