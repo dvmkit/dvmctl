@@ -69,7 +69,7 @@ describe.skipIf(!mintUrl && !hosted)("proof isolation against Nutshell FakeWalle
 
     const outputs = [0, 1, 2].map(index => {
       const secret = new TextEncoder().encode(JSON.stringify(["P2PK", {
-        nonce: `fakewallet-${index}`, data: LOCK, tags: index === 1 ? [["pubkeys", LOCK]] : [],
+        nonce: `fakewallet-${index}`, data: LOCK, tags: index === 1 ? [["n_sigs", "2"]] : [],
       }]));
       const { B_, r } = blindMessage(secret);
       return new OutputData({ amount: Amount.from(64), id: wallet.getKeyset().id, B_: B_.toHex(true) }, r, secret);
@@ -80,6 +80,9 @@ describe.skipIf(!mintUrl && !hosted)("proof isolation against Nutshell FakeWalle
     const batch: AdminBatch = { mint_url: mintUrl!, lock_pubkey: LOCK,
       row_ids: ["good-a", "isolated", "good-b"], total_sats: 192, t_expire: null,
       proofs: minted.map(p => ({ ...p, amount: p.amount.toNumber() })) };
+    const { getP2PKWitnessSignatures } = await import("@cashu/cashu-ts");
+    const signed = wallet.signP2PKProofs([batch.proofs[1]], PRIVKEY);
+    expect(getP2PKWitnessSignatures(signed[0].witness)).toHaveLength(1);
     fixture.batches.mockResolvedValue({ batches: [batch] });
     const marked: string[] = [];
     fixture.mark.mockImplementation(async ({ row_ids }: { row_ids: string[] }) => {

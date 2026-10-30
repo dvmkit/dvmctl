@@ -1,4 +1,4 @@
-import { getP2PKSigFlag, getP2PKWitnessSignatures, hashToCurve, type Wallet, type ProofLike } from "@cashu/cashu-ts";
+import { getP2PKSigFlag, getP2PKWitnessSignatures, hashToCurve, isP2PKSpendAuthorised, type Wallet, type ProofLike } from "@cashu/cashu-ts";
 
 import type { AdminBatch } from "../../lib/admin-cashu-client.ts";
 
@@ -20,7 +20,8 @@ export function proofSigningGroup(wallet: Wallet, proof: ProofLike, privkey: str
     if (Array.isArray(tags) && tags.some(tag => Array.isArray(tag) && tag.length === 1 &&
       ["n_sigs", "sigflag"].includes(tag[0]))) return null;
     const signed = wallet.signP2PKProofs([proof], privkey, [], "preflight")[0];
-    if (getP2PKWitnessSignatures(signed.witness).length === 0) return null;
+    if (getP2PKWitnessSignatures(signed.witness).length === 0 &&
+      !(secret[0] === "P2PK" && isP2PKSpendAuthorised(signed, undefined, "preflight"))) return null;
     return getP2PKSigFlag(proof.secret) === "SIG_ALL"
       ? JSON.stringify([secret[0], secret[1].data, secret[1].tags ?? []])
       : "inputs";

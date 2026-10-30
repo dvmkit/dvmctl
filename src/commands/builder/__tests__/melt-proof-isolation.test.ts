@@ -54,6 +54,7 @@ describe("unusable proof isolation at the command boundary", () => {
   let paidRows: Set<string>;
   let requests: { quote: string; rows: string[] }[];
   let reject: (proofs: ProofLike[]) => Error | undefined;
+  let reserve: number;
   beforeEach(() => {
     vi.clearAllMocks();
     root = mkdtempSync(join(tmpdir(), "melt-isolation-"));
@@ -61,7 +62,7 @@ describe("unusable proof isolation at the command boundary", () => {
     batch = { mint_url: "https://mint.invalid", lock_pubkey: LOCK,
       row_ids: ["row-a", "row-b", "row-c", "row-d"],
       proofs: [proof("a"), proof("b"), proof("c"), proof("d")], total_sats: 256, t_expire: null };
-    paidRows = new Set(); requests = []; reject = () => undefined;
+    paidRows = new Set(); requests = []; reject = () => undefined; reserve = 0;
     fixture.batches.mockImplementation(async () => {
       const indices = batch.row_ids.flatMap((row, index) => paidRows.has(row) ? [] : [index]);
       return { batches: indices.length === 0 ? [] : [{ ...batch, row_ids: indices.map(i => batch.row_ids[i]),
@@ -74,8 +75,8 @@ describe("unusable proof isolation at the command boundary", () => {
     fixture.invoice.mockImplementation(async (_address, msats) => `invoice:${msats / 1000}`);
     let id = 0;
     fixture.quote.mockImplementation(async (_mint, invoice: string) => ({
-      amountSats: Number(invoice.split(":")[1]), feeReserveSats: 0,
-      rawQuote: { quote: `quote-${++id}`, amount: Number(invoice.split(":")[1]), fee_reserve: 0, unit: "sat" },
+      amountSats: Number(invoice.split(":")[1]), feeReserveSats: reserve,
+      rawQuote: { quote: `quote-${++id}`, amount: Number(invoice.split(":")[1]), fee_reserve: reserve, unit: "sat" },
     }));
     fixture.wallet.mockResolvedValue(payoutWallet(async (quote, proofs) => {
       const pending: { batches: AdminBatch[] } = await fixture.batches.mock.results.at(-1)!.value;
@@ -89,7 +90,8 @@ describe("unusable proof isolation at the command boundary", () => {
       const error = reject(proofs);
       if (error) throw error;
       return { quote: { state: "PAID", payment_preimage: "receipt" } };
-    }, { mint: batch.mint_url }));
+    }, { mint: batch.mint_url, quote: async () => ({ fee_reserve: reserve }),
+      fee: async () => await fixture.fee.mock.results.at(-1)?.value ?? 0 }));
     vi.spyOn(console, "log").mockImplementation(() => undefined);
     vi.spyOn(console, "error").mockImplementation(() => undefined);
   });
@@ -112,6 +114,30 @@ describe("unusable proof isolation at the command boundary", () => {
     expect(logs).not.toContain(PRIVKEY);
     expect(process.journal.readInFlight(DVM)).toEqual([]);
     expect(new process.custody.MeltCustody().operations(DVM).flatMap(op => op.rows)).not.toContain("row-b");
+  });
+
+  it.each(["SIG_INPUTS", "SIG_ALL"])("submits a witness-free expired %s lock instead of setting it aside", async flag => {
+    batch.proofs[1] = proof("expired", LOCK, [["locktime", "1"], ["sigflag", flag]]);
+    const wallet: Wallet = await fixture.wallet();
+    const complete = vi.spyOn(wallet, "completeMelt");
+    const process = await processObjects(); await process.run();
+    expect(paidRows).toEqual(new Set(batch.row_ids));
+    const submitted = complete.mock.calls.flatMap(([preview]) => preview.inputs)
+      .find(p => p.secret === batch.proofs[1].secret);
+    expect(submitted).toBeDefined();
+    expect(submitted!.witness).toBeUndefined();
+    expect(process.output.json).toHaveBeenLastCalledWith(expect.objectContaining({
+      rows_set_aside: 0, sats_melted: 256, batches_failed: 0,
+    }));
+  });
+
+  it.each(["future lock", "expired refund lock"])("does not treat an unsigned %s as unlocked", async kind => {
+    const other = Buffer.from(getPubKeyFromPrivKey(Buffer.from("22".repeat(32), "hex"))).toString("hex");
+    const tags = kind === "future lock" ? [["locktime", "4000000000"]] : [["locktime", "1"], ["refund", other]];
+    batch.proofs[1] = proof("still-locked", other, tags);
+    const process = await processObjects(); await process.run();
+    expect(requests.map(r => r.rows)).toEqual([["row-a", "row-c", "row-d"]]);
+    expect(process.output.json).toHaveBeenLastCalledWith(expect.objectContaining({ rows_set_aside: 1, sats_melted: 192 }));
   });
 
   it("bisects an unidentified witness rejection and pays every usable sibling in the same run", async () => {
@@ -167,6 +193,84 @@ describe("unusable proof isolation at the command boundary", () => {
     ]);
     expect([...paidRows]).toEqual(["row-a", "row-c", "row-d"]);
     expect(new Set(fixture.mark.mock.calls.flatMap(([body]) => body.row_ids))).toEqual(paidRows);
+  });
+
+  it.each([0, 1, 2].flatMap(small => [0, 1, 2].filter(bad => bad !== small)
+    .flatMap(bad => [0, 1].map(inputFee => ({ small, bad, inputFee })))))("recombines a fee-limited fragment at $small after isolating $bad (input fee $inputFee)", async ({ small, bad, inputFee }) => {
+      batch.proofs = batch.proofs.slice(0, 3); batch.row_ids = batch.row_ids.slice(0, 3);
+      batch.proofs[small].amount = 1; batch.total_sats = 129;
+      reserve = 2;
+      fixture.fee.mockImplementation(async (_mint, proofs) => proofs.length * inputFee);
+      reject = proofs => proofs.some(p => p.secret === batch.proofs[bad].secret)
+        ? new MintOperationError(10001, "Proof verification failed") : undefined;
+      const process = await processObjects(); await process.run();
+      const usable = batch.row_ids.filter((_row, index) => index !== bad);
+      expect(paidRows).toEqual(new Set(usable));
+      expect(fixture.mark.mock.calls.flatMap(([body]) => body.row_ids)).toHaveLength(2);
+      expect(fixture.mark).toHaveBeenCalledWith(expect.objectContaining({ row_ids: expect.arrayContaining(usable) }));
+      expect(process.output.json).toHaveBeenLastCalledWith(expect.objectContaining({
+        batches_melted: 1, batches_skipped: 0, batches_failed: 0, rows_set_aside: 1, sats_set_aside: 64, sats_melted: 65,
+      }));
+      expect(process.journal.readInFlight(DVM)).toEqual([]);
+    });
+
+  it("keeps recombined requests within the mint's learned cap", async () => {
+    batch.proofs[0].amount = 1; batch.total_sats = 193; reserve = 2;
+    reject = proofs => proofs.length > 2 ? new MintOperationError(11014, "Request limit")
+      : proofs.some(p => p.secret === batch.proofs[1].secret) ? new MintOperationError(10001, "Proof verification failed") : undefined;
+    const process = await processObjects(); await process.run();
+    expect(requests[0].rows).toHaveLength(4);
+    expect(requests.slice(1).every(request => request.rows.length <= 2)).toBe(true);
+    expect(paidRows).toEqual(new Set(["row-a", "row-c", "row-d"]));
+    expect(process.output.json).toHaveBeenLastCalledWith(expect.objectContaining({ sats_melted: 129, rows_set_aside: 1 }));
+  });
+
+  it("retains an uneconomic fragment when the learned cap prevents combining it", async () => {
+    batch.proofs = batch.proofs.slice(0, 3); batch.row_ids = batch.row_ids.slice(0, 3);
+    batch.proofs[0].amount = 1; batch.total_sats = 129; reserve = 2;
+    reject = proofs => proofs.length > 1 ? new MintOperationError(11014, "Request limit")
+      : proofs.some(p => p.secret === batch.proofs[1].secret) ? new MintOperationError(10001, "Proof verification failed") : undefined;
+    const process = await processObjects(); await process.run();
+    expect(requests.map(request => request.rows.length)).toEqual([3, 1, 1]);
+    expect(paidRows).toEqual(new Set(["row-c"]));
+    expect(process.output.json).toHaveBeenLastCalledWith(expect.objectContaining({ batches_skipped: 1, sats_melted: 64, rows_set_aside: 1 }));
+  });
+
+  it("keeps deferred fragments out of incompatible signing groups", async () => {
+    batch.proofs = [proof("small", LOCK, [["sigflag", "SIG_ALL"]]), proof("bad"), proof("good")];
+    batch.row_ids = ["small", "bad", "good"]; batch.proofs[0].amount = 1; batch.total_sats = 129; reserve = 2;
+    reject = proofs => proofs.some(p => p.secret === batch.proofs[1].secret)
+      ? new MintOperationError(10001, "Proof verification failed") : undefined;
+    const process = await processObjects(); await process.run();
+    expect(requests.every(request => !request.rows.includes("small"))).toBe(true);
+    expect(paidRows).toEqual(new Set(["good"]));
+    expect(process.output.json).toHaveBeenLastCalledWith(expect.objectContaining({
+      batches_skipped: 1, rows_set_aside: 1, sats_melted: 64,
+    }));
+  });
+
+  it("finishes a wholly fee-limited batch without repeating quotes or setting aside rows", async () => {
+    reserve = 300;
+    const process = await processObjects(); await process.run();
+    expect(fixture.quote).toHaveBeenCalledTimes(1);
+    expect(requests).toEqual([]);
+    expect(process.output.json).toHaveBeenLastCalledWith(expect.objectContaining({ batches_skipped: 1, rows_set_aside: 0 }));
+  });
+
+  it("keeps recombined inputs held on their original quote after an uncertain submission", async () => {
+    batch.proofs = batch.proofs.slice(0, 3); batch.row_ids = batch.row_ids.slice(0, 3);
+    batch.proofs[0].amount = 1; batch.total_sats = 129; reserve = 2;
+    reject = proofs => proofs.some(p => p.secret === batch.proofs[1].secret)
+      ? new MintOperationError(10001, "Proof verification failed") : new Error("response lost");
+    const process = await processObjects(); await expect(process.run()).rejects.toMatchObject({ code: "batches_failed" });
+    const held = process.journal.readInFlight(DVM);
+    expect(held).toHaveLength(1);
+    expect(new Set(held[0].rowIds)).toEqual(new Set(["row-a", "row-c"]));
+    const before = requests.length;
+    await (await processObjects()).run();
+    expect(requests.slice(before).every(request => request.rows.every(row => row !== "row-a" && row !== "row-c"))).toBe(true);
+    expect(process.journal.readInFlight(DVM).map(entry => entry.quoteId)).toEqual([held[0].quoteId]);
+    expect(fixture.mark).not.toHaveBeenCalled();
   });
 
   it.each([new Error("pubkeys must be unique."), new MintOperationError(11000, "unknown transaction failure"),

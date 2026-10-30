@@ -648,10 +648,12 @@ async function meltBatchChunks(
   }
 
   const setAside = new Set<number>();
+  let drainingDeferred = false;
   const aside = (indices: number[], reason: string, code: number | null = null) => {
     for (const index of indices) {
       if (setAside.has(index)) continue;
       setAside.add(index);
+      drainingDeferred = false;
       logEvent(ctx, "melt_pending_row_set_aside", {
         mint_url: batch.mint_url, row_id: batch.row_ids[index], sats: batch.proofs[index].amount,
         reason, ...(code === null ? {} : { mint_code: code }),
@@ -669,14 +671,33 @@ async function meltBatchChunks(
     }
   }
   const queue = [availableIndices.filter(index => !setAside.has(index))];
-  while (queue.length > 0) {
-    const remaining = queue.shift()!;
+  let deferred: number[] = [];
+  const unspentOutcomes = new Map<string, "fee_starved" | WitnessRejection>();
+  const inputKey = (indices: number[]) => indices.toSorted((a, b) => a - b).join(",");
+  while (queue.length > 0 || deferred.length > 0) {
+    if (queue.length === 0) {
+      // One final regrouping pass, unless isolating another row makes new
+      // combinations possible. Cached no-spend results bound repeated work.
+      if (drainingDeferred) break;
+      queue.push(deferred); deferred = []; drainingDeferred = true;
+    }
+    let remaining = queue.shift()!;
     if (remaining.length === 0) continue;
     const cap = inputCapsByMint.get(batch.mint_url) ?? DEFAULT_MELT_INPUT_CAP;
     // SIG_ALL commits to all inputs, so it cannot share a request with a
     // different spending condition. Preserve the mint's cap independently.
-    const boundary = remaining.findIndex(index => groups.get(index) !== groups.get(remaining[0]));
-    const count = Math.min(cap, boundary < 0 ? remaining.length : boundary);
+    const chunkLength = (members: number[]) => {
+      const boundary = members.findIndex(index => groups.get(index) !== groups.get(members[0]));
+      return Math.min(cap, boundary < 0 ? members.length : boundary);
+    };
+    let count = chunkLength(remaining);
+    const extras = deferred.filter(index => groups.get(index) === groups.get(remaining[0])).slice(0, cap - 1);
+    const combined = [...extras, ...remaining.slice(0, Math.min(count, cap - extras.length))];
+    if (extras.length > 0 && !unspentOutcomes.has(inputKey(combined))) {
+      deferred = deferred.filter(index => !extras.includes(index));
+      remaining = [...extras, ...remaining];
+      count = chunkLength(remaining);
+    }
     const indices = remaining.slice(0, count);
     const rest = remaining.slice(count);
     const proofs = indices.map(i => batch.proofs[i]);
@@ -684,7 +705,9 @@ async function meltBatchChunks(
       ...batch, proofs, row_ids: indices.map(i => batch.row_ids[i]),
       total_sats: proofs.reduce((sum, proof) => sum + proof.amount, 0),
     };
-    const outcome = await meltBatch(ctx, chunk);
+    const key = inputKey(indices);
+    const outcome = unspentOutcomes.get(key) ?? await meltBatch(ctx, chunk);
+    if (outcome === "fee_starved" || typeof outcome === "object") unspentOutcomes.set(key, outcome);
     if (outcome === "input_cap_exceeded" && indices.length > 1) {
       const reducedCap = Math.max(1, Math.floor(indices.length / 2));
       inputCapsByMint.set(batch.mint_url, reducedCap);
@@ -700,9 +723,17 @@ async function meltBatchChunks(
         aside(rejected.length > 0 ? rejected : indices, "witness_rejected", outcome.code);
         queue.unshift(indices.filter(index => !setAside.has(index)), rest);
       } else {
-        const middle = Math.floor(indices.length / 2);
-        queue.unshift(indices.slice(0, middle), indices.slice(middle), rest);
+        // Find small leaves before spending rich siblings they may need to
+        // cover fees once the rejected row has been isolated.
+        const ordered = indices.toSorted((a, b) => batch.proofs[a].amount - batch.proofs[b].amount);
+        const middle = Math.floor(ordered.length / 2);
+        queue.unshift(ordered.slice(0, middle), ordered.slice(middle), rest);
       }
+      continue;
+    }
+    if (outcome === "fee_starved") {
+      deferred.push(...indices);
+      queue.unshift(rest);
       continue;
     }
     if (outcome === "melted" || outcome === "paid_unresolved") satsMelted += chunk.total_sats;
@@ -711,6 +742,7 @@ async function meltBatchChunks(
     queue.unshift(rest);
   }
 
+  skipped ||= deferred.length > 0;
   return {
     outcome: failed ? (satsMelted > 0 ? "melted" : "failed") :
       skipped || satsMelted === 0 ? "skipped" : "melted",
@@ -722,7 +754,7 @@ async function meltBatchChunks(
 async function meltBatch(
   ctx: CustodyContext,
   batch: AdminBatch
-): Promise<BatchOutcome | "input_cap_exceeded" | "paid_unresolved" | WitnessRejection> {
+): Promise<BatchOutcome | "input_cap_exceeded" | "paid_unresolved" | "fee_starved" | WitnessRejection> {
   const batchKeypair = ctx.keypairsByPubkey.get(toLockPubkey(batch.lock_pubkey));
   if (!batchKeypair) {
     // No matching privkey in `0..current_rotation_index` — either the batch
@@ -768,7 +800,7 @@ async function meltBatch(
       total_sats: batch.total_sats,
       input_fees: inputFees,
     });
-    return "skipped";
+    return "fee_starved";
   }
 
   let bolt11: string;
@@ -809,7 +841,7 @@ async function meltBatch(
         fee_reserve_sats: quote.feeReserveSats,
         input_fees: inputFees,
       });
-      return "skipped";
+      return "fee_starved";
     }
 
     try {
@@ -845,7 +877,7 @@ async function meltBatch(
         input_fees: inputFees,
         retry: true,
       });
-      return "skipped";
+      return "fee_starved";
     }
   }
 
