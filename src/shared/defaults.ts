@@ -127,6 +127,8 @@ export const PROXY_STATE_FILE = join(ADMIN_DIR, "proxy.json");
  * at import time; setting the env after the process boots has no effect.
  */
 export const BUILDER_CONFIG_DIR = process.env.DVMKIT_CONFIG_DIR ?? join(homedir(), ".dvmkit");
+/** An explicit tree must never acquire legacy recovery words through a read. */
+export const BUILDER_CONFIG_DIR_EXPLICIT = process.env.DVMKIT_CONFIG_DIR !== undefined;
 export const BUILDER_FILE = join(BUILDER_CONFIG_DIR, "builder.json");
 /** Current builder Cashu lock-key derivation root (mode 0600). */
 export const BUILDER_MNEMONIC_FILE = join(BUILDER_CONFIG_DIR, "builder.mnemonic");

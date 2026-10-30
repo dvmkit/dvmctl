@@ -1,7 +1,9 @@
+import { resolve } from "node:path";
+
 import { DvmError, generateIdentity, writeIdentity } from "@dvmkit/sdk/internal";
 
 import { loadIdentityPubkey } from "../../shared/builder-store.ts";
-import { BUILDER_FILE, BUILDER_KEY_FILE } from "../../shared/defaults.ts";
+import { BUILDER_CONFIG_DIR, BUILDER_FILE, BUILDER_KEY_FILE } from "../../shared/defaults.ts";
 import { info, json } from "../../shared/output.ts";
 
 export interface IdentityCreateOptions {
@@ -32,11 +34,13 @@ export function identityCreate(opts: IdentityCreateOptions): void {
   const keypair = generateIdentity();
   writeIdentity(keypair, { force: opts.force });
   if (opts.quiet) return;
+  const configDir = resolve(BUILDER_CONFIG_DIR);
   const isWindows = process.platform === "win32";
   if (opts.human) {
     info("Builder identity created.");
     info(`  pubkey: ${keypair.pubkey}`);
     info(`  secret stored at: ${BUILDER_KEY_FILE}`);
+    info(`  builder directory: ${configDir} (DVMKIT_CONFIG_DIR; separate from authentication's DVMCTL_CONFIG_DIR)`);
     if (isWindows) {
       info("");
       info("⚠  Windows does not enforce Unix file permissions. Make sure");
@@ -51,6 +55,8 @@ export function identityCreate(opts: IdentityCreateOptions): void {
   } else {
     json({
       status: "created",
+      configDir,
+      configDirEnv: "DVMKIT_CONFIG_DIR",
       identity_pubkey: keypair.pubkey,
       secret_path: BUILDER_KEY_FILE,
       pubkey_path: BUILDER_FILE,
@@ -74,13 +80,19 @@ export function identityShow(opts: IdentityShowOptions): void {
     throw new DvmError(
       "identity_missing",
       "No builder identity exists.",
-      "Run `dvmctl identity create` to generate one."
+      `Checked ${resolve(BUILDER_CONFIG_DIR)} (DVMKIT_CONFIG_DIR; separate from authentication's DVMCTL_CONFIG_DIR). Run \`dvmctl identity create\` to generate one.`
     );
   }
   if (opts.human) {
     info(`identity_pubkey: ${pubkey}`);
     info(`stored at: ${BUILDER_FILE}`);
+    info(`Builder directory: ${resolve(BUILDER_CONFIG_DIR)} (DVMKIT_CONFIG_DIR; separate from authentication's DVMCTL_CONFIG_DIR).`);
   } else {
-    json({ identity_pubkey: pubkey, pubkey_path: BUILDER_FILE });
+    json({
+      identity_pubkey: pubkey,
+      pubkey_path: BUILDER_FILE,
+      configDir: resolve(BUILDER_CONFIG_DIR),
+      configDirEnv: "DVMKIT_CONFIG_DIR",
+    });
   }
 }

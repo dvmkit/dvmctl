@@ -1,12 +1,15 @@
+import { resolve } from "node:path";
+
 import { DvmError } from "@dvmkit/sdk/internal";
 
 import {
   generateRecoveryMnemonic,
+  getBuilderMnemonicMigrationHint,
   isValidMnemonic,
   readBuilderMnemonic,
   writeBuilderMnemonic,
 } from "../../lib/builder-mnemonic.ts";
-import { BUILDER_MNEMONIC_FILE } from "../../shared/defaults.ts";
+import { BUILDER_CONFIG_DIR, BUILDER_MNEMONIC_FILE } from "../../shared/defaults.ts";
 import { info, json } from "../../shared/output.ts";
 
 export interface LockCreateOptions {
@@ -19,8 +22,8 @@ export interface LockCreateOptions {
 
 /**
  * Generate (or import) a BIP-39 mnemonic for builder Cashu P2PK lock
- * keypairs (tracked change rename of `dvmctl keygen`). Saves the mnemonic to
- * `~/.dvmkit/builder.mnemonic`. The mnemonic is the derivation root for
+ * keypairs. Saves the mnemonic to `~/.dvmkit/builder.mnemonic` by default.
+ * The mnemonic is the derivation root for
  * per-DVM lock keypairs (`dvmctl deploy` / `rotate` / `melt-pending`).
  *
  * An existing mnemonic is reported as `already_exists` and left alone unless
@@ -29,11 +32,14 @@ export interface LockCreateOptions {
  * `.bak` sibling and its path surfaced.
  */
 export function lockCreate(opts: LockCreateOptions): void {
+  const configDir = resolve(BUILDER_CONFIG_DIR);
+  const directoryHint = `Builder directory: ${configDir} (DVMKIT_CONFIG_DIR; separate from authentication's DVMCTL_CONFIG_DIR).`;
   const existing = readBuilderMnemonic();
   if (existing && !opts.import && !opts.force) {
     if (opts.human) {
       info("Builder mnemonic already exists.");
       info(`Mnemonic stored at: ${BUILDER_MNEMONIC_FILE}`);
+      info(directoryHint);
       info("\nTo replace it, re-run with --force (fresh words) or --import <words>");
       info("(known words). Either way the current mnemonic is copied to a");
       info("timestamped .bak sibling first.");
@@ -43,11 +49,22 @@ export function lockCreate(opts: LockCreateOptions): void {
     } else {
       json({
         status: "already_exists",
+        configDir,
+        configDirEnv: "DVMKIT_CONFIG_DIR",
         mnemonicFile: BUILDER_MNEMONIC_FILE,
         hint: `A builder mnemonic already exists, so nothing was written. Re-run with --force to generate fresh words, or --import <words> to restore a known mnemonic; either way the current mnemonic is copied to a timestamped .bak sibling (mode 0600) first. Replacing it makes proofs locked to lock pubkeys derived from the current words unspendable, so \`dvmctl deploy\` has to be re-run for every DVM afterwards.`,
       });
     }
     return;
+  }
+
+  const migrationHint = getBuilderMnemonicMigrationHint();
+  if (migrationHint && !opts.import && !opts.force) {
+    throw new DvmError(
+      "mnemonic_exists",
+      `No builder mnemonic was written in ${configDir} (DVMKIT_CONFIG_DIR).`,
+      `${migrationHint} To create independent words instead, explicitly pass --force; the legacy file will remain in place.`
+    );
   }
 
   let mnemonic: string;
@@ -85,6 +102,7 @@ export function lockCreate(opts: LockCreateOptions): void {
       info("Builder mnemonic imported.\n");
     }
     info(`Mnemonic stored at: ${BUILDER_MNEMONIC_FILE}`);
+    info(directoryHint);
     if (backupFile) {
       info(`Previous mnemonic backed up to: ${backupFile}`);
       info(
@@ -97,6 +115,8 @@ export function lockCreate(opts: LockCreateOptions): void {
   } else {
     json({
       status: opts.import ? "imported" : "generated",
+      configDir,
+      configDirEnv: "DVMKIT_CONFIG_DIR",
       mnemonicFile: BUILDER_MNEMONIC_FILE,
       ...(backupFile
         ? {

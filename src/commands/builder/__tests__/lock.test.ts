@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../../../lib/builder-mnemonic", () => ({
   generateRecoveryMnemonic: vi.fn(),
+  getBuilderMnemonicMigrationHint: vi.fn(() => null),
   isValidMnemonic: vi.fn(),
   readBuilderMnemonic: vi.fn(),
   writeBuilderMnemonic: vi.fn(),

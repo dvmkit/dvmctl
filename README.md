@@ -39,6 +39,8 @@ To scaffold directly, run `dvmctl create my-dvm`, enter the directory, install i
 
 Commands return structured output by default. Use `--human` for terminal output and `dvmctl --help` for the command list.
 
+Builder keys, recovery words, and records live in `~/.dvmkit`; set `DVMKIT_CONFIG_DIR` before creating them to select another directory. This is separate from `DVMCTL_CONFIG_DIR`, which moves authentication state in `~/.dvmctl`; caller wallet state uses `DVM_CONFIG_DIR` (default `~/.dvm`).
+
 Payment setup, secrets, content holds, financial export, and retirement are covered by the skill's task procedures and the [dvmctl reference](https://dvmkit.com/docs/cli-dvmctl).
 
 The CLI pins `@dvmkit/sdk` to `0.16.2` in [package.json](package.json), and new scaffolds inherit that exact version. `dvmctl dev` and `dvmctl serve` use the CLI's pinned SDK, print its version, and warn when the project's installed SDK differs. The local `/_dev` test page also shows the serving SDK version.

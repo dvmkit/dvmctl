@@ -18,11 +18,15 @@ let tmpDir: string;
 let mnemonicPath: string;
 let renamedLegacyPath: string;
 let splitLegacyPath: string;
+let explicitBuilderDir: boolean;
 
 vi.mock("../../shared/defaults", async () => {
   return {
     get BUILDER_CONFIG_DIR() {
       return tmpDir;
+    },
+    get BUILDER_CONFIG_DIR_EXPLICIT() {
+      return explicitBuilderDir;
     },
     get BUILDER_MNEMONIC_FILE() {
       return mnemonicPath;
@@ -43,6 +47,7 @@ vi.mock("../../shared/output", () => ({ info: vi.fn() }));
 // *after* the rename is the whole point, and only the filesystem can answer it.
 import {
   generateRecoveryMnemonic,
+  getBuilderMnemonicMigrationHint,
   readBuilderMnemonic,
   writeBuilderMnemonic,
 } from "../builder-mnemonic";
@@ -64,6 +69,7 @@ describe("writeBuilderMnemonic", () => {
     mnemonicPath = join(tmpDir, "builder.mnemonic");
     renamedLegacyPath = join(tmpDir, "recovery.mnemonic");
     splitLegacyPath = join(tmpDir, "legacy", "recovery.mnemonic");
+    explicitBuilderDir = false;
   });
 
   afterEach(() => {
@@ -191,5 +197,52 @@ describe("writeBuilderMnemonic", () => {
 
     expect(existsSync(splitLegacyPath)).toBe(false);
     expect(readFileSync(mnemonicPath, "utf-8").trim()).toBe(WORDS_A);
+  });
+
+  it.each(["caller", "builder"])("leaves the %s legacy mnemonic untouched with an explicit builder tree", (location) => {
+    explicitBuilderDir = true;
+    mkdirSync(join(tmpDir, "legacy"), { mode: 0o700 });
+    const legacyPath = location === "caller" ? splitLegacyPath : renamedLegacyPath;
+    writeFileSync(legacyPath, WORDS_A + "\n", { mode: 0o644 });
+    const before = readdirSync(tmpDir);
+
+    expect(readBuilderMnemonic()).toBeNull();
+    expect(readBuilderMnemonic()).toBeNull();
+
+    expect(readdirSync(tmpDir)).toEqual(before);
+    expect(readFileSync(legacyPath, "utf-8")).toBe(WORDS_A + "\n");
+    expect(statSync(legacyPath).mode & 0o777).toBe(0o644);
+    const hint = getBuilderMnemonicMigrationHint();
+    expect(hint).toContain(legacyPath);
+    expect(hint).toContain("DVMKIT_CONFIG_DIR");
+    expect(hint).toContain("dvmctl lock create --import");
+    expect(hint).not.toContain(WORDS_A);
+  });
+
+  it("does not create an explicit builder directory on a legacy-only read", () => {
+    explicitBuilderDir = true;
+    const root = tmpDir;
+    splitLegacyPath = join(root, "recovery.mnemonic");
+    writeFileSync(splitLegacyPath, WORDS_A + "\n");
+    tmpDir = join(root, "builder");
+    mnemonicPath = join(tmpDir, "builder.mnemonic");
+    renamedLegacyPath = join(tmpDir, "recovery.mnemonic");
+    try {
+      expect(readBuilderMnemonic()).toBeNull();
+      expect(existsSync(tmpDir)).toBe(false);
+      expect(readFileSync(splitLegacyPath, "utf-8")).toBe(WORDS_A + "\n");
+    } finally {
+      tmpDir = root;
+    }
+  });
+
+  it("reads the current mnemonic in an explicit tree without touching a legacy file", () => {
+    explicitBuilderDir = true;
+    writeFileSync(mnemonicPath, WORDS_B + "\n");
+    writeFileSync(renamedLegacyPath, WORDS_A + "\n");
+
+    expect(readBuilderMnemonic()).toBe(WORDS_B);
+    expect(getBuilderMnemonicMigrationHint()).toBeNull();
+    expect(readFileSync(renamedLegacyPath, "utf-8")).toBe(WORDS_A + "\n");
   });
 });
