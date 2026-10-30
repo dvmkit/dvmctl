@@ -37,6 +37,7 @@ await preservePrimaryFailure(async () => {
   await live(cliPath, project, "dev", false, true);
   await assertDevReload(cliPath, project);
   await expectMissingDatabase(cliPath, project);
+  await assertMultiCapability(cliPath, project);
   if (full) {
     if (!process.env.DATABASE_URL) fail("--full requires DATABASE_URL for disposable PostgreSQL");
     await live(cliPath, project, "serve", true);
@@ -126,8 +127,8 @@ async function assertProjectEnvironment(cli, project) {
     if (`${doctor.stdout}\n${doctor.stderr}`.includes(privateValue)) fail("unreadable project .env error exposed file content");
   } finally { rmSync(envPath, { recursive: true, force: true }); }
 }
-/** @param {string} cli @param {string} project @param {"dev" | "serve"} mode @param {boolean} database @param {boolean} [noReload] */
-async function live(cli, project, mode, database, noReload = false) {
+/** @param {string} cli @param {string} project @param {"dev" | "serve"} mode @param {boolean} database @param {boolean} [noReload] @param {Array<{capability: string, summary: string}>} [jobs] */
+async function live(cli, project, mode, database, noReload = false, jobs = [{ capability: "first-project", summary: "typed smoke" }]) {
   const port = await availablePort();
   const args = [mode, "handler.ts", "--port", String(port), ...(noReload ? ["--no-reload"] : [])];
   const child = start(cli, args, { cwd: project, database });
@@ -151,11 +152,50 @@ async function live(cli, project, mode, database, noReload = false) {
       const response = await getResponse(port, "/_dev");
       if (response?.statusCode !== 404) fail("production serve did not return 404 for the development page");
     }
-    await assertTypedJob(port);
+    for (const job of jobs) await assertTypedJob(port, job.capability, job.summary);
     if (projectVersion !== servingVersion) {
       await until(() => stderr.includes(`dvmctl serves with @dvmkit/sdk ${servingVersion}`) && stderr.includes(`project has @dvmkit/sdk ${projectVersion} installed`), { child, output: () => stdout + stderr }, () => "SDK mismatch warning did not name both versions");
     } else if (stderr.includes("Warning: dvmctl serves with @dvmkit/sdk")) fail("matching SDK versions produced a mismatch warning");
   }, async () => { await stop(child); });
+}
+/** @param {string} cli @param {string} project */
+async function assertMultiCapability(cli, project) {
+  const handlerPath = join(project, "handler.ts");
+  const original = readFileSync(handlerPath, "utf8");
+  writeFileSync(handlerPath, `import { configureDVM, z } from "@dvmkit/sdk";
+const input = z.object({ text: z.string() });
+export default configureDVM({
+  name: "Multi smoke",
+  capabilities: {
+    alpha: {
+      input, example: { text: "hello" }, state: { prefix: "alpha:" },
+      onJob(ctx) {
+        ctx.artifact({ data: ctx.input.text, mime_type: "application/json", name: "result.json" });
+        ctx.complete(ctx.state.prefix + ctx.input.text);
+      },
+    },
+    beta: {
+      input, example: { text: "hello" }, state: { prefix: "beta:" },
+      onJob(ctx) {
+        ctx.artifact({ data: ctx.input.text, mime_type: "application/json", name: "result.json" });
+        ctx.complete(ctx.state.prefix + ctx.input.text);
+      },
+    },
+  },
+});
+`);
+  const jobs = [
+    { capability: "alpha", summary: "alpha:typed smoke" },
+    { capability: "beta", summary: "beta:typed smoke" },
+  ];
+  try {
+    const validated = lastJson((await command(cli, ["validate"], { cwd: project, capture: true })).stdout);
+    if (validated.status !== "ok" || JSON.stringify(validated.capabilities) !== JSON.stringify(["alpha", "beta"])) fail("multi-capability validation did not list both capabilities");
+    await live(cli, project, "dev", false, false, jobs);
+    await live(cli, project, "dev", false, true, jobs);
+    await expectMissingDatabase(cli, project);
+    if (full) await live(cli, project, "serve", true, false, jobs);
+  } finally { writeFileSync(handlerPath, original); }
 }
 /** @param {string} cli @param {string} project */
 async function assertSdkMismatch(cli, project) {
@@ -272,10 +312,10 @@ async function expectMissingDatabase(cli, project) { const result = await proces
 /** @param {number} port @param {string} path @returns {Promise<{ statusCode: number | undefined, body: string } | null>} */ function getResponse(port, path) { return new Promise((done) => { const probe = request({ host: "127.0.0.1", port, path, timeout: 500 }, (response) => { let body = ""; response.setEncoding("utf8"); response.on("data", (chunk) => { body += chunk; }); response.on("end", () => { done({ statusCode: response.statusCode, body }); }); }); probe.once("error", () => done(null)); probe.once("timeout", () => { probe.destroy(); done(null); }); probe.end(); }); }
 /** @param {import("node:child_process").ChildProcess} child */ async function stop(child) { if (!await stopProcess(child)) fail("server process did not stop"); }
 function availablePort() { return new Promise((done, reject) => { const server = createServer(); server.once("error", reject); server.listen(0, "127.0.0.1", () => { const address = server.address(); if (!address || typeof address === "string") reject(new Error("could not allocate a local port")); else server.close((error) => error ? reject(error) : done(address.port)); }); }); }
-/** @param {number} port */
-async function assertTypedJob(port) {
-  const submitted = await postJson(port, "/v1/job", { capability: "first-project", input: JSON.stringify({ text: "typed smoke" }) });
-  if (submitted.statusCode !== 200 || submitted.body.status !== "completed" || submitted.body.summary !== "typed smoke" || typeof submitted.body.job_id !== "string") fail("typed free job did not complete");
+/** @param {number} port @param {string} capability @param {string} summary */
+async function assertTypedJob(port, capability, summary) {
+  const submitted = await postJson(port, "/v1/job", { capability, input: JSON.stringify({ text: "typed smoke" }) });
+  if (submitted.statusCode !== 200 || submitted.body.status !== "completed" || submitted.body.summary !== summary || typeof submitted.body.job_id !== "string") fail(`typed free job did not complete for ${capability}`);
   const messages = await getJson(port, `/v1/job/${submitted.body.job_id}/messages`, submitted.body.job_token);
   if (messages.statusCode !== 200 || !Array.isArray(messages.body.messages) || !messages.body.messages.some((/** @type {{type?: string, content?: {name?: string, mime_type?: string}}} */ message) => message?.type === "artifact" && message?.content?.name === "result.json" && message?.content?.mime_type === "application/json")) fail("typed completed job did not retain its artifact");
 }

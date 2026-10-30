@@ -60,7 +60,12 @@ function descriptorFromExport(
   if (isDescriptor(value)) return value;
   if (!isDescriptorSketch(value)) return undefined;
 
-  const { config, capabilities: _resolvedCapabilities, inputSchema, ...topLevel } = value;
+  const { config, capabilities: resolvedCapabilities, inputSchema, ...topLevel } = value;
+  // SDK descriptors mirror state at the top level even with explicit capabilities.
+  // Only config.state is a flat declaration in that shape; sketches keep their fallback.
+  if (resolvedCapabilities !== undefined && config.capabilities !== undefined) {
+    delete topLevel.state;
+  }
   const normalizedConfig: Record<string, unknown> = {
     ...topLevel,
     ...(inputSchema !== undefined ? { input: inputSchema } : {}),
