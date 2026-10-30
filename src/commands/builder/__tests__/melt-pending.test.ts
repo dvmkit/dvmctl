@@ -1,4 +1,4 @@
-import { rmSync } from "node:fs";
+import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { payoutWallet } from "../../../../test-support/payout-wallet.ts";
 import { BUILDER_CONFIG_DIR } from "../../../shared/defaults.ts";
@@ -1192,7 +1192,61 @@ describe("dvmctl melt-pending", () => {
     expect(summary.batches_melted).toBe(1);
   });
 
-  it("skips when the second-pass quote still demands more than the batch", async () => {
+  it("re-quotes a shrinking reserve before submitting exact inputs with empty change", async () => {
+    const { getPendingBatches, markMelted } = setHappyPath();
+    getPendingBatches.mockResolvedValue({ batches: [{
+      mint_url: "https://mint", lock_pubkey: PUBKEY, row_ids: ["r1"], total_sats: 2006, t_expire: null,
+      proofs: [{ id: "k", amount: 2006, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
+    }] });
+    // 2004 + 21 does not fit. The second invoice is 1983, but its reserve
+    // falls to 20: submitting now would leave 21 sats against a 20-sat ceiling.
+    vi.mocked(melt.getInputFeesForProofs).mockResolvedValue(2);
+    vi.mocked(lnurl.fetchLnurlPayInvoice).mockImplementation(async (_address, msats) => `invoice:${msats}`);
+    vi.mocked(melt.fetchMeltQuote).mockImplementation(async (_mint, invoice) => {
+      const amount = Number(invoice.split(":")[1]) / 1000;
+      const reserve = amount === 2004 ? 21 : 20;
+      return { amountSats: amount, feeReserveSats: reserve,
+        rawQuote: { quote: invoice, amount, fee_reserve: reserve, unit: "sat" } as never };
+    });
+    const submit = vi.fn().mockResolvedValue({ quote: { state: "PAID", payment_preimage: "receipt", change: [] }, change: [] });
+    vi.mocked(wallet.getWallet).mockResolvedValue(payoutWalletFixture(submit));
+    markMelted.mockResolvedValue({ melted: 1 });
+    await meltPending("dvm", { endpoint: "https://dvm.example" });
+    expect(vi.mocked(lnurl.fetchLnurlPayInvoice).mock.calls.map(call => call[1])).toEqual([2004000, 1983000, 1984000]);
+    expect(submit).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ quote: "invoice:1984000" }),
+      [expect.objectContaining({ secret: "s" })], expect.anything());
+    expect(submit.mock.calls[0][1].map((proof: { amount: unknown }) => String(proof.amount))).toEqual(["2006"]);
+    const { data } = JSON.parse(readFileSync(join(BUILDER_CONFIG_DIR, "melt-custody.json"), "utf8"));
+    expect(data.operations[0]).toMatchObject({ invoiceAmount: "1984", inputFee: "2", reserve: "20",
+      acknowledged: true, quarantine: false, complete: true, evidence: "explicit_empty" });
+    expect(markMelted).toHaveBeenCalledOnce();
+  });
+
+  it.each(["oscillating", "changing"])("leaves inputs untouched when %s reserves cannot fit", async variant => {
+    const { getPendingBatches, markMelted } = setHappyPath();
+    getPendingBatches.mockResolvedValue({ batches: [{
+      mint_url: "https://mint", lock_pubkey: PUBKEY, row_ids: ["r1"], total_sats: 100, t_expire: null,
+      proofs: [{ id: "k", amount: 100, secret: "s", C: "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" }],
+    }] });
+    vi.mocked(lnurl.fetchLnurlPayInvoice).mockImplementation(async (_address, msats) => `invoice:${msats}`);
+    let quotes = 0;
+    vi.mocked(melt.fetchMeltQuote).mockImplementation(async (_mint, invoice) => {
+      const amount = Number(invoice.split(":")[1]) / 1000;
+      const reserve = variant === "oscillating" ? (amount === 98 ? 3 : 2) : ++quotes;
+      return { amountSats: amount, feeReserveSats: reserve,
+        rawQuote: { quote: invoice, amount, fee_reserve: reserve, unit: "sat" } as never };
+    });
+    const submit = vi.fn();
+    vi.mocked(wallet.getWallet).mockResolvedValue(payoutWalletFixture(submit));
+    await meltPending("dvm", { endpoint: "https://dvm.example" });
+    expect(vi.mocked(lnurl.fetchLnurlPayInvoice).mock.calls.map(call => call[1])).toEqual(
+      variant === "oscillating" ? [100000, 98000, 97000] : [100000, 99000, 98000, 97000]);
+    expect(submit).not.toHaveBeenCalled(); expect(markMelted).not.toHaveBeenCalled();
+    expect(meltLog.appendPreMelt).not.toHaveBeenCalled();
+    expect(output.json).toHaveBeenCalledWith(expect.objectContaining({ batches_skipped: 1, batches_failed: 0 }));
+  });
+
+  it("skips when repeated quotes cannot fit within the batch", async () => {
     const { getPendingBatches } = setHappyPath();
     getPendingBatches.mockResolvedValue({
       batches: [
@@ -1208,15 +1262,15 @@ describe("dvmctl melt-pending", () => {
     });
     vi.mocked(lnurl.fetchLnurlPayInvoice).mockResolvedValue("lnbc...");
     // First quote needs 50 + 5 = 55; retry. Second quote on a 45-sat invoice
-    // still needs 45 + 6 = 51 (mint's fee_reserve actually grew on the
-    // smaller invoice). Skipped.
+    // still needs 45 + 6 = 51. The mint repeats this cost after resizing
+    // again, so no exact fit is possible this tick.
     vi.mocked(melt.fetchMeltQuote)
       .mockResolvedValueOnce({
         amountSats: 50,
         feeReserveSats: 5,
         rawQuote: { quote: "q-pass1", amount: 50, fee_reserve: 5, unit: "sat" } as never,
       })
-      .mockResolvedValueOnce({
+      .mockResolvedValue({
         amountSats: 45,
         feeReserveSats: 6,
         rawQuote: { quote: "q-pass2", amount: 45, fee_reserve: 6, unit: "sat" } as never,
