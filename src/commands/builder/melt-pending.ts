@@ -1,5 +1,5 @@
 // Builder-owned payout surface shipped with dvmctl.
-import type { MeltQuoteBolt11Response, ProofLike } from "@cashu/cashu-ts";
+import { Wallet, type MeltQuoteBolt11Response, type ProofLike } from "@cashu/cashu-ts";
 import {
   type BuilderLockKeypair,
   checkMeltQuoteState,
@@ -47,6 +47,7 @@ import { info, json } from "../../shared/output.ts";
 import { dvmUrlUnsetError } from "./dvm-url.ts";
 import { type ResolvedDvm, resolveDvm } from "./resolve-dvm.ts";
 import { type DrainServiceContext, serviceDrains } from "./drain-service.ts";
+import { identifiedRejectedRows, isWitnessRejection, proofSigningGroup, type WitnessRejection } from "./melt-proof-isolation.ts";
 
 export interface MeltPendingOptions {
   /** Lightning address invoices are fetched from per batch via LNURL-pay.
@@ -110,6 +111,10 @@ export interface TickSummary {
   batches_melted: number;
   batches_skipped: number;
   batches_failed: number;
+  /** Batches with a paid chunk and an operational failure; still fail the run. */
+  batches_partial_failed: number;
+  rows_set_aside: number;
+  sats_set_aside: number;
   sats_melted: number;
   recovered: number;
   /** Credit-drain servicing counters. */
@@ -495,6 +500,9 @@ async function runLockedTick(ctx: CustodyContext): Promise<TickSummary> {
     batches_melted: 0,
     batches_skipped: 0,
     batches_failed: 0,
+    batches_partial_failed: 0,
+    rows_set_aside: 0,
+    sats_set_aside: 0,
     sats_melted: 0,
   };
 
@@ -536,6 +544,9 @@ async function runLockedTick(ctx: CustodyContext): Promise<TickSummary> {
   let melted = 0;
   let skipped = 0;
   let failed = 0;
+  let partialFailed = 0;
+  let rowsSetAside = 0;
+  let satsSetAside = 0;
   let satsMelted = 0;
   const inputCapsByMint = new Map<string, number>();
   const unresolvedByRow = new Map(
@@ -546,6 +557,9 @@ async function runLockedTick(ctx: CustodyContext): Promise<TickSummary> {
     if (result.outcome === "melted") melted++;
     else if (result.outcome === "skipped") skipped++;
     else failed++;
+    if (result.failed && result.outcome === "melted") partialFailed++;
+    rowsSetAside += result.rowsSetAside;
+    satsSetAside += result.satsSetAside;
     satsMelted += result.satsMelted;
   }
 
@@ -555,6 +569,9 @@ async function runLockedTick(ctx: CustodyContext): Promise<TickSummary> {
     batches_melted: melted,
     batches_skipped: skipped,
     batches_failed: failed,
+    batches_partial_failed: partialFailed,
+    rows_set_aside: rowsSetAside,
+    sats_set_aside: satsSetAside,
     sats_melted: satsMelted,
     melt_skipped: null,
   };
@@ -568,7 +585,7 @@ async function meltBatchChunks(
   batch: AdminBatch,
   unresolvedByRow: Map<string, UnresolvedMelt>,
   inputCapsByMint: Map<string, number>
-): Promise<{ outcome: BatchOutcome; satsMelted: number }> {
+): Promise<{ outcome: BatchOutcome; failed: boolean; satsMelted: number; rowsSetAside: number; satsSetAside: number }> {
   // Slicing by position is safe only with the admin API's one-row-per-proof contract.
   if (batch.row_ids.length !== batch.proofs.length || new Set(batch.row_ids).size !== batch.row_ids.length ||
       !Number.isSafeInteger(batch.total_sats) || batch.proofs.some(p => !Number.isSafeInteger(p.amount) || p.amount <= 0) ||
@@ -576,7 +593,7 @@ async function meltBatchChunks(
     logErr(ctx, "melt_pending_invalid_batch", new Error("Invalid batch row or native amount mapping"), {
       mint_url: batch.mint_url,
     });
-    return { outcome: "failed", satsMelted: 0 };
+    return { outcome: "failed", failed: true, satsMelted: 0, rowsSetAside: 0, satsSetAside: 0 };
   }
 
   let failed = false;
@@ -602,6 +619,7 @@ async function meltBatchChunks(
   for (const entry of heldEntries) {
     const ageMs = Math.max(0, Date.now() - entry.ts);
     if (isAcknowledgedPending(entry)) {
+      skipped = true;
       logEvent(ctx, "melt_pending_batch_acknowledged", {
         mint_url: entry.mintUrl,
         quote_id: entry.quoteId,
@@ -610,7 +628,6 @@ async function meltBatchChunks(
         reason: entry.acknowledged.reason,
         acknowledged_at: new Date(entry.acknowledged.ts).toISOString(),
       });
-      skipped = true;
       continue;
     }
     const alarmed = ageMs >= IN_FLIGHT_MELT_ALARM_AFTER_MS;
@@ -630,42 +647,114 @@ async function meltBatchChunks(
     else skipped = true;
   }
 
-  let offset = 0;
-  while (offset < availableIndices.length) {
+  const setAside = new Set<number>();
+  let drainingDeferred = false;
+  const aside = (indices: number[], reason: string, code: number | null = null) => {
+    for (const index of indices) {
+      if (setAside.has(index)) continue;
+      setAside.add(index);
+      drainingDeferred = false;
+      logEvent(ctx, "melt_pending_row_set_aside", {
+        mint_url: batch.mint_url, row_id: batch.row_ids[index], sats: batch.proofs[index].amount,
+        reason, ...(code === null ? {} : { mint_code: code }),
+      });
+    }
+  };
+  const keypair = ctx.keypairsByPubkey.get(toLockPubkey(batch.lock_pubkey));
+  const groups = new Map<number, string>();
+  if (keypair) {
+    const signer = new Wallet(batch.mint_url);
+    for (const index of availableIndices) {
+      const group = proofSigningGroup(signer, batch.proofs[index], keypair.privkey);
+      if (group === null) aside([index], "witness_unavailable");
+      else groups.set(index, group);
+    }
+  }
+  const queue = [availableIndices.filter(index => !setAside.has(index))];
+  let deferred: number[] = [];
+  const unspentOutcomes = new Map<string, "fee_starved" | WitnessRejection>();
+  const inputKey = (indices: number[]) => indices.toSorted((a, b) => a - b).join(",");
+  while (queue.length > 0 || deferred.length > 0) {
+    if (queue.length === 0) {
+      // One final regrouping pass, unless isolating another row makes new
+      // combinations possible. Cached no-spend results bound repeated work.
+      if (drainingDeferred) break;
+      queue.push(deferred); deferred = []; drainingDeferred = true;
+    }
+    let remaining = queue.shift()!;
+    if (remaining.length === 0) continue;
     const cap = inputCapsByMint.get(batch.mint_url) ?? DEFAULT_MELT_INPUT_CAP;
-    const indices = availableIndices.slice(offset, offset + cap);
-    const proofs = indices.map((i) => batch.proofs[i]);
+    // SIG_ALL commits to all inputs, so it cannot share a request with a
+    // different spending condition. Preserve the mint's cap independently.
+    const chunkLength = (members: number[]) => {
+      const boundary = members.findIndex(index => groups.get(index) !== groups.get(members[0]));
+      return Math.min(cap, boundary < 0 ? members.length : boundary);
+    };
+    let count = chunkLength(remaining);
+    const extras = deferred.filter(index => groups.get(index) === groups.get(remaining[0])).slice(0, cap - 1);
+    const combined = [...extras, ...remaining.slice(0, Math.min(count, cap - extras.length))];
+    if (extras.length > 0 && !unspentOutcomes.has(inputKey(combined))) {
+      deferred = deferred.filter(index => !extras.includes(index));
+      remaining = [...extras, ...remaining];
+      count = chunkLength(remaining);
+    }
+    const indices = remaining.slice(0, count);
+    const rest = remaining.slice(count);
+    const proofs = indices.map(i => batch.proofs[i]);
     const chunk: AdminBatch = {
-      ...batch,
-      proofs,
-      row_ids: indices.map((i) => batch.row_ids[i]),
+      ...batch, proofs, row_ids: indices.map(i => batch.row_ids[i]),
       total_sats: proofs.reduce((sum, proof) => sum + proof.amount, 0),
     };
-    const outcome = await meltBatch(ctx, chunk);
+    const key = inputKey(indices);
+    const outcome = unspentOutcomes.get(key) ?? await meltBatch(ctx, chunk);
+    if (outcome === "fee_starved" || typeof outcome === "object") unspentOutcomes.set(key, outcome);
     if (outcome === "input_cap_exceeded" && indices.length > 1) {
       const reducedCap = Math.max(1, Math.floor(indices.length / 2));
       inputCapsByMint.set(batch.mint_url, reducedCap);
       logEvent(ctx, "melt_pending_input_cap_reduced", {
-        mint_url: batch.mint_url,
-        previous_input_cap: cap,
-        input_cap: reducedCap,
+        mint_url: batch.mint_url, previous_input_cap: cap, input_cap: reducedCap,
       });
-      // A definitive size rejection spent nothing. Retry these rows with a fresh quote.
+      queue.unshift(remaining);
       continue;
     }
-    if (outcome === "melted") satsMelted += chunk.total_sats;
-    else if (outcome === "skipped") skipped = true;
-    else failed = true;
-    offset += indices.length;
+    if (typeof outcome === "object") {
+      const rejected = indices.filter(index => outcome.rowIds.includes(batch.row_ids[index]));
+      if (rejected.length > 0 || indices.length === 1) {
+        aside(rejected.length > 0 ? rejected : indices, "witness_rejected", outcome.code);
+        queue.unshift(indices.filter(index => !setAside.has(index)), rest);
+      } else {
+        // Find small leaves before spending rich siblings they may need to
+        // cover fees once the rejected row has been isolated.
+        const ordered = indices.toSorted((a, b) => batch.proofs[a].amount - batch.proofs[b].amount);
+        const middle = Math.floor(ordered.length / 2);
+        queue.unshift(ordered.slice(0, middle), ordered.slice(middle), rest);
+      }
+      continue;
+    }
+    if (outcome === "fee_starved") {
+      deferred.push(...indices);
+      queue.unshift(rest);
+      continue;
+    }
+    if (outcome === "melted" || outcome === "paid_unresolved") satsMelted += chunk.total_sats;
+    if (outcome === "skipped") skipped = true;
+    else if (outcome !== "melted") failed = true;
+    queue.unshift(rest);
   }
 
-  return { outcome: failed ? "failed" : skipped ? "skipped" : "melted", satsMelted };
+  skipped ||= deferred.length > 0;
+  return {
+    outcome: failed ? (satsMelted > 0 ? "melted" : "failed") :
+      skipped || satsMelted === 0 ? "skipped" : "melted",
+    failed, satsMelted, rowsSetAside: setAside.size,
+    satsSetAside: [...setAside].reduce((sum, index) => sum + batch.proofs[index].amount, 0),
+  };
 }
 
 async function meltBatch(
   ctx: CustodyContext,
   batch: AdminBatch
-): Promise<BatchOutcome | "input_cap_exceeded"> {
+): Promise<BatchOutcome | "input_cap_exceeded" | "paid_unresolved" | "fee_starved" | WitnessRejection> {
   const batchKeypair = ctx.keypairsByPubkey.get(toLockPubkey(batch.lock_pubkey));
   if (!batchKeypair) {
     // No matching privkey in `0..current_rotation_index` — either the batch
@@ -711,7 +800,7 @@ async function meltBatch(
       total_sats: batch.total_sats,
       input_fees: inputFees,
     });
-    return "skipped";
+    return "fee_starved";
   }
 
   let bolt11: string;
@@ -752,7 +841,7 @@ async function meltBatch(
         fee_reserve_sats: quote.feeReserveSats,
         input_fees: inputFees,
       });
-      return "skipped";
+      return "fee_starved";
     }
 
     try {
@@ -788,7 +877,7 @@ async function meltBatch(
         input_fees: inputFees,
         retry: true,
       });
-      return "skipped";
+      return "fee_starved";
     }
   }
 
@@ -818,6 +907,15 @@ async function meltBatch(
     return "failed";
   }
   const { op, preview } = prepared;
+  try {
+    preview.inputs = wallet.signP2PKProofs(preview.inputs, batchKeypair.privkey, preview.outputData, op.quote);
+  } catch {
+    // Signing has made no request. Do not leave these rows held as if a mint
+    // might have received them; split them through the same isolation path.
+    op.submission = "rejected";
+    ctx.custody.commit();
+    return { outcome: "witness_rejected", rowIds: [], code: null };
+  }
   appendPreMelt({
     dvm_id: ctx.dvmId, row_ids: batch.row_ids, mint_url: batch.mint_url,
     quote_id: op.quote, lock_pubkey: batch.lock_pubkey, total_sats: batch.total_sats,
@@ -826,7 +924,7 @@ async function meltBatch(
   ctx.custody.commit();
   let submissionError = false;
   try {
-    const result = await wallet.completeMelt(preview, batchKeypair.privkey);
+    const result = await wallet.completeMelt(preview);
     ctx.custody.observe(op, "submission", result);
   } catch (err) {
     submissionError = true;
@@ -840,6 +938,9 @@ async function meltBatch(
       ctx.custody.commit();
       appendPostMelt({ dvm_id: ctx.dvmId, row_ids: batch.row_ids, quote_id: op.quote,
         status: "failed", error: `mint_rejection_${rejectionCode}` });
+      if (isWitnessRejection(rejectionCode, err)) return {
+        outcome: "witness_rejected", rowIds: identifiedRejectedRows(err, batch), code: rejectionCode,
+      };
       if (batch.proofs.length > 1 && (rejectionCode === 11014 || rejectionCode === 11015)) return "input_cap_exceeded";
       return "failed";
     }
@@ -907,7 +1008,7 @@ async function meltBatch(
       row_ids: batch.row_ids,
       quote_id: quote.rawQuote.quote,
     });
-    return "failed";
+    return "paid_unresolved";
   }
 
   op.acknowledged = true;
@@ -927,7 +1028,7 @@ async function meltBatch(
     quote_id: quote.rawQuote.quote,
   });
   // The payout landed, but its change did not reconcile: keep the run's alarm.
-  return changeUnresolved ? "failed" : "melted";
+  return changeUnresolved ? "paid_unresolved" : "melted";
 }
 
 /**
@@ -971,12 +1072,12 @@ function noSpendRejectionCode(err: unknown): number | null {
     return code === 12001 || code === 12002 || code === 12003 ? code : null;
   }
   const code = mintOperationCode(err);
-  // Only assigned integer rejections establish finality. A direct failed
+  // Recognized protocol rejections establish finality. A direct failed
   // payment or expired-quote rejection differs from observing UNPAID/expiry
   // after a response was lost: this submission cannot later settle.
   return code !== null &&
     Number.isInteger(code) &&
-    (code === 10001 || (code >= 11005 && code <= 11015) ||
+    (isWitnessRejection(code, err) || (code >= 11005 && code <= 11015) ||
       code === 12001 || code === 12002 || code === 12003 || code === 20004 || code === 20007)
     ? code
     : null;
@@ -1263,10 +1364,10 @@ async function runWatchLoop(ctx: MeltContext, opts: MeltPendingOptions): Promise
  * refreshing a failed tick's stamp would make an alive daemon look successful.
  */
 function runFailure(ctx: MeltContext, summary: TickSummary): DvmError | null {
-  if (summary.batches_failed > 0) {
+  if (summary.batches_failed + summary.batches_partial_failed > 0) {
     return new DvmError(
       "batches_failed",
-      `${summary.batches_failed} batch(es) failed during this sweep.`,
+      `${summary.batches_failed} batch(es) failed and ${summary.batches_partial_failed} partially paid batch(es) had errors during this sweep.`,
       "Inspect the per-batch logs above. Transient failures retry on next run."
     );
   }
@@ -1376,7 +1477,9 @@ function emitTickSummary(summary: TickSummary, human: boolean, slug: string): vo
     info(
       `[${summary.tick}] dvm=${summary.dvm_id} seen=${summary.batches_seen} ` +
         `melted=${summary.batches_melted} skipped=${summary.batches_skipped} ` +
-        `failed=${summary.batches_failed} sats=${summary.sats_melted} recovered=${summary.recovered} ` +
+        `failed=${summary.batches_failed} partial_failed=${summary.batches_partial_failed} ` +
+        `set_aside=${summary.rows_set_aside} (${summary.sats_set_aside} sats) ` +
+        `sats=${summary.sats_melted} recovered=${summary.recovered} ` +
         `drains=${summary.drains_seen} parked=${summary.drains_parked} ` +
         `drain_failed=${summary.drains_failed} drain_queued=${summary.drains_queued} ` +
         `drain_manual=${summary.drains_manual}` +
