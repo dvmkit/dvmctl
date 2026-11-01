@@ -4,7 +4,7 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { randomTraceId } from "@dvmkit/sdk/internal";
+import { DvmError, randomTraceId } from "@dvmkit/sdk/internal";
 import { Command } from "commander";
 
 import type { ApiKeysCreateOptions } from "../commands/builder/api-keys-create.ts";
@@ -55,8 +55,8 @@ import type {
 import { feedbackDisable, feedbackEnable, feedbackList } from "../commands/builder/feedback.ts";
 import { feedbackPostureCommand, feedbackSend, type FeedbackSendOptions, type FeedbackPostureOptions } from "../commands/builder/feedback-send.ts";
 import { handle, handleCheck } from "../commands/builder/handle.ts";
-import type { IdentityCreateOptions, IdentityShowOptions } from "../commands/builder/identity.ts";
-import { identityCreate, identityShow } from "../commands/builder/identity.ts";
+import type { IdentityCreateOptions, IdentityImportOptions, IdentityShowOptions } from "../commands/builder/identity.ts";
+import { identityCreate, identityImport, identityShow } from "../commands/builder/identity.ts";
 import type { InfoOptions } from "../commands/builder/info.ts";
 import { dvmInfo } from "../commands/builder/info.ts";
 import type { InitOptions } from "../commands/builder/init.ts";
@@ -608,7 +608,7 @@ export function buildProgram(): Command {
   identityCmd
     .command("create")
     .description(
-      `Generate a per-workstation secp256k1 identity keypair. Persists builder.json and builder.key (0600) in ${resolve(BUILDER_CONFIG_DIR)} (default ~/.dvmkit; override with DVMKIT_CONFIG_DIR, separate from authentication's DVMCTL_CONFIG_DIR).`
+      `Generate a per-account secp256k1 identity keypair (refused when the account is already bound to a key; run "dvmctl identity import" on another machine). Persists builder.json and builder.key (0600) in ${resolve(BUILDER_CONFIG_DIR)} (default ~/.dvmkit; override with DVMKIT_CONFIG_DIR, separate from authentication's DVMCTL_CONFIG_DIR).`
     )
     .option(
       "--force",
@@ -616,8 +616,31 @@ export function buildProgram(): Command {
     )
     .option("--human", "Human-readable output instead of JSON")
     .action((opts: IdentityCreateOptions) => {
+      catchErrors(() => identityCreate(opts), opts.human);
+    });
+
+  identityCmd
+    .command("import")
+    .description(
+      `Install your account's existing identity on this machine from its 32-byte secret key (64 hex characters) read from stdin or --from-file; the secret is never accepted as an argument. Writes builder.key (0600) and builder.json in ${resolve(BUILDER_CONFIG_DIR)}.`
+    )
+    .allowExcessArguments(true)
+    .option("--from-file <path>", "Read the secret key from a file instead of stdin")
+    .option(
+      "--force",
+      "Replace a different existing identity (the old key is backed up first). Any DVMs deployed under the old key will need re-deploy."
+    )
+    .option("--human", "Human-readable output instead of JSON")
+    .action((opts: IdentityImportOptions, command: Command) => {
       catchErrors(() => {
-        identityCreate(opts);
+        if (command.args.length > 0) {
+          throw new DvmError(
+            "secret_in_argv",
+            "The identity secret must not be passed as a command argument.",
+            "Pipe it on stdin (`dvmctl identity import < key.hex`) or use --from-file <path>."
+          );
+        }
+        return identityImport(opts);
       }, opts.human);
     });
 

@@ -16,7 +16,7 @@ Builder signing keys, Cashu recovery words, and records live in `~/.dvmkit` (`bu
 
 An explicit `DVMKIT_CONFIG_DIR` disables automatic legacy mnemonic migration. If `lock create` or `deploy` names an untouched legacy file, have the human use `dvmctl lock create --import <words>` in a private terminal to reuse those words. To create independent words instead, use `dvmctl lock create --force --human`; the legacy file stays in place. Keep recovery words out of agent output.
 
-A real deployment needs a builder signing identity. Inspect it with `dvmctl identity show`; create one only if absent and authorized. `dvmctl deploy --create-identity` can create the missing identity noninteractively. Never replace an existing identity to bypass an error.
+A real deployment needs a builder signing identity. Inspect it with `dvmctl identity show`; create one only if absent and authorized. `dvmctl deploy --create-identity` can create the missing identity noninteractively. The account is bound to one signing key: on another machine, if creation fails with `identity_bound_elsewhere`, have the human run `dvmctl identity import` (secret on stdin or `--from-file`, never an argument) in a private terminal. `dvmctl whoami` reports whether the local identity matches. Never replace an existing identity to bypass an error.
 
 If accepting Cashu, establish the lock identity and recovery backup. When creation is needed, have the human run `dvmctl lock create --human` in a private terminal and save the recovery words. Do not capture the words in agent output. Require explicit confirmation that the backup is complete before accepting production funds.
 

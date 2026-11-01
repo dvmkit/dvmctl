@@ -149,7 +149,7 @@ export async function deploy(opts: DeployOptions, cwd?: string): Promise<void> {
 
   const target = opts.target ?? (await pickTarget());
 
-  await ensureBuilderIdentity(opts);
+  await ensureBuilderIdentity(opts, target);
 
   if (target === "cloud") {
     await deployCloud(cwd, opts);
@@ -159,7 +159,7 @@ export async function deploy(opts: DeployOptions, cwd?: string): Promise<void> {
   deploySelfHost(cwd, opts);
 }
 
-async function ensureBuilderIdentity(opts: DeployOptions): Promise<void> {
+async function ensureBuilderIdentity(opts: DeployOptions, target: string): Promise<void> {
   if (loadIdentitySecret() !== null) return;
   let create = opts.createIdentity === true;
   if (!create && process.stdin.isTTY) {
@@ -178,7 +178,9 @@ async function ensureBuilderIdentity(opts: DeployOptions): Promise<void> {
       "Run `dvmctl deploy --create-identity` (or `dvmctl identity create`) and re-run the deploy."
     );
   }
-  identityCreate({ human: opts.human, quiet: true });
+  // Self-host never contacts the platform, so only a cloud deploy needs the
+  // account-binding check that identityCreate otherwise runs first.
+  await identityCreate({ human: opts.human, quiet: true, skipBindingCheck: target !== "cloud" });
   if (opts.human) info("Builder signing identity created.");
 }
 

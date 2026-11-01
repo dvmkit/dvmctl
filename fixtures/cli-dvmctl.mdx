@@ -1325,6 +1325,7 @@ dvmctl whoami --human
 {
   "identity_pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "identity_status": "available",
+  "identity_match": "unknown",
   "builder": {
     "id": "bld_123",
     "email": "builder@example.com",
@@ -1363,6 +1364,8 @@ dvmctl whoami --human
 ```
 
 `identity_status` is `missing` when no local identity has been created, or `unreadable` when the local builder config cannot be read. In both cases, the platform profile and memberships remain available.
+
+`identity_match` compares the local identity with the key the account is bound to: `match`, `mismatch` (deploys will be rejected; run [`identity import`](#identity-import) with the account's key), or `unknown` when either side is unavailable, including platforms that do not report a bound key.
 
 ---
 
@@ -1515,7 +1518,9 @@ dvmctl domains list my-dvm
 
 ## identity create
 
-Generate a per-workstation secp256k1 builder identity keypair. Persists the pubkey to `~/.dvmkit/builder.json` and the secret to `~/.dvmkit/builder.key` (mode `0600`). This key signs deploy attestations and populates `builder.pubkey` on each DVM's `/v1/info` — distinct from the Cashu lock keypair managed by [`dvmctl lock create`](#lock-create).
+Generate a per-account secp256k1 builder identity keypair. Persists the pubkey to `~/.dvmkit/builder.json` and the secret to `~/.dvmkit/builder.key` (mode `0600`). This key signs deploy attestations and populates `builder.pubkey` on each DVM's `/v1/info` — distinct from the Cashu lock keypair managed by [`dvmctl lock create`](#lock-create).
+
+The platform binds one signing identity to your account and rejects deploys signed by any other key. When you are logged in and the account is already bound, `identity create` (and `deploy --create-identity` for cloud deploys) refuses with `identity_bound_elsewhere` before writing anything; on another machine use [`identity import`](#identity-import). The check is skipped when you are logged out, the platform is unreachable, or the platform does not report a bound key.
 
 ```sh
 dvmctl identity create
@@ -1542,6 +1547,38 @@ dvmctl identity create --force
 `identity_pubkey` is the x-only BIP-340 pubkey — 64 hex chars, no `02`/`03` prefix (unlike the compressed Cashu lock pubkeys that [`rotate`](#rotate) prints).
 
 On Windows, `mode` is replaced by a `windows_note` string (POSIX file modes don't apply).
+
+---
+
+## identity import
+
+Install your account's existing identity on this machine. Reads the 32-byte secret key (64 hex characters) from stdin or `--from-file`, derives the x-only pubkey, and writes `~/.dvmkit/builder.key` (mode `0600`) and `~/.dvmkit/builder.json` exactly as `identity create` does. The secret is never accepted as a command argument and is never printed.
+
+```sh
+dvmctl identity import < builder.key
+dvmctl identity import --from-file ./builder.key
+dvmctl identity import --from-file ./builder.key --force
+```
+
+| Flag | Description |
+|---|---|
+| `--from-file <path>` | Read the secret from a file instead of stdin |
+| `--force` | Replace a different existing identity. The old key is backed up to `builder.key.<timestamp>.bak` first; DVMs deployed under it need a redeploy |
+| `--human` | Prose output |
+
+**JSON output:**
+
+```json
+{
+  "status": "imported",
+  "identity_pubkey": "f2f1d2c3b3382d924d13f55d0a70d0d555239c39a36464980c0b37804ddd1846",
+  "secret_path": "~/.dvmkit/builder.key",
+  "pubkey_path": "~/.dvmkit/builder.json",
+  "mode": "0600"
+}
+```
+
+`status` is `unchanged` when the same key is already installed. When `--force` replaced a key, `backup_file` names the backup. Importing a different key without `--force` fails with `identity_exists` and leaves the files untouched.
 
 ---
 

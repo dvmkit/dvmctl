@@ -652,7 +652,13 @@ export interface BuilderOrgMembership {
 }
 
 /** The authenticated builder profile returned by `GET /api/v1/builder/me`. */
-export type AuthenticatedBuilderProfile = Builder;
+export type AuthenticatedBuilderProfile = Builder & {
+  /**
+   * 64-hex x-only pubkey the account's deploy attestations must be signed
+   * with; `null` when unbound. Absent on platforms that predate the field.
+   */
+  identity_pubkey?: string | null;
+};
 
 export async function getAuthenticatedBuilderProfile(
   platformUrl: string,
