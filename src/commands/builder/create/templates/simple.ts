@@ -34,7 +34,7 @@ export default configureDVM({
 `;
 }
 
-export function testTemplate(opts: { name: string; tag: string }): string {
+export function testTemplate(opts: { name: string }): string {
   return `import { describe, expect, it } from "vitest";
 import { createTestContext } from "@dvmkit/sdk/testing";
 
@@ -43,7 +43,9 @@ import dvm from "./handler";
 describe(${JSON.stringify(opts.name)}, () => {
   it("completes a job with typed input and an artifact", async () => {
     const ctx = createTestContext({ input: { text: "hello world" } });
-    await dvm.capabilities[${JSON.stringify(opts.tag)}].onJob(ctx);
+    // First capability, so the test survives renaming it or moving to a \`capabilities\` map.
+    const [capability] = Object.values(dvm.capabilities);
+    await capability.onJob(ctx);
 
     expect(ctx.completed).toBe(true);
     expect(ctx.summary).toBe("hello world");

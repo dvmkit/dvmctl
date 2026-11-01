@@ -21,6 +21,7 @@ export function packageJsonTemplate(opts: { dirName: string }): string {
     },
     devDependencies: {
       "@types/node": "^22",
+      "@types/pg": "^8",
       // Allow 5.x updates: npm 10 crashes when an exact pin trails Vitest's optional peers.
       vitest: "^5.0.2",
       typescript: "^5",
@@ -40,9 +41,10 @@ export function tsconfigTemplate(): string {
       skipLibCheck: true,
       outDir: "dist",
     },
-    include: ["*.ts"],
+    include: ["**/*.ts"],
+    // A custom exclude replaces tsc's default, so node_modules and dist must be listed.
     // Tests run with vitest, not the production build — keep them out of dist/.
-    exclude: ["*.test.ts"],
+    exclude: ["node_modules", "dist", "**/*.test.ts"],
   };
   return JSON.stringify(config, null, 2) + "\n";
 }

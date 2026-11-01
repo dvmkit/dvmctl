@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -57,7 +58,20 @@ describe("dvmctl create", () => {
     const tsconfig = JSON.parse(readFileSync(join(projectDir, "tsconfig.json"), "utf-8")) as {
       exclude?: string[];
     };
-    expect(tsconfig.exclude).toContain("*.test.ts");
+    expect(tsconfig.exclude).toContain("**/*.test.ts");
+  });
+
+  it("typechecks every source file without relying on imports from the root", async () => {
+    const projectDir = join(dir, "my-dvm");
+    await create(projectDir, {});
+
+    const tsconfig = JSON.parse(readFileSync(join(projectDir, "tsconfig.json"), "utf-8")) as {
+      include?: string[];
+      exclude?: string[];
+    };
+    expect(tsconfig.include).toEqual(["**/*.ts"]);
+    // A custom exclude replaces tsc's default, which would otherwise typecheck node_modules.
+    expect(tsconfig.exclude).toEqual(expect.arrayContaining(["node_modules", "dist"]));
   });
 
   it("documents the multi-capability shape in the README", async () => {
@@ -110,6 +124,7 @@ describe("dvmctl create", () => {
     expect(pkg.type).toBe("module");
     expect((pkg.dependencies as Record<string, string>)["@dvmkit/sdk"]).toBe(packageManifest.dependencies["@dvmkit/sdk"]);
     expect((pkg.devDependencies as Record<string, string>).vitest).toBe("^5.0.2");
+    expect((pkg.devDependencies as Record<string, string>)["@types/pg"]).toBe("^8");
     expect((pkg.engines as Record<string, string>).node).toBe("^22.12.0 || ^24.0.0 || >=26.0.0");
   });
 
@@ -119,7 +134,8 @@ describe("dvmctl create", () => {
 
     const test = readFileSync(join(projectDir, "handler.test.ts"), "utf-8");
     expect(test).toContain('from "@dvmkit/sdk/testing"');
-    expect(test).toContain('dvm.capabilities["my-dvm"].onJob(ctx)');
+    expect(test).toContain("Object.values(dvm.capabilities)");
+    expect(test).not.toContain('dvm.capabilities["my-dvm"]');
     expect(test).toContain("ctx.completed");
     expect(test).toContain('input: { text: "hello world" }');
   });
@@ -294,4 +310,79 @@ describe("dvmctl create", () => {
     expect(agents).toContain("@dvmkit/dvmctl@0.1.0-rc.99");
     expect(agents).not.toContain("@dvmkit/dvmctl@0.1.0-rc.2");
   });
+});
+
+describe("scaffolded project checks", () => {
+  const nodeModules = fileURLToPath(new URL("../../../../node_modules", import.meta.url));
+  let projectDir: string;
+  let root: string;
+
+  beforeEach(async () => {
+    root = mkdtempSync(join(tmpdir(), "dvmctl-scaffold-check-"));
+    projectDir = join(root, "my-dvm");
+    await create(projectDir, {});
+    // Reuse this repo's SDK, pg types, typescript and vitest instead of installing per test.
+    symlinkSync(nodeModules, join(projectDir, "node_modules"), "dir");
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function tool(entry: string, args: string[]) {
+    return spawnSync(process.execPath, [join(nodeModules, entry), ...args], {
+      cwd: projectDir,
+      encoding: "utf-8",
+    });
+  }
+  const typecheck = () => tool("typescript/bin/tsc", ["--noEmit"]);
+  const runTests = () => tool("vitest/vitest.mjs", ["run"]);
+
+  it("typechecks modules the root files never import, and pg types without extra installs", () => {
+    expect(typecheck().status).toBe(0);
+
+    mkdirSync(join(projectDir, "src"));
+    writeFileSync(join(projectDir, "src/orphan.ts"), 'export const broken: number = "text";\n');
+    const failed = typecheck();
+    expect(failed.status).not.toBe(0);
+    expect(failed.stdout).toContain("src/orphan.ts");
+
+    writeFileSync(
+      join(projectDir, "src/orphan.ts"),
+      'import type { Pool } from "pg";\nexport const query = (pool: Pool) => pool.query("select 1");\n'
+    );
+    const typed = typecheck();
+    expect(typed.stdout).toBe("");
+    expect(typed.status).toBe(0);
+  }, 60_000);
+
+  it("keeps the scaffolded test passing after the handler moves to a capabilities map", () => {
+    const flat = runTests();
+    expect(flat.stderr + flat.stdout).toContain("1 passed");
+    expect(flat.status).toBe(0);
+
+    writeFileSync(
+      join(projectDir, "handler.ts"),
+      `import { configureDVM, z } from "@dvmkit/sdk";
+
+const input = z.object({ text: z.string().min(1) });
+const onJob = async (ctx: { input: { text: string }; complete(summary: string): void; artifact(a: { data: string; mime_type: string; name: string }): void }) => {
+  ctx.artifact({ data: JSON.stringify({ text: ctx.input.text }), mime_type: "application/json", name: "result.json" });
+  ctx.complete(ctx.input.text);
+};
+
+export default configureDVM({
+  name: "My DVM",
+  description: "Two capabilities",
+  capabilities: {
+    renamed: { description: "First", input, price: "$0.01", onJob },
+    second: { description: "Second", input, price: "$0.01", onJob },
+  },
+});
+`
+    );
+    const mapped = runTests();
+    expect(mapped.stderr + mapped.stdout).toContain("1 passed");
+    expect(mapped.status).toBe(0);
+  }, 60_000);
 });
