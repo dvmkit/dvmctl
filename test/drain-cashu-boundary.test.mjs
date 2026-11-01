@@ -113,6 +113,7 @@ test("standalone service bridges the SDK Cashu Amount boundary", async () => {
   const change = proof(SdkAmount.from(112), LOCK_PUBKEY, "change");
   const parked = [];
   const client = {
+    getRefundCapability: async () => ({ accumulator: true, mints: ["https://mint.example.com"] }),
     getPendingDrains: async () => ({
       drains: [
         {
@@ -189,6 +190,7 @@ test("standalone service encodes a foreign SDK proof after just-in-time minting"
   };
   const parked = [];
   const client = {
+    getRefundCapability: async () => ({ accumulator: true, mints: ["https://mint.example.com"] }),
     getPendingDrains: async () => ({
       drains: [
         {

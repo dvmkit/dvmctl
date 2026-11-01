@@ -2,6 +2,8 @@ import type { ContentHoldsResponse } from "@dvmkit/sdk/server";
 import type { SerializedDLEQ } from "@cashu/cashu-ts";
 import { ADMIN_STATE_UNAVAILABLE, buildAdminAuthHeader, DvmError } from "@dvmkit/sdk/internal";
 
+import { readRefundCapability } from "./refund-capability.ts";
+
 /**
  * One proof tuple as returned by `GET /admin/cashu/pending-batches`. The
  * shape mirrors NUT-00 with the DVM's accumulator row id elided — `row_ids`
@@ -709,12 +711,18 @@ export class AdminCashuClient {
     }
   }
 
+  async getRefundCapability() {
+    return readRefundCapability(this.endpoint, this.fetchImpl);
+  }
+
   /** Fetch unmelted batches from the DVM, sorted by oldest `t_expire`. */
-  async getPendingBatches(): Promise<AdminPendingBatchesResponse> {
+  async getPendingBatches(options?: { requireDirectResponse?: boolean }): Promise<AdminPendingBatchesResponse> {
     return this.requestJson<AdminPendingBatchesResponse>(
       "GET",
       "/admin/cashu/pending-batches",
-      undefined
+      undefined,
+      undefined,
+      options?.requireDirectResponse
     );
   }
 
@@ -1016,7 +1024,8 @@ export class AdminCashuClient {
     method: "GET" | "POST",
     path: string,
     body: unknown,
-    query?: string
+    query?: string,
+    requireDirectResponse = false
   ): Promise<T> {
     const { header } = buildAdminAuthHeader({
       method,
@@ -1025,8 +1034,10 @@ export class AdminCashuClient {
       privkeyHex: this.privkeyHex,
       now: this.now,
     });
+    const url = `${this.endpoint}${path}${query ?? ""}`;
     const init: RequestInit = {
       method,
+      ...(requireDirectResponse ? { redirect: "error" as const, signal: AbortSignal.timeout(10_000) } : {}),
       headers: {
         Authorization: header,
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
@@ -1035,12 +1046,21 @@ export class AdminCashuClient {
     };
     let res: Response;
     try {
-      res = await this.fetchImpl(`${this.endpoint}${path}${query ?? ""}`, init);
+      res = await this.fetchImpl(url, init);
     } catch (err) {
       throw new DvmError(
         "admin_unreachable",
         `Failed to reach DVM admin endpoint ${this.endpoint}${path}: ${err instanceof Error ? err.message : String(err)}`,
         "The DVM may be down or the endpoint URL is wrong. Verify with `dvmctl info <handle>`."
+      );
+    }
+    // Refund purchases rely on this route's absence at the configured endpoint,
+    // so a forwarded response cannot establish that the accumulator is absent.
+    if (requireDirectResponse && (res.redirected || (res.url && res.url !== new URL(url).href))) {
+      throw new DvmError(
+        "admin_response_mismatch",
+        "The refund batch lookup returned a response from a different endpoint.",
+        "Use the service's direct endpoint before retrying refund servicing."
       );
     }
     if (res.status === 404 && path.startsWith("/admin/jobs/") && path.includes("/content-holds") && !res.headers.get("content-type")?.includes("json")) {
