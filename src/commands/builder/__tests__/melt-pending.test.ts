@@ -285,10 +285,12 @@ function withPendingChannelDrain(getPendingDrains: ReturnType<typeof vi.fn>): vo
 /** Drain stubs: no pending drains, so melts are never held back. */
 function emptyDrainSurface(): {
   getPendingDrains: ReturnType<typeof vi.fn>;
+  getRefundCapability: ReturnType<typeof vi.fn>;
   parkDrain: ReturnType<typeof vi.fn>;
   markDrainSent: ReturnType<typeof vi.fn>;
 } {
   return {
+    getRefundCapability: vi.fn().mockResolvedValue({ accumulator: true, mints: ["https://mint.example.com"] }),
     getPendingDrains: vi.fn().mockResolvedValue({
       drains: [],
       liability: { cashu_sats: 0, by_method_micro: {} },

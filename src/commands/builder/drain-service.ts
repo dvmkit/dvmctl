@@ -405,8 +405,27 @@ async function parkOne(
 
   let batches: AdminBatch[];
   try {
-    batches = (await ctx.client.getPendingBatches()).batches;
+    const capability = await ctx.client.getRefundCapability();
+    try {
+      batches = (await ctx.client.getPendingBatches({ requireDirectResponse: true })).batches;
+      if (!capability.accumulator) {
+        throw new Error("Refund-only metadata contradicts an available accumulator route");
+      }
+    } catch (err) {
+      // Only the SDK's missing route together with fresh refund-only metadata
+      // establishes that no accumulator exists. Other failures cannot permit spending.
+      if (
+        capability.accumulator || !(err instanceof AdminApiError) ||
+        err.status !== 404 || err.body.error !== "not_found"
+      ) throw err;
+      batches = [];
+      mints = mints.filter((mint) => capability.mints.includes(mint));
+      if (mints.length === 0) {
+        throw new Error("Refund metadata and signed state share no mint", { cause: err });
+      }
+    }
   } catch (err) {
+    rethrowIfBadSignature(err);
     rethrowIfAdminStateUnavailable(err);
     logDrain(ctx, "drain_park_batches_fetch_failed", {
       error: err instanceof Error ? err.message : String(err),
