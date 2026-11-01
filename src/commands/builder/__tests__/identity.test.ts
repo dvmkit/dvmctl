@@ -124,6 +124,15 @@ describe("dvmctl identity create", () => {
       await createRefusedBeforeAnyWrite({ force: true });
     });
 
+    it("reports identity_exists, not a binding conflict, when this machine already holds the bound key", async () => {
+      bindAccount(BOUND);
+      vi.mocked(builderStore.loadIdentityPubkey).mockReturnValue(BOUND);
+
+      await expect(identityCreate({})).rejects.toMatchObject({ code: "identity_exists" });
+      expect(builderIdentity.generateIdentity).not.toHaveBeenCalled();
+      expect(builderIdentity.writeIdentity).not.toHaveBeenCalled();
+    });
+
     it("does not reveal more of the bound pubkey than its prefix", async () => {
       bindAccount(BOUND);
       const error = await identityCreate({}).catch((e: unknown) => e as DvmError);

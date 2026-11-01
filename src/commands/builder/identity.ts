@@ -57,6 +57,13 @@ export async function assertIdentityNotBoundElsewhere(): Promise<void> {
     return;
   }
   if (typeof bound !== "string" || bound === "") return;
+  if (loadIdentityPubkey() === bound) {
+    throw new DvmError(
+      "identity_exists",
+      "This machine already has the identity this account is bound to.",
+      "Nothing to create. `dvmctl identity show` prints the pubkey."
+    );
+  }
   throw new DvmError(
     "identity_bound_elsewhere",
     `This account is already bound to a builder signing identity (${bound.slice(0, 8)}…). A newly created key would be rejected at deploy.`,
