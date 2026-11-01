@@ -76,6 +76,7 @@ describe("dvmctl whoami", () => {
     expect(json).toHaveBeenCalledWith({
       identity_pubkey: "a".repeat(64),
       identity_status: "available",
+      identity_match: "unknown",
       builder: BUILDER,
       activeOrg: "my-org",
       memberships: [
@@ -98,6 +99,40 @@ describe("dvmctl whoami", () => {
       display: "Builder builder@example.com. Active context: my-org.",
       hint: "Every listed membership can deploy a new DVM. The role shows its existing access level.",
     });
+  });
+
+  it.each([
+    ["match", "a".repeat(64), "match"],
+    ["mismatch", "c".repeat(64), "mismatch"],
+    ["unknown when the account is unbound", null, "unknown"],
+  ])("compares the local identity with the account's bound pubkey: %s", async (_label, bound, expected) => {
+    vi.mocked(platformClient.getAuthenticatedBuilderProfile).mockResolvedValue({
+      ...BUILDER,
+      identity_pubkey: bound,
+    });
+
+    await whoami({});
+
+    const report = vi.mocked(json).mock.calls[0][0] as { identity_match: string; hint: string };
+    expect(report.identity_match).toBe(expected);
+    if (expected === "mismatch") expect(report.hint).toContain("dvmctl identity import");
+  });
+
+  it("points at identity import when the account is bound but no local identity exists", async () => {
+    vi.mocked(builderStore.loadIdentityPubkey).mockReturnValue(null);
+    vi.mocked(platformClient.getAuthenticatedBuilderProfile).mockResolvedValue({
+      ...BUILDER,
+      identity_pubkey: "c".repeat(64),
+    });
+
+    await whoami({});
+
+    expect(json).toHaveBeenCalledWith(
+      expect.objectContaining({
+        identity_match: "unknown",
+        hint: expect.stringContaining("dvmctl identity import"),
+      })
+    );
   });
 
   it("reports a missing local identity without blocking the platform lookup", async () => {

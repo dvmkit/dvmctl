@@ -13,6 +13,14 @@ type LocalIdentity =
   | { status: "missing"; pubkey: null }
   | { status: "unreadable"; pubkey: null; detail: string };
 
+type IdentityMatch = "match" | "mismatch" | "unknown";
+
+/** Whether the local identity is the key the account is bound to; unknown when either side is unavailable. */
+function compareIdentity(identity: LocalIdentity, bound: string | null | undefined): IdentityMatch {
+  if (identity.status !== "available" || typeof bound !== "string" || bound === "") return "unknown";
+  return identity.pubkey === bound ? "match" : "mismatch";
+}
+
 export async function whoami(opts: WhoamiOptions): Promise<void> {
   const { token, platformUrl } = requireAuth();
   const activeOrg = loadActiveOrg();
@@ -22,14 +30,17 @@ export async function whoami(opts: WhoamiOptions): Promise<void> {
     platformClient.listBuilderOrgs(platformUrl, token),
   ]);
 
+  const identityMatch = compareIdentity(identity, builder.identity_pubkey);
+
   if (opts.human) {
-    printHuman(builder, memberships, activeOrg, identity);
+    printHuman(builder, memberships, activeOrg, identity, identityMatch);
     return;
   }
 
   json({
     identity_pubkey: identity.pubkey,
     identity_status: identity.status,
+    identity_match: identityMatch,
     ...(identity.status === "unreadable" ? { identity_detail: identity.detail } : {}),
     builder,
     activeOrg,
@@ -37,10 +48,14 @@ export async function whoami(opts: WhoamiOptions): Promise<void> {
     display: `Builder ${builder.email ?? builder.handle ?? builder.id}. Active context: ${activeOrg ?? "personal"}.`,
     hint:
       identity.status === "missing"
-        ? "Run `dvmctl identity create` before a cloud or Connect deploy."
+        ? builder.identity_pubkey
+          ? "This account is already bound to a signing identity. Run `dvmctl identity import` to install it before a cloud or Connect deploy."
+          : "Run `dvmctl identity create` before a cloud or Connect deploy."
         : identity.status === "unreadable"
           ? "Repair the local builder configuration before a cloud or Connect deploy."
-          : "Every listed membership can deploy a new DVM. The role shows its existing access level.",
+          : identityMatch === "mismatch"
+            ? "The local identity is not the key this account is bound to, so deploys will be rejected. Run `dvmctl identity import --force` with the account's key."
+            : "Every listed membership can deploy a new DVM. The role shows its existing access level.",
   });
 }
 
@@ -90,13 +105,15 @@ function printHuman(
   builder: AuthenticatedBuilderProfile,
   memberships: BuilderOrgMembership[],
   activeOrg: string | null,
-  identity: LocalIdentity
+  identity: LocalIdentity,
+  identityMatch: IdentityMatch
 ): void {
   info(`Builder: ${builder.displayName ?? builder.email ?? builder.handle ?? builder.id}`);
   info(`  id: ${builder.id}`);
   info(`  email: ${builder.email ?? "—"}`);
   info(`  handle: ${builder.handle ?? "—"}`);
   info(`  identity pubkey: ${identity.pubkey ?? "—"} (${identity.status})`);
+  info(`  identity matches account: ${identityMatch}`);
   if (identity.status === "unreadable") info(`  identity detail: ${identity.detail}`);
   info(`Active context: ${activeOrg ?? "personal"}`);
 

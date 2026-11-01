@@ -141,7 +141,11 @@ describe("dvmctl deploy --target self-host", () => {
 
     await deploy({ target: "self-host", createIdentity: true });
 
-    expect(identityCreate).toHaveBeenCalledWith({ human: undefined, quiet: true });
+    expect(identityCreate).toHaveBeenCalledWith({
+      human: undefined,
+      quiet: true,
+      skipBindingCheck: true,
+    });
   });
 
   it("emits DVMKIT_BUILDER_* env vars on the self-host JSON line", async () => {
