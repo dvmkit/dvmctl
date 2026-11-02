@@ -6,6 +6,18 @@
 - Pin the CLI runtime and new project scaffolds to exact `@dvmkit/sdk` `0.11.0-rc.1`. Separately installed project dependencies stay unchanged until explicitly upgraded. `dvmctl serve` and `dvmctl dev` run the CLI's pinned SDK, so upgrading or downgrading dvmctl changes their SDK on the next restart. Pause monetary writes and coordinate upgrades or rollbacks across these processes under the rules below, even when the project's own SDK dependency is unchanged. Custom credit stores must implement the SDK's transactional `refundDraw` accounting and report enqueueing.
 - Before activating refunds, pause monetary writes and upgrade every process sharing the credit database and report queue, including funding writers and retry workers. Mixed-version monetary history after new metadata is written needs a state compatibility assessment, as does rollback after refund state exists. Older readers cannot interpret refund reports or known-zero Bitcoin lots. Additive schema initialization alone does not make a rolling upgrade or rollback safe. See [refund guidance](docs/refund-command.md) and the [SDK upgrade details](https://github.com/dvmkit/sdk/blob/v0.11.0-rc.1/CHANGELOG.md).
 
+## [0.15.0](https://github.com/dvmkit/dvmctl/compare/v0.14.0...v0.15.0) (2026-11-02)
+
+
+### Features
+
+* point builders to the Discord from errors and the build-dvm skill ([ede171a](https://github.com/dvmkit/dvmctl/commit/ede171a4e3783372561c504eac46f564006c4820))
+
+
+### Bug Fixes
+
+* guard refund purchases before payment ([381bbbc](https://github.com/dvmkit/dvmctl/commit/381bbbca374e26ae3691b1cffa44d2f813994f84))
+
 ## [0.14.0](https://github.com/dvmkit/dvmctl/compare/v0.13.5...v0.14.0) (2026-11-01)
 
 
