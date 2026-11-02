@@ -378,6 +378,51 @@ async function refreshedPendingIds(
 
 type ParkOutcome = "parked" | "jit_minted" | "queued" | "failed";
 
+type RefundDeliveryTarget = Pick<AdminPendingDrain, "credit_id" | "drain_id" | "amount_sats"> & {
+  quote_id?: string;
+};
+
+async function readRefundDeliveryBatches(
+  ctx: DrainServiceContext,
+  target: RefundDeliveryTarget
+): Promise<AdminBatch[] | undefined> {
+  const capability = await ctx.client.getRefundCapability();
+  try {
+    const { batches } = await ctx.client.getPendingBatches({ requireDirectResponse: true });
+    if (!capability.accumulator) {
+      throw new Error("Refund-only metadata contradicts an available accumulator route");
+    }
+    return batches;
+  } catch (err) {
+    if (
+      capability.accumulator || !(err instanceof AdminApiError) ||
+      err.status !== 404 || err.body.error !== "not_found"
+    ) throw err;
+    // A missing accumulator route does not establish support for accepting
+    // bought refund notes, whether this pass would open a quote or pay an old one.
+    logRefundDeliveryUnavailable(ctx, target);
+    return undefined;
+  }
+}
+
+function logRefundDeliveryUnavailable(
+  ctx: DrainServiceContext,
+  target: RefundDeliveryTarget,
+  error?: unknown
+): void {
+  logDrain(ctx, "drain_refund_delivery_unavailable", {
+    credit_id: target.credit_id,
+    drain_id: target.drain_id,
+    amount_sats: target.amount_sats,
+    ...(target.quote_id ? { quote_id: target.quote_id } : {}),
+    ...(error === undefined ? {} : { error: error instanceof Error ? error.message : String(error) }),
+    display: error === undefined
+      ? "This service cannot accept refund notes yet. The refund remains pending; no new refund purchase was attempted."
+      : "Refund-note delivery could not be confirmed. The refund and its unpaid quote remain pending; no new payment was attempted.",
+    hint: "Use `dvmctl credit liability <handle>` to inspect the debt. The service must support refund-note delivery before retrying.",
+  });
+}
+
 /**
  * Fulfil one cashu drain: pick an accumulator batch that covers the amount
  * plus what the mint charges to swap it ({@link selectCoveringBatch}), swap it
@@ -405,25 +450,9 @@ async function parkOne(
 
   let batches: AdminBatch[];
   try {
-    const capability = await ctx.client.getRefundCapability();
-    try {
-      batches = (await ctx.client.getPendingBatches({ requireDirectResponse: true })).batches;
-      if (!capability.accumulator) {
-        throw new Error("Refund-only metadata contradicts an available accumulator route");
-      }
-    } catch (err) {
-      // Only the SDK's missing route together with fresh refund-only metadata
-      // establishes that no accumulator exists. Other failures cannot permit spending.
-      if (
-        capability.accumulator || !(err instanceof AdminApiError) ||
-        err.status !== 404 || err.body.error !== "not_found"
-      ) throw err;
-      batches = [];
-      mints = mints.filter((mint) => capability.mints.includes(mint));
-      if (mints.length === 0) {
-        throw new Error("Refund metadata and signed state share no mint", { cause: err });
-      }
-    }
+    const available = await readRefundDeliveryBatches(ctx, drain);
+    if (!available) return "queued";
+    batches = available;
   } catch (err) {
     rethrowIfBadSignature(err);
     rethrowIfAdminStateUnavailable(err);
@@ -1153,6 +1182,22 @@ async function recoverMintQuotes(
       const settled = await reconcileQuotePayment(ctx, conn, item.quote, item.paymentRejected);
       if (settled === "unknown") continue;
       if (settled !== "unpaid") carried = { ...item, paid: settled };
+    }
+    // Delivery uncertainty can block a new payment, but must not block
+    // collecting value already paid for or abandoning a definitively unpaid expiry.
+    if (!carried.paid && !quoteDead(carried.quote)) {
+      const target = {
+        credit_id: item.quote.credit_id, drain_id: item.quote.drain_id,
+        amount_sats: item.quote.face_sats, quote_id: item.quote.quote_id,
+      };
+      try {
+        if (!await readRefundDeliveryBatches(ctx, target)) continue;
+      } catch (err) {
+        rethrowIfBadSignature(err);
+        rethrowIfAdminStateUnavailable(err);
+        logRefundDeliveryUnavailable(ctx, target, err);
+        continue;
+      }
     }
     const outcome = await advanceMintQuote(ctx, conn, keypair, carried);
     if (outcome === "jit_minted") {
