@@ -13,6 +13,7 @@
 
 * offer deployment after a paid service works locally ([adade03](https://github.com/dvmkit/dvmctl/commit/adade0367274bd06b5b5ab2c666e37cefa0baf3e))
 * support explicit refund park capability ([614ed09](https://github.com/dvmkit/dvmctl/commit/614ed0976e44b71f5b337210d8a4578593b15e7d))
+* Pin the CLI runtime and new scaffolds to SDK 0.21.1. Separately installed project dependencies are not upgraded automatically.
 
 ## [0.15.0](https://github.com/dvmkit/dvmctl/compare/v0.14.0...v0.15.0) (2026-11-02)
 
