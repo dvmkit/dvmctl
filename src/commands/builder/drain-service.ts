@@ -55,6 +55,7 @@ import {
   readOpenMintQuotes,
   readUnparked,
 } from "../../lib/drain-park-log.ts";
+import { canonicalMint } from "../../lib/melt-change-custody.ts";
 import { bolt11AmountMsats } from "../../lib/lightning/bolt11-amount.ts";
 
 /** Refunds precede builder payouts; outstanding cashu liability holds the melt. */
@@ -380,28 +381,62 @@ type ParkOutcome = "parked" | "jit_minted" | "queued" | "failed";
 
 type RefundDeliveryTarget = Pick<AdminPendingDrain, "credit_id" | "drain_id" | "amount_sats"> & {
   quote_id?: string;
+  mint_url?: string;
+  refund_pubkey?: string;
 };
 
-async function readRefundDeliveryBatches(
+interface RefundDelivery {
+  batches: AdminBatch[];
+  jitMints?: string[];
+}
+
+async function readRefundDelivery(
   ctx: DrainServiceContext,
-  target: RefundDeliveryTarget
-): Promise<AdminBatch[] | undefined> {
+  target: RefundDeliveryTarget,
+  acceptedMints?: string[]
+): Promise<RefundDelivery | undefined> {
   const capability = await ctx.client.getRefundCapability();
   try {
     const { batches } = await ctx.client.getPendingBatches({ requireDirectResponse: true });
     if (!capability.accumulator) {
       throw new Error("Refund-only metadata contradicts an available accumulator route");
     }
-    return batches;
+    return { batches };
   } catch (err) {
     if (
       capability.accumulator || !(err instanceof AdminApiError) ||
       err.status !== 404 || err.body.error !== "not_found"
     ) throw err;
-    // A missing accumulator route does not establish support for accepting
-    // bought refund notes, whether this pass would open a quote or pay an old one.
-    logRefundDeliveryUnavailable(ctx, target);
-    return undefined;
+    if (!capability.jitRefundPark) {
+      logRefundDeliveryUnavailable(ctx, target);
+      return undefined;
+    }
+    // A refund-only service must explicitly support park delivery, and the
+    // public mint menu must agree with its signed refund state before spending.
+    let signedMints = acceptedMints;
+    if (signedMints === undefined) {
+      const pending = await ctx.client.getPendingDrains();
+      const drain = pending.drains.find((item) =>
+        item.credit_id === target.credit_id && item.drain_id === target.drain_id
+      );
+      if (
+        !drain || drain.method !== "cashu" || drain.amount_sats !== target.amount_sats ||
+        drain.payout.refund_pubkey !== target.refund_pubkey
+      ) {
+        throw new Error("The original unpaid refund no longer matches signed pending state", { cause: err });
+      }
+      signedMints = pending.mints;
+    }
+    if (!Array.isArray(signedMints)) throw new Error("Signed refund state has no accepted mints", { cause: err });
+    const publicMints = new Set(capability.mints.map(canonicalMint));
+    const jitMints = [...new Set(signedMints.map((mint) => {
+      if (typeof mint !== "string") throw new Error("Signed refund state has an invalid mint", { cause: err });
+      return canonicalMint(mint);
+    }))].filter((mint) => publicMints.has(mint));
+    if (jitMints.length === 0 || (target.mint_url && !jitMints.includes(canonicalMint(target.mint_url)))) {
+      throw new Error("Refund metadata and signed state do not accept the refund mint", { cause: err });
+    }
+    return { batches: [], jitMints };
   }
 }
 
@@ -450,9 +485,10 @@ async function parkOne(
 
   let batches: AdminBatch[];
   try {
-    const available = await readRefundDeliveryBatches(ctx, drain);
+    const available = await readRefundDelivery(ctx, drain, mints);
     if (!available) return "queued";
-    batches = available;
+    batches = available.batches;
+    mints = available.jitMints ?? mints;
   } catch (err) {
     rethrowIfBadSignature(err);
     rethrowIfAdminStateUnavailable(err);
@@ -1189,9 +1225,10 @@ async function recoverMintQuotes(
       const target = {
         credit_id: item.quote.credit_id, drain_id: item.quote.drain_id,
         amount_sats: item.quote.face_sats, quote_id: item.quote.quote_id,
+        mint_url: item.quote.mint_url, refund_pubkey: item.quote.refund_pubkey,
       };
       try {
-        if (!await readRefundDeliveryBatches(ctx, target)) continue;
+        if (!await readRefundDelivery(ctx, target)) continue;
       } catch (err) {
         rethrowIfBadSignature(err);
         rethrowIfAdminStateUnavailable(err);

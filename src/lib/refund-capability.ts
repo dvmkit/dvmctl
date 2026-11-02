@@ -5,6 +5,7 @@ import { canonicalMint } from "./melt-change-custody.ts";
 
 export interface RefundCapability {
   accumulator: boolean;
+  jitRefundPark: boolean;
   mints: string[];
 }
 
@@ -39,7 +40,7 @@ export async function readRefundCapability(
     ) {
       throw new Error("Malformed accumulator metadata");
     }
-    return { accumulator: true, mints: data.mints };
+    return { accumulator: true, jitRefundPark: false, mints: data.mints };
   }
   // The existing parser checks the credit wire shape; require usable prepaid
   // terms as well, so a missing cashu field alone never authorizes a purchase.
@@ -53,7 +54,11 @@ export async function readRefundCapability(
   ) {
     throw new Error("Missing or malformed prepaid refund terms");
   }
-  return { accumulator: false, mints: data.mints };
+  return {
+    accumulator: false,
+    jitRefundPark: credit.jit_refund_park === true,
+    mints: data.mints,
+  };
 }
 
 function record(value: unknown): value is Record<string, unknown> {
