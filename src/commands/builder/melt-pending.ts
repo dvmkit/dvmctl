@@ -1443,7 +1443,7 @@ function unsettledDrainHint(summary: TickSummary): string {
   }
   if (summary.drains_queued > 0) {
     hints.push(
-      "`queued`: nothing was attempted for these — the `drain_jit_*` lines above say why. `drain_jit_unconfigured` means no send wallet is wired to buy the refund's ecash; `drain_jit_no_mint` means no accepted mint would quote; anything naming a payment in flight is being held on purpose so the refund cannot be bought twice."
+      "`queued`: nothing was attempted for these — the `drain_jit_*` and `drain_refund_delivery_unavailable` lines above say why. `drain_jit_unconfigured` means no send wallet is wired to buy the refund's ecash; `drain_jit_no_mint` means no accepted mint would quote; anything naming a payment in flight is being held on purpose so the refund cannot be bought twice."
     );
   }
   return hints.join(" ");
