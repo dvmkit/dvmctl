@@ -4,6 +4,7 @@ import { info, json } from "../shared/output.ts";
 import { feedbackHumanHint, feedbackNudge } from "./builder-feedback-nudges.ts";
 import { isPlatformError } from "./platform-error-tag.ts";
 import { takeFeedbackNoticeFields } from "./feedback-notice.ts";
+import { helpFor, helpHumanLine } from "./support.ts";
 
 /**
  * Catch errors from a command action and exit the process when the command
@@ -50,6 +51,7 @@ export function catchErrors(fn: () => void | Promise<void>, human?: boolean): vo
 export function handleError(err: unknown, human?: boolean): never {
   if (err instanceof DvmError) {
     const nudge = feedbackNudge({ failed: true, platformError: isPlatformError(err), errorCode: err.code });
+    const help = helpFor(err);
     if (human) {
       // JSON spreads `data` last, so its relay fields are authoritative when
       // an error also uses the older positional `display`. Resolve human mode
@@ -59,7 +61,7 @@ export function handleError(err: unknown, human?: boolean): never {
       const display = typeof dataDisplay === "string" ? dataDisplay : err.display;
       const dataNextStep = err.data?.next_step;
       const nextStep = typeof dataNextStep === "string" ? dataNextStep : undefined;
-      info([`Error: ${err.message}`, display, nextStep, err.hint, nudge.feedback_hint].filter(Boolean).join("\n"));
+      info([`Error: ${err.message}`, display, nextStep, err.hint, nudge.feedback_hint, help && helpHumanLine(help)].filter(Boolean).join("\n"));
     } else {
       const error: Record<string, unknown> = {
         code: err.code,
@@ -78,6 +80,7 @@ export function handleError(err: unknown, human?: boolean): never {
         error,
         ...takeFeedbackNoticeFields(),
         ...nudge,
+        ...(help ? { help } : {}),
       });
     }
     process.exit(1);
