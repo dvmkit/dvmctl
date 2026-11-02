@@ -1072,6 +1072,128 @@ describe("serviceDrains — just-in-time mint", () => {
     return fetchImpl;
   }
 
+  function parkCapableInfo(overrides: Record<string, unknown> = {}) {
+    return refundInfo({ credit: { ...refundInfo().credit, jit_refund_park: true }, ...overrides });
+  }
+
+  it("uses the literal park capability to buy caller-locked notes only at a shared canonical mint", async () => {
+    const { ctx, client, wallet, payInvoice } = jitCtx();
+    client.getPendingDrains.mockResolvedValue({
+      drains: [pendingCashuDrain({ amount_sats: 392, amount_msats: 392_000 })],
+      liability: { cashu_sats: 392, by_method_micro: {} },
+      mints: ["https://signed-only.example", "https://mint.example.com:443/"],
+    });
+    capabilityWire(client, parkCapableInfo({ mints: ["https://public-only.example", "https://MINT.example.com/"] }));
+    expect(await serviceDrains(ctx)).toMatchObject({ drains_parked: 1, drains_jit_minted: 1, cashu_liability_sats_after: 0 });
+    expect(ctx.walletProvider).toHaveBeenCalledWith(MINT);
+    expect(ctx.walletProvider).not.toHaveBeenCalledWith("https://public-only.example");
+    expect(ctx.walletProvider).not.toHaveBeenCalledWith("https://signed-only.example");
+    expect(wallet.createLockedMintQuote).toHaveBeenCalledWith(392, LOCK_PUBKEY);
+    expect(payInvoice).toHaveBeenCalledTimes(1);
+    const parked = client.parkDrain.mock.calls[0][0];
+    expect(parked).toMatchObject({ credit_id: "c1", drain_id: "d1", consumed_row_ids: [], keep_proofs: [],
+      mint_evidence: { mint_url: MINT, face_sats: 392, reserve_sats: 8 } });
+    const proof = getDecodedToken(parked.token, [KEYSET_ID]).proofs[0];
+    expect(proof.amount.toNumber()).toBe(392);
+    expect(proof.secret).toContain(REFUND_PUBKEY);
+  });
+
+  it("uses the literal park capability to resume a reconciled unpaid quote without replacing its invoice", async () => {
+    const { ctx, client, wallet, payInvoice, lookupInvoiceImpl } = jitCtx();
+    vi.mocked(parkLog.readOpenMintQuotes).mockReturnValue([{ quote: quoteEntry() }]);
+    lookupInvoiceImpl.mockRejectedValue(new NwcError("NOT_FOUND", "no such invoice"));
+    capabilityWire(client, parkCapableInfo());
+    expect(await serviceDrains(ctx)).toMatchObject({ recovered: 1, drains_jit_minted: 1, cashu_liability_sats_after: 0 });
+    expect(lookupInvoiceImpl).toHaveBeenCalledWith(expect.anything(), { invoice: BOLT11 });
+    expect(client.getPendingDrains.mock.invocationCallOrder[0]).toBeGreaterThan(lookupInvoiceImpl.mock.invocationCallOrder[0]);
+    expect(payInvoice).toHaveBeenCalledExactlyOnceWith(expect.anything(), BOLT11);
+    expect(wallet.createLockedMintQuote).not.toHaveBeenCalled();
+    expect(parkLog.appendMintQuote).not.toHaveBeenCalled();
+    expect(parkLog.appendMintAbandoned).not.toHaveBeenCalled();
+    expect(client.parkDrain).toHaveBeenCalledWith(expect.objectContaining({
+      credit_id: "c1", drain_id: "d1", mint_evidence: expect.objectContaining({ quote_id: QUOTE_ID }),
+    }));
+  });
+
+  it("keeps capability-authorized notes durable after park refuses and replays them without a second purchase", async () => {
+    const { ctx, client, wallet, payInvoice } = jitCtx();
+    capabilityWire(client, parkCapableInfo());
+    client.parkDrain.mockRejectedValueOnce(new AdminApiError(503, { error: "accumulator_not_wired", raw: {} }));
+    expect(await serviceDrains(ctx)).toMatchObject({ drains_queued: 1, drains_jit_minted: 0, cashu_liability_sats_after: 392 });
+    expect(parkLog.appendSwapped).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(parkLog.appendSwapped).mock.invocationCallOrder[0]).toBeLessThan(client.parkDrain.mock.invocationCallOrder[0]);
+    const saved = vi.mocked(parkLog.appendSwapped).mock.calls[0][0];
+    vi.mocked(parkLog.readUnparked).mockReturnValue([{ ...saved, kind: "swapped", ts: 1 }]);
+    client.getRefundCapability.mockClear().mockRejectedValue(new Error("metadata unavailable"));
+    ctx.refundNwc = undefined;
+    ctx.currentKeypair = undefined;
+    expect(await serviceDrains(ctx)).toMatchObject({ recovered: 1, drains_jit_minted: 1, cashu_liability_sats_after: 0 });
+    expect(client.parkDrain).toHaveBeenCalledTimes(2);
+    expect(client.parkDrain.mock.calls[1][0]).toEqual(client.parkDrain.mock.calls[0][0]);
+    expect(parkLog.appendParked).toHaveBeenCalledTimes(1);
+    expect(wallet.createLockedMintQuote).toHaveBeenCalledTimes(1);
+    expect(wallet.completeMint).toHaveBeenCalledTimes(1);
+    expect(payInvoice).toHaveBeenCalledTimes(1);
+    expect(client.getRefundCapability).not.toHaveBeenCalled();
+  });
+
+  it.each([undefined, false, "true", 1, null, {}].flatMap((flag) => [
+    [flag, false] as const, [flag, true] as const,
+  ]))("does not acquire notes for non-literal park support %j during unpaid recovery=%s", async (flag, recovering) => {
+    const { ctx, client, wallet, payInvoice, lookupInvoiceImpl } = jitCtx();
+    if (recovering) {
+      vi.mocked(parkLog.readOpenMintQuotes).mockReturnValue([{ quote: quoteEntry() }]);
+      lookupInvoiceImpl.mockRejectedValue(new NwcError("NOT_FOUND", "no such invoice"));
+    }
+    capabilityWire(client, refundInfo({ credit: { ...refundInfo().credit, jit_refund_park: flag } }));
+    expect(await serviceDrains(ctx)).toMatchObject({ drains_queued: 1, cashu_liability_sats_after: 392 });
+    expect(ctx.walletProvider).not.toHaveBeenCalled();
+    expect(wallet.createLockedMintQuote).not.toHaveBeenCalled();
+    expect(payInvoice).not.toHaveBeenCalled();
+    expect(parkLog.appendMintQuote).not.toHaveBeenCalled();
+    expect(parkLog.appendMintPaymentAttempt).not.toHaveBeenCalled();
+    expect(parkLog.appendMintAbandoned).not.toHaveBeenCalled();
+    expect(client.parkDrain).not.toHaveBeenCalled();
+  });
+
+  it("refuses a positive park capability when public and signed mints disagree before quoting", async () => {
+    const { ctx, client, wallet, payInvoice } = jitCtx();
+    capabilityWire(client, parkCapableInfo({ mints: ["https://other-mint.example"] }));
+    expect(await serviceDrains(ctx)).toMatchObject({ drains_failed: 1, cashu_liability_sats_after: 392 });
+    expect(ctx.walletProvider).not.toHaveBeenCalled();
+    expect(wallet.createLockedMintQuote).not.toHaveBeenCalled();
+    expect(payInvoice).not.toHaveBeenCalled();
+    expect(parkLog.appendMintQuote).not.toHaveBeenCalled();
+    expect(client.parkDrain).not.toHaveBeenCalled();
+  });
+
+  it.each(["missing drain", "missing mints", "unavailable state", "different mint", "different amount", "different refund key"])(
+    "holds a positive-capability unpaid quote with %s in signed pending state", async (state) => {
+      const { ctx, client, wallet, payInvoice, lookupInvoiceImpl } = jitCtx();
+      vi.mocked(parkLog.readOpenMintQuotes).mockReturnValue([{ quote: quoteEntry() }]);
+      lookupInvoiceImpl.mockRejectedValue(new NwcError("NOT_FOUND", "no such invoice"));
+      const otherMint = "https://other-mint.example";
+      client.getPendingDrains.mockResolvedValue({
+        drains: state === "missing drain" ? [] : [pendingCashuDrain({ amount_sats: state === "different amount" ? 391 : 392,
+          ...(state === "different refund key" ? { payout: { refund_pubkey: LOCK_PUBKEY } } : {}) })],
+        liability: { cashu_sats: 392, by_method_micro: {} },
+        ...(state === "missing mints" ? {} : { mints: [state === "different mint" ? otherMint : MINT] }),
+      });
+      if (state === "unavailable state") client.getPendingDrains.mockRejectedValue(new Error("pending state unavailable"));
+      capabilityWire(client, parkCapableInfo({ mints: [MINT, otherMint] }));
+      await serviceDrains(ctx);
+      expect(lookupInvoiceImpl).toHaveBeenCalledWith(expect.anything(), { invoice: BOLT11 });
+      expect(client.getPendingDrains).toHaveBeenCalled();
+      expect(ctx.walletProvider).not.toHaveBeenCalled();
+      expect(wallet.createLockedMintQuote).not.toHaveBeenCalled();
+      expect(payInvoice).not.toHaveBeenCalled();
+      expect(parkLog.appendMintQuote).not.toHaveBeenCalled();
+      expect(parkLog.appendMintPaymentAttempt).not.toHaveBeenCalled();
+      expect(parkLog.appendMintAbandoned).not.toHaveBeenCalled();
+      expect(client.parkDrain).not.toHaveBeenCalled();
+    }
+  );
+
   it.each([
     ["matching mints", [MINT], [MINT]],
     ["partially overlapping mints", ["https://public-only.example", MINT], ["https://signed-only.example", MINT]],
@@ -1082,8 +1204,8 @@ describe("serviceDrains — just-in-time mint", () => {
       drains: [pendingCashuDrain({ amount_sats: 392, amount_msats: 392_000 })],
       liability: { cashu_sats: 392, by_method_micro: {} }, mints: signedMints,
     });
-    // Current services reject delivery in this mode even though refund mints
-    // and the pending drain exist. Purchasing notes would strand them locally.
+    // Legacy refund-only services can advertise mints and pending drains
+    // while rejecting park delivery. Do not purchase notes for that response.
     client.parkDrain.mockRejectedValue(new AdminApiError(503, {
       error: "accumulator_not_wired", raw: { error: "accumulator_not_wired" },
     }));
@@ -1172,7 +1294,7 @@ describe("serviceDrains — just-in-time mint", () => {
     const { ctx, client, wallet, payInvoice } = jitCtx();
     const response = Response.json({ error: "not_found" }, { status: 404 });
     Object.defineProperties(response, { url: { value: url }, redirected: { value: redirected } });
-    capabilityWire(client, refundInfo(), { status: 404, body: response });
+    capabilityWire(client, parkCapableInfo(), { status: 404, body: response });
     expect(await serviceDrains(ctx)).toMatchObject({
       drains_failed: 1, drains_parked: 0, drains_jit_minted: 0, cashu_liability_sats_after: 392,
     });
@@ -1186,7 +1308,7 @@ describe("serviceDrains — just-in-time mint", () => {
     const { ctx, client, payInvoice } = jitCtx();
     const response = Response.json({ batches: [] });
     Object.defineProperty(response, "url", { value: "https://service.example/admin/cashu/pending-batches" });
-    const fetchImpl = capabilityWire(client, refundInfo({
+    const fetchImpl = capabilityWire(client, parkCapableInfo({
       cashu: { mints: [MINT], lock_pubkeys: [LOCK_PUBKEY] },
     }), { status: 200, body: response });
     expect(await serviceDrains(ctx)).toMatchObject({ drains_jit_minted: 1 });
@@ -1197,32 +1319,32 @@ describe("serviceDrains — just-in-time mint", () => {
   });
 
   it.each([
-    ["successful batch response contradicts refund-only info", refundInfo(), 200, { batches: [] }],
-    ["accumulator route missing", refundInfo({ cashu: { mints: [MINT], lock_pubkeys: [LOCK_PUBKEY] } }), 404, { error: "not_found" }],
-    ["unknown protocol", refundInfo({ protocol_version: 2 }), 404, { error: "not_found" }],
-    ["missing protocol", refundInfo({ protocol_version: undefined }), 404, { error: "not_found" }],
+    ["successful batch response contradicts refund-only info", parkCapableInfo(), 200, { batches: [] }],
+    ["accumulator route missing", parkCapableInfo({ cashu: { mints: [MINT], lock_pubkeys: [LOCK_PUBKEY] } }), 404, { error: "not_found" }],
+    ["unknown protocol", parkCapableInfo({ protocol_version: 2 }), 404, { error: "not_found" }],
+    ["missing protocol", parkCapableInfo({ protocol_version: undefined }), 404, { error: "not_found" }],
     ["partial metadata", { protocol_version: 1 }, 404, { error: "not_found" }],
     ["non-object metadata", null, 404, { error: "not_found" }],
     ["non-JSON metadata", new Response("invalid JSON"), 404, { error: "not_found" }],
     ["info authentication rejected", Response.json({ error: "unauthorized" }, { status: 401 }), 404, { error: "not_found" }],
     ["info unavailable", Response.json({ error: "unavailable" }, { status: 503 }), 404, { error: "not_found" }],
-    ["missing credit", refundInfo({ credit: undefined }), 404, { error: "not_found" }],
-    ["partial credit", refundInfo({ credit: { balance_payment: true, currency: "usd", funding: ["lightning"] } }), 404, { error: "not_found" }],
-    ["invalid credit bounds", refundInfo({ credit: { ...refundInfo().credit, max_micro: -1 } }), 404, { error: "not_found" }],
-    ["unknown funding rail", refundInfo({ credit: { ...refundInfo().credit, funding: ["unknown"] } }), 404, { error: "not_found" }],
-    ["null cashu", refundInfo({ cashu: null }), 404, { error: "not_found" }],
-    ["partial cashu", refundInfo({ cashu: {} }), 404, { error: "not_found" }],
-    ["empty lock keys", refundInfo({ cashu: { mints: [MINT], lock_pubkeys: [] } }), 404, { error: "not_found" }],
-    ["invalid lock key", refundInfo({ cashu: { mints: [MINT], lock_pubkeys: ["invalid"] } }), 404, { error: "not_found" }],
-    ["missing payment schema", refundInfo({ payment: undefined }), 404, { error: "not_found" }],
-    ["invalid mint scheme", refundInfo({ mints: ["ftp://mint.example"] }), 404, { error: "not_found" }],
-    ["non-JSON route missing", refundInfo(), 404, "not found"],
-    ["different 404", refundInfo(), 404, { error: "proxy_not_found" }],
-    ["authentication rejected", refundInfo(), 401, { error: "unauthorized" }],
-    ["authorization rejected", refundInfo(), 403, { error: "forbidden" }],
-    ["batch service unavailable", refundInfo(), 503, { error: "unavailable" }],
-    ["batch server failure", refundInfo(), 500, { error: "server_error" }],
-    ["batch timeout", refundInfo(), 200, new Error("request timed out")],
+    ["missing credit", parkCapableInfo({ credit: undefined }), 404, { error: "not_found" }],
+    ["partial credit", parkCapableInfo({ credit: { balance_payment: true, currency: "usd", funding: ["lightning"], jit_refund_park: true } }), 404, { error: "not_found" }],
+    ["invalid credit bounds", parkCapableInfo({ credit: { ...refundInfo().credit, max_micro: -1, jit_refund_park: true } }), 404, { error: "not_found" }],
+    ["unknown funding rail", parkCapableInfo({ credit: { ...refundInfo().credit, funding: ["unknown"], jit_refund_park: true } }), 404, { error: "not_found" }],
+    ["null cashu", parkCapableInfo({ cashu: null }), 404, { error: "not_found" }],
+    ["partial cashu", parkCapableInfo({ cashu: {} }), 404, { error: "not_found" }],
+    ["empty lock keys", parkCapableInfo({ cashu: { mints: [MINT], lock_pubkeys: [] } }), 404, { error: "not_found" }],
+    ["invalid lock key", parkCapableInfo({ cashu: { mints: [MINT], lock_pubkeys: ["invalid"] } }), 404, { error: "not_found" }],
+    ["missing payment schema", parkCapableInfo({ payment: undefined }), 404, { error: "not_found" }],
+    ["invalid mint scheme", parkCapableInfo({ mints: ["ftp://mint.example"] }), 404, { error: "not_found" }],
+    ["non-JSON route missing", parkCapableInfo(), 404, "not found"],
+    ["different 404", parkCapableInfo(), 404, { error: "proxy_not_found" }],
+    ["authentication rejected", parkCapableInfo(), 401, { error: "unauthorized" }],
+    ["authorization rejected", parkCapableInfo(), 403, { error: "forbidden" }],
+    ["batch service unavailable", parkCapableInfo(), 503, { error: "unavailable" }],
+    ["batch server failure", parkCapableInfo(), 500, { error: "server_error" }],
+    ["batch timeout", parkCapableInfo(), 200, new Error("request timed out")],
   ])("does not quote or pay when %s", async (_label, info, status, body) => {
     const { ctx, client, wallet, payInvoice } = jitCtx();
     capabilityWire(client, info, { status, body });
@@ -1240,7 +1362,7 @@ describe("serviceDrains — just-in-time mint", () => {
     ["unavailable authentication state", 503, { error: "admin_state_unavailable" }, "admin_state_unavailable"],
   ])("preserves the actionable %s failure without opening a quote", async (_label, status, body, code) => {
     const { ctx, client, wallet, payInvoice } = jitCtx();
-    capabilityWire(client, refundInfo(), { status, body });
+    capabilityWire(client, parkCapableInfo(), { status, body });
     await expect(serviceDrains(ctx)).rejects.toMatchObject({ code });
     expect(wallet.createLockedMintQuote).not.toHaveBeenCalled();
     expect(payInvoice).not.toHaveBeenCalled();
@@ -1249,7 +1371,7 @@ describe("serviceDrains — just-in-time mint", () => {
 
   it("does not quote or pay when the info read fails", async () => {
     const { ctx, client, wallet, payInvoice } = jitCtx();
-    capabilityWire(client, refundInfo(), undefined, new Error("metadata timeout"));
+    capabilityWire(client, parkCapableInfo(), undefined, new Error("metadata timeout"));
     expect(await serviceDrains(ctx)).toMatchObject({ drains_failed: 1, cashu_liability_sats_after: 392 });
     expect(client.getPendingBatches).not.toHaveBeenCalled();
     expect(wallet.createLockedMintQuote).not.toHaveBeenCalled();

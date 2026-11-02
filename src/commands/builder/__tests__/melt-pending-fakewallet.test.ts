@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Amount, blindMessage, getPubKeyFromPrivKey, OutputData } from "@cashu/cashu-ts";
+import { Amount, blindMessage, getEncodedToken, getPubKeyFromPrivKey, OutputData } from "@cashu/cashu-ts";
 import type * as Sdk from "@dvmkit/sdk/internal";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -50,6 +50,92 @@ describe.skipIf(!mintUrl && !hosted)("proof isolation against Nutshell FakeWalle
   }, 180_000);
   afterAll(async () => { await Promise.all(mints.map(mint => mint.stop())); });
   afterEach(() => { vi.unstubAllEnvs(); if (root) rmSync(root, { recursive: true, force: true }); });
+
+  it.skipIf(!process.env.DATABASE_URL)("delivers a refund through the installed SDK with Cashu receiving off", async () => {
+    const database = process.env.DATABASE_URL!;
+    const databaseUrl = new URL(database);
+    if (!["localhost", "127.0.0.1", "[::1]"].includes(databaseUrl.hostname) ||
+        !/^\/dvmctl_refund_test_[a-z0-9_]+$/i.test(databaseUrl.pathname)) {
+      throw new Error("Refund integration requires an explicitly disposable loopback test database");
+    }
+    if (!["localhost", "127.0.0.1", "[::1]"].includes(new URL(mintUrl!).hostname)) {
+      throw new Error("Refund integration accepts only a loopback FakeWallet mint");
+    }
+    root = mkdtempSync(join(tmpdir(), "refund-delivery-"));
+    vi.stubEnv("DVMKIT_CONFIG_DIR", root);
+    vi.resetModules();
+    const sdk = await import("@dvmkit/sdk/internal");
+    const { configureDVM, z } = await import("@dvmkit/sdk");
+    const { createDVMHost, secp256k1Auth, createSignedRequestVerifier, CREDIT_REQUEST_SCHEMA, fundingCommitment } = await import("@dvmkit/sdk/server");
+    const { AdminCashuClient } = await vi.importActual<typeof import("../../../lib/admin-cashu-client.ts")>("../../../lib/admin-cashu-client.ts");
+    const { serviceDrains } = await import("../drain-service.ts");
+    const callerKey = "22".repeat(32);
+    const caller = Buffer.from(getPubKeyFromPrivKey(Buffer.from(callerKey, "hex"))).toString("hex").slice(2);
+    const refundKey = "33".repeat(32);
+    const refundPubkey = Buffer.from(getPubKeyFromPrivKey(Buffer.from(refundKey, "hex"))).toString("hex");
+    const dvmId = "fakewallet-refund-delivery";
+    const unused = vi.fn().mockRejectedValue(new Error("Unexpected receive-wallet operation"));
+    const host = createDVMHost({
+      database, mints: [mintUrl!], paymentMethods: [],
+      env: { DVMKIT_DVM_ID: dvmId, DVMKIT_CASHU_LOCK_PUBKEY: LOCK,
+        DVMKIT_ALLOW_TEST_MINTS: "true" },
+      fx: { fetch: async () => ({ rates: { usd: 100_000 }, as_of: new Date().toISOString() }), supportedCurrencies: () => ["usd"] },
+      lightningReceive: { backend: { getInfo: unused, getBalance: unused, createInvoice: unused, lookupInvoice: unused, payInvoice: unused } },
+    });
+    host.mount(configureDVM({ name: "Refund integration", capability: "echo", input: z.object({ text: z.string() }),
+      price: "$0.01", credit: { min: "$0.001", max: "$5" }, auth: secp256k1Auth(), onJob(ctx) { ctx.complete("done"); } }));
+    try {
+      const { url } = await host.serve({ port: 0 });
+      const signer = createSignedRequestVerifier(CREDIT_REQUEST_SCHEMA);
+      const credit = async (body: Record<string, unknown>, token?: string) => fetch(`${url}/v1/credit`, {
+        method: "POST", headers: { "Content-Type": "application/json", ...(token ? { "X-Cashu": token } : {}) },
+        body: JSON.stringify(signer.signRequest(Buffer.from(callerKey, "hex"), body)),
+      });
+      const info = await (await fetch(`${url}/v1/info`)).json();
+      expect(info.credit).toMatchObject({ jit_refund_park: true, balance_payment: true, funding: ["lightning"] });
+      expect(info).not.toHaveProperty("cashu");
+      expect(info.payment.methods).not.toContain("cashu");
+      const admin = new AdminCashuClient({ endpoint: url, dvmId, privkeyHex: PRIVKEY });
+      await expect(admin.getPendingBatches()).rejects.toMatchObject({ status: 404, body: { error: "not_found" } });
+      await host.creditLedger!.fund({ creditId: "refund-credit", callerPubkey: caller, currency: "usd", amountMicro: 400_000,
+        expiryMs: Date.now() + 3_600_000, basis: { rail: "lightning", paidMsats: 400_000, fundingRef: "synthetic-deposit" } });
+      const requested = await credit({ op: "drain", credit_id: "refund-credit", drain: {
+        drain_id: "refund-drain", method: "cashu", payout: { refund_pubkey: refundPubkey },
+      } });
+      expect(requested.status).toBe(200);
+      expect((await requested.json()).drain).toMatchObject({ status: "pending", owed_sats: 392 });
+      const payInvoice = vi.fn().mockResolvedValue({ preimage: "aa".repeat(32), feesPaidMsats: 0, outcome: "paid" });
+      const park = vi.spyOn(admin, "parkDrain");
+      expect(await serviceDrains({ dvmId, handle: "refund-integration", client: admin,
+        keypairsByPubkey: new Map([[sdk.toLockPubkey(LOCK), { privkey: PRIVKEY, pubkey: LOCK }]]),
+        currentKeypair: { privkey: PRIVKEY, pubkey: LOCK },
+        refundNwc: { uri: "nostr+walletconnect://" + "55".repeat(32) + "?relay=wss://relay.example&secret=" + "66".repeat(32) },
+        payInvoice,
+      })).toMatchObject({ drains_parked: 1, drains_jit_minted: 1, cashu_liability_sats_after: 0 });
+      expect(payInvoice).toHaveBeenCalledTimes(1);
+      const parked = park.mock.calls[0][0];
+      expect(parked.mint_evidence).toMatchObject({ source: "jit_mint", face_sats: 392 });
+      const pickup = await credit({ op: "drain", credit_id: "refund-credit", drain: { drain_id: "refund-drain" } });
+      expect(pickup.status).toBe(200);
+      expect((await pickup.json()).drain).toMatchObject({ status: "picked_up", token: parked.token });
+      await expect(admin.parkDrain(parked)).resolves.toMatchObject({ status: "picked_up" });
+      const wallet = await sdk.getWallet(mintUrl!);
+      const redeemed = await wallet.receive(parked.token, { privkey: refundKey });
+      expect(redeemed.reduce((total, proof) => total + proof.amount.toNumber(), 0)).toBe(392);
+      const locked = await wallet.ops.send(8, redeemed).asLocked({ pubkey: LOCK }).run();
+      const incoming = getEncodedToken({ mint: mintUrl!, proofs: locked.send });
+      const receive = await credit({ op: "fund", credit_id: "receiving-probe", fund: {
+        amount_micro: 8_000, fund_id: "incoming-probe", commitment: fundingCommitment(incoming),
+      } }, incoming);
+      expect(receive.status).toBe(402);
+      expect((await receive.json()).error).toBe("cashu_not_p2pk_locked");
+      expect((await wallet.checkProofsStates(locked.send)).every((proof) => proof.state === "UNSPENT")).toBe(true);
+      expect((await host.pool!.query("SELECT to_regclass('wallet_accumulator') AS table_name")).rows[0].table_name).toBeNull();
+      expect(unused).not.toHaveBeenCalled();
+    } finally {
+      await host.shutdown();
+    }
+  }, 60_000);
 
   it("pays usable siblings after a real mint witness rejection and leaves only that row unspent", async () => {
     if (!payoutUrl) throw new Error("The FakeWallet tier needs a separate payout mint URL");
