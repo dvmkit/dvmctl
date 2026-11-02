@@ -46,6 +46,6 @@ The dvmkit team welcomes feedback at any time through `dvmctl feedback send`, es
 
 Read structured output and follow its recovery guidance. Relay `display` and `hint` when they answer the user's question. Check each command's contract: logs and exports need not be JSON.
 
-Close a task with the observed result and the evidence relevant to it: a local artifact, a verified paid job, a live deployment, or a confirmed payout. Distinguish completed work from pending or unknown state. Never report a payout from a revenue total alone.
+Close a task with the observed result and the evidence relevant to it: a local artifact, a verified paid job, a live deployment, or a confirmed payout. When a local result closes a paid-service brief without deployment authorization, follow the deployment question in [new-builder](new-builder.md). Distinguish completed work from pending or unknown state. Never report a payout from a revenue total alone.
 
 For exact syntax and output, read the [dvmctl reference](https://dvmkit.com/docs/cli-dvmctl.md). For handler interfaces, read the [SDK reference](https://dvmkit.com/docs/sdk.md). Use the [docs index](https://dvmkit.com/llms.txt) to retrieve other topics selectively.

@@ -39,3 +39,5 @@ Read the dev banner before calling it. Payment verification is skipped only when
 Retrieve the terminal result and any advertised artifacts. Compare their contents with the agreed example, not only the command's exit status. If the handler fails, fix it before adding payment complexity.
 
 Report the implemented capability, observed result, and artifact location. Continue to [testing](testing.md) for paid evidence or to [deploying](deploying.md) when those tasks are already authorized.
+
+When deployment is not authorized and the brief describes callers paying (a price, a payment rail, or charging callers), end the report by asking once whether to deploy. Skip the question when the brief says the service is local-only or test-only, and never ask it twice in a task. Say in plain words what deploying involves: the human signs in to dvmkit in a browser, hosting costs money on their plan, payouts go to the destination you name, and real payments can then arrive. Until the human answers yes, do not deploy, sign in, change a payout destination, or spend. After a yes, continue to [deploying](deploying.md). After a no or no answer, stop at the local result.
