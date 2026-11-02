@@ -8,6 +8,7 @@ vi.mock("../../shared/output", () => ({ json: vi.fn(), info: vi.fn(), setOutputT
 import { DvmError } from "@dvmkit/sdk/internal";
 import { setFeedbackCommand, setFeedbackTraceId } from "../builder-feedback-nudges";
 import { handleError } from "../error-handler";
+import { DISCORD_INVITE_URL } from "../support";
 import { listDomains } from "../platform-client";
 import { info, json } from "../../shared/output";
 
@@ -35,14 +36,14 @@ describe("builder feedback at the command error boundary", () => {
     setFeedbackCommand("deploy");
     expect(() => handleError(new DvmError("deploy_failed", "Deployment failed."))).toThrow(stop);
     expect(process.exit).toHaveBeenCalledWith(1);
-    expect(json).toHaveBeenCalledWith({ error: { code: "deploy_failed", message: "Deployment failed." } });
+    expect(json).toHaveBeenCalledWith({ error: { code: "deploy_failed", message: "Deployment failed." }, help: DISCORD_INVITE_URL });
   });
   it("keeps the original human error and exit when nudge storage fails", () => {
     writeFileSync(dir, "blocked");
     setFeedbackCommand("deploy", true);
     expect(() => handleError(new DvmError("deploy_failed", "Deployment failed."), true)).toThrow(stop);
     expect(process.exit).toHaveBeenCalledWith(1);
-    expect(info).toHaveBeenCalledWith("Error: Deployment failed.");
+    expect(info).toHaveBeenCalledWith(`Error: Deployment failed.\nNeed help? Join the dvmkit builder Discord: ${DISCORD_INVITE_URL}`);
   });
   it("nudges on an unexpected deploy failure with the original internal error", () => {
     setFeedbackCommand("deploy");

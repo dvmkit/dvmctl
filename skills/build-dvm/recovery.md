@@ -33,6 +33,10 @@ A write-off has an obligation-specific meaning: a Tempo drain write-off only ann
 
 For runtime failure, inspect current logs, configuration names, dependencies, and persistence before restarting or rolling back. A rollback does not undo external transfers or necessarily restore an earlier database schema. Never rotate or delete recovery keys as a general repair. If a rotation reached the DVM but its platform update is pending, follow the CLI's synchronization hint; rotating again would create another key change.
 
+## Get help from a person
+
+When the tool cannot resolve the problem, or the failure is on the platform or the account, tell the human where to get help: the dvmkit builder Discord at https://discord.gg/aJ8BwVj5G2 first, and `support@dvmkit.com` as the fallback for account access, billing, or a problem that must stay private. When a command's error output has a `help` field, relay that link. Give the human the trace or deploy ID, the service slug, the `dvmctl` version, and what you tried. Never include secrets or recovery words.
+
 ## Verify and retain evidence
 
 Re-read the original operation and its liability or balance after the repair. Verify the actual job result or funds movement as relevant. A repair command exiting successfully is not sufficient if the underlying state is still pending.
