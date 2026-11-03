@@ -19,6 +19,7 @@ const expectedFiles = [
   "skills/build-dvm/new-builder.md",
   "skills/build-dvm/operating.md",
   "skills/build-dvm/recovery.md",
+  "skills/build-dvm/references/builder-tables.md",
   "skills/build-dvm/references/content-holds.md",
   "skills/build-dvm/references/financial-export.md",
   "skills/build-dvm/references/lightning-credit-test.md",
@@ -26,6 +27,7 @@ const expectedFiles = [
   "skills/build-dvm/references/local-tempo-test.md",
   "skills/build-dvm/references/local-x402-test.md",
   "skills/build-dvm/references/tempo-close-reports.md",
+  "skills/build-dvm/references/work-shaped-jobs.md",
   "skills/build-dvm/retirement.md",
   "skills/build-dvm/testing.md",
 ];
