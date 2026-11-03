@@ -62,7 +62,7 @@ export async function create(
 
   const files: { name: string; content: string }[] = [
     { name: "handler.ts", content: handlerTemplate({ name, description, price, tag }) },
-    { name: "handler.test.ts", content: testTemplate({ name, tag }) },
+    { name: "handler.test.ts", content: testTemplate({ name }) },
     { name: "serve.ts", content: serveTemplate() },
     { name: "Dockerfile", content: dockerfileTemplate() },
     { name: "package.json", content: packageJsonTemplate({ dirName }) },
