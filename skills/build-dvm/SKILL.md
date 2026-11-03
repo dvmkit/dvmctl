@@ -17,6 +17,8 @@ Identify the user's task and the service's current state. Read the matching file
 | --- | --- |
 | Turn an idea into a working local capability | [new-builder](new-builder.md) |
 | Validate behavior or prove a paid call | [testing](testing.md), then only the chosen payment recipe |
+| Build a job that prompts, charges mid-job, runs long, or has several capabilities | [work-shaped jobs](references/work-shaped-jobs.md) |
+| Store the DVM's own data in Postgres | [builder tables](references/builder-tables.md) |
 | Prepare or perform a deployment | [deploying](deploying.md) |
 | Inspect health or earnings, collect payouts, refund a completed job, update, or transfer a service | [operating](operating.md) |
 | Diagnose a failure or reconcile an uncertain payment or deploy | [recovery](recovery.md) |
