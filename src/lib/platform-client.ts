@@ -419,6 +419,43 @@ export async function listDvms(
  */
 export type BuilderDvmView = BuilderDvmWithRevenue & { orgHandle: string | null };
 
+export interface DvmVisibilityResult {
+  slug: string;
+  hidden: boolean;
+}
+
+export async function setDvmVisibility(
+  platformUrl: string,
+  token: string,
+  dvmId: string,
+  hidden: boolean
+): Promise<DvmVisibilityResult> {
+  const res = await platformFetch(
+    `${platformUrl}/api/v1/builder/dvms/${encodeURIComponent(dvmId)}/visibility`,
+    {
+      method: "PUT",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ hidden }),
+    }
+  );
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as {
+      error?: { message?: string; code?: string; display?: string; hint?: string };
+    };
+    throw platformResponseError(
+      body.error?.code ?? "visibility_failed",
+      body.error,
+      `Failed to change DVM visibility: ${res.status}`,
+      {
+        hint: res.status === 403
+          ? "Changing visibility requires an admin role in the DVM's org. Ask an org admin."
+          : undefined,
+      }
+    );
+  }
+  return (await res.json()) as DvmVisibilityResult;
+}
+
 /**
  * Get detailed info for a single DVM including deploys and domains.
  *

@@ -41,6 +41,12 @@ Submit the authorized deployment once and retain its deployment ID. For an ambig
 
 For self-hosting, initialize the durable service ID with `dvmctl init <slug> --self-hosted`, then run `dvmctl deploy --target self-host`. Protect any generated attestation and receipt-key values as secrets. Deploy the generated container with the target's tools, configure its durable database and secrets, and operate the required payment workers yourself. Generating these files is not a completed deployment.
 
+## Control discovery
+
+For an unlisted launch, deploy first, then run `dvmctl visibility <slug> --hidden`. The DVM can appear in discovery between deployment and the visibility change; deployment cannot create it hidden. Hiding only removes it from discovery: anyone with its URL can still call it, so visibility is not access control.
+
+Run `dvmctl visibility <slug> --listed` to restore discovery. Choose exactly one of `--hidden` or `--listed`. Both require an admin role in the DVM's organization. Use `--org <handle>` to override the active organization selected by `dvmctl switch`, and `--human` for terminal output. Default JSON returns `{ slug, hidden }`. Check the current state with `dvmctl info <slug>` or `dvmctl list`; both also show visibility with `--human`.
+
 ## Verify the deployed service
 
 Inspect the actual endpoint, active revision, and health. Read `/v1/info` or `dvm describe` to confirm capability, price, any declared rate card, signing identity, and intended payment configuration. Test the agreed example and retrieve its output.

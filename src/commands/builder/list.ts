@@ -24,7 +24,7 @@ export async function list(opts: ListOptions): Promise<void> {
     const nameW = Math.max(4, ...dvms.map((d) => d.name.length));
     const statusW = Math.max(6, ...dvms.map((d) => d.status.length));
     const regionW = Math.max(6, ...dvms.map((d) => d.region.length));
-    const header = `  ${"SLUG".padEnd(slugW)}  ${"NAME".padEnd(nameW)}  ${"STATUS".padEnd(statusW)}  ${"REGION".padEnd(regionW)}  URL`;
+    const header = `  ${"SLUG".padEnd(slugW)}  ${"NAME".padEnd(nameW)}  ${"STATUS".padEnd(statusW)}  VISIBILITY  ${"REGION".padEnd(regionW)}  URL`;
     info(header);
     for (const d of dvms) {
       // The public address, not the Fly origin — that's what a builder came to
@@ -34,7 +34,7 @@ export async function list(opts: ListOptions): Promise<void> {
       // address yet (`dvmctl info` names the fix).
       const url = d.dvmkitUrl ?? d.url ?? "—";
       info(
-        `  ${d.slug.padEnd(slugW)}  ${d.name.padEnd(nameW)}  ${d.status.padEnd(statusW)}  ${d.region.padEnd(regionW)}  ${url}`
+        `  ${d.slug.padEnd(slugW)}  ${d.name.padEnd(nameW)}  ${d.status.padEnd(statusW)}  ${(d.hidden ? "hidden" : "listed").padEnd(10)}  ${d.region.padEnd(regionW)}  ${url}`
       );
     }
   } else {

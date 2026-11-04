@@ -118,6 +118,20 @@ describe("dvmInfo", () => {
     expect(info).not.toHaveBeenCalled();
   });
 
+  it.each([[true, "hidden"], [false, "listed"]] as const)(
+    "shows visibility for hidden=%s in human and JSON output",
+    async (hidden, label) => {
+      vi.mocked(getDvm).mockResolvedValue(response({ hidden }));
+      await dvmInfo("scrape", { human: true });
+      expect(printed()).toContain(`Visibility: ${label}`);
+
+      await dvmInfo("scrape", {});
+      expect(json).toHaveBeenCalledWith(expect.objectContaining({
+        dvm: expect.objectContaining({ hidden }),
+      }));
+    }
+  );
+
   it("tells a builder who paused the DVM themselves how to bring it back", async () => {
     vi.mocked(getDvm).mockResolvedValue(
       response({
