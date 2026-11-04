@@ -115,6 +115,22 @@ describe("list", () => {
     expect(printed()).toContain("No DVMs found in dvmkit.");
   });
 
+  it("shows hidden and listed DVMs with their visibility in human and JSON output", async () => {
+    vi.mocked(listDvms).mockResolvedValue(result([
+      row({ slug: "private-dvm", hidden: true }),
+      row({ slug: "public-dvm", hidden: false }),
+    ]));
+    await list({ human: true });
+    expect(printed()).toMatch(/private-dvm[^\n]*hidden/);
+    expect(printed()).toMatch(/public-dvm[^\n]*listed/);
+
+    await list({});
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({ dvms: [
+      expect.objectContaining({ slug: "private-dvm", hidden: true }),
+      expect.objectContaining({ slug: "public-dvm", hidden: false }),
+    ] }));
+  });
+
   it("echoes the resolved scope in JSON so an agent can tell which org answered", async () => {
     vi.mocked(listDvms).mockResolvedValue(result([row()], SHARED));
     await list({ org: "dvmkit" });

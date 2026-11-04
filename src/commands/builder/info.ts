@@ -37,6 +37,7 @@ export async function dvmInfo(slug: string, opts: InfoOptions): Promise<void> {
     // selected context, so this confirms the org that supplied the result.
     info(`  Org:        ${dvm.orgHandle ?? "personal"}`);
     info(`  Status:     ${dvm.status}${suspension}`);
+    info(`  Visibility: ${dvm.hidden ? "hidden" : "listed"}`);
     // The address callers use. Absent until the builder claims a handle — the
     // router has nothing to resolve without one, so `dvmctl handle set` is the
     // next action, not a missing deploy.

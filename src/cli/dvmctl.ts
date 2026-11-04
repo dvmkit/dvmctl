@@ -134,6 +134,7 @@ import type { TransferOptions } from "../commands/builder/transfer.ts";
 import { transfer } from "../commands/builder/transfer.ts";
 import type { ValidateOptions } from "../commands/builder/validate.ts";
 import { validate } from "../commands/builder/validate.ts";
+import { visibility, type VisibilityOptions } from "../commands/builder/visibility.ts";
 import type { WhoamiOptions } from "../commands/builder/whoami.ts";
 import { whoami } from "../commands/builder/whoami.ts";
 import type {
@@ -312,6 +313,17 @@ export function buildProgram(): Command {
     .option("--human", "Human-readable output instead of JSON")
     .action((slug: string, opts: InfoOptions) => {
       catchErrors(() => dvmInfo(slug, opts), opts.human);
+    });
+
+  program
+    .command("visibility <slug>")
+    .description("Hide a DVM from discovery or list it; hidden DVMs remain callable by URL")
+    .option("--hidden", "Hide from discovery (requires an org admin)")
+    .option("--listed", "List in discovery (requires an org admin)")
+    .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
+    .option("--human", "Human-readable output instead of JSON")
+    .action((slug: string, opts: VisibilityOptions) => {
+      catchErrors(() => visibility(slug, opts), opts.human);
     });
 
   program
