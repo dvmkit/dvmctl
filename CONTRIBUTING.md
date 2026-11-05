@@ -19,3 +19,5 @@ This repository owns the builder CLI implementation, its behavioral tests, and i
 Use Node.js 22.23.2 for development, matching the hosted build, install with `npm ci`, and run `npm run verify` after the last edit. Source behavior tests use Vitest beside the implementation. Run a focused group with `npm run test:source -- src/commands/builder/__tests__/create.test.ts`. Artifact and release safeguards use `node:test`; run `npm run build` followed by `npm run test:package` when iterating on those boundaries. Keep external dependency mocks and each distinct money, recovery, lifecycle, and security regression.
 
 The hosted verification workflow also checks public safety, release tooling, deterministic archives, and installed consumers across the supported Node.js and operating system matrix. Local verification does not publish a package.
+
+For an exact reviewed archive, follow [full package acceptance without publishing](RELEASING.md#full-package-acceptance-without-publishing) to run the installed-consumer fixture with disposable PostgreSQL and Docker and record reproducible evidence.
