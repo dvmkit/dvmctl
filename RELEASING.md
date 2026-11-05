@@ -85,6 +85,7 @@ touch "$NPM_CONFIG_USERCONFIG" "$NPM_CONFIG_GLOBALCONFIG"
 docker image ls --filter 'reference=dvmctl-consumer-*' --format '{{.Repository}}:{{.Tag}} {{.ID}}' > "$evidence/runtime-images-before.txt"
 git clone --quiet https://github.com/dvmkit/dvmctl.git "$scratch/source"
 cd "$scratch/source"
+git fetch --no-tags origin "$reviewed_commit"
 git checkout --detach "$reviewed_commit"
 test "$(git rev-parse HEAD)" = "$reviewed_commit"
 version=$(node -p 'require("./package.json").version')
