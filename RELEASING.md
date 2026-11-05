@@ -160,6 +160,8 @@ Record in the pull request:
 
 Keep raw logs locally for reproduction. Before publishing evidence, remove local filesystem paths, host/account identifiers, credentials, and unrelated environment data. This procedure does not replace the repository's `npm run verify` gate or the hosted package/runtime checks.
 
+See the [2026-11-05 acceptance record](docs/package-acceptance-2026-11-05.md) for a completed maintainer run with separate cleanup evidence.
+
 ## Prepare a stable release or release candidate
 
 Release-please creates a version and changelog pull request when the repository variable `RELEASE_PLEASE_ENABLED` is `true`. Package, lockfile, and release manifest must agree. For fresh history, use release-please manifest bootstrap and first-release controls. The package and release manifest start at `0.5.0-rc.5`, so the first fresh-history release needs a `Release-As: 0.8.0` commit footer to select the intended stable version. Ordinary merges never publish.
