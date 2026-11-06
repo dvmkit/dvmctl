@@ -14,9 +14,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { createTestContext } from "@dvmkit/sdk/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { handleError } from "../../../lib/error-handler";
+import { loadDescriptor } from "../../../lib/load-handler";
 import * as output from "../../../shared/output";
 import { create, ScaffoldCollisionError } from "../create";
 import { agentsTemplate } from "../create/templates/shared";
@@ -337,6 +339,32 @@ describe("scaffolded project checks", () => {
   }
   const typecheck = () => tool("typescript/bin/tsc", ["--noEmit"]);
   const runTests = () => tool("vitest/vitest.mjs", ["run"]);
+
+  it.each([
+    { price: undefined, expected: "$0.01" },
+    { price: "$0.05", expected: "$0.05" },
+  ])("preserves the starter's fixed price $expected without another payment request", async ({ price, expected }) => {
+    const pricedProject = join(root, "priced-dvm");
+    await create(pricedProject, { price });
+    symlinkSync(nodeModules, join(pricedProject, "node_modules"), "dir");
+    const descriptor = await loadDescriptor(join(pricedProject, "handler.ts"));
+    const [capability] = Object.values(descriptor.capabilities);
+    expect(capability.price).toBe(expected);
+
+    const ctx = createTestContext({ input: { text: "paid starter" } });
+    await capability.onJob(ctx);
+    expect(ctx.completed).toBe(true);
+    expect(ctx.summary).toBe("paid starter");
+    expect(ctx.messages.filter((message) => message.type === "payment-request")).toEqual([]);
+    expect(ctx.messages).toContainEqual({
+      type: "artifact",
+      content: {
+        data: '{"text":"paid starter"}',
+        mime_type: "application/json",
+        name: "result.json",
+      },
+    });
+  });
 
   it("typechecks modules the root files never import, and pg types without extra installs", () => {
     expect(typecheck().status).toBe(0);

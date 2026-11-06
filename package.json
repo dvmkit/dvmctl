@@ -55,7 +55,7 @@
     "test:package": "node --test test/*.test.mjs"
   },
   "dependencies": {
-    "@dvmkit/sdk": "0.21.1",
+    "@dvmkit/sdk": "0.25.0",
     "@cashu/cashu-ts": "4.10.2"
   },
   "optionalDependencies": {
