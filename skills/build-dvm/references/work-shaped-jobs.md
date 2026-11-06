@@ -5,7 +5,8 @@ For a capability that asks the caller questions, charges during the job, or runs
 ## Ask and charge inside the job
 
 - `ctx.prompt(id, text, { options?, schema? })` pauses until the caller answers and resolves with the response.
-- `ctx.requestPayment(amount, reason)` pauses until the ask is covered by the caller's prepaid pool or a payment. A bare number is millisatoshis; `{ amount, currency }` uses major units (`{ amount: 0.25, currency: "usd" }`). For metered work, ask for each increment after the work that earns it.
+- `ctx.requestPayment(amount, reason)` asks the caller to pay for the next piece of work and pauses until that ask is paid. The upfront payment buys the first piece; every later ask is new money, never covered by the upfront payment. A bare number is millisatoshis; `{ amount, currency }` uses major units (`{ amount: 0.25, currency: "usd" }`).
+- Deliver the current piece's output (artifacts or partial results) before asking for the next piece. Sending an ask finishes the current piece; `ctx.complete` finishes the last piece. For a fixed-price job bought upfront, complete without asking for the same work again. For metered work, ask before doing the next increment.
 - Both calls can return only after the job is resumed. The handler body is replayed from the top on resume, so any work above a prompt or payment ask that is not inside `ctx.step` runs again.
 
 Wrap every costly or side-effecting call that comes before a prompt or payment ask:
