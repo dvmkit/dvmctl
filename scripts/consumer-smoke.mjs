@@ -6,6 +6,7 @@ import { connect, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { assertTempoDrainDecisions } from "./consumer-tempo-decisions.mjs";
+import { assertSignedAuth } from "./consumer-signed-auth.mjs";
 import { isHealthyResponse } from "./consumer-health.mjs";
 import { scaffoldInstallCommand } from "./consumer-install.mjs";
 import { cleanupAll, INSTALL_COMMAND_TIMEOUT_MS, observeProcess, preservePrimaryFailure, processCommand, removeTemporaryDirectory, stopProcess, waitForProcessClose } from "./consumer-process.mjs";
@@ -28,6 +29,7 @@ await preservePrimaryFailure(async () => {
   const project = join(root, "first-project");
   await scaffold(cliPath, project);
   await install(project);
+  await assertSignedAuth(cliPath, project, environment(false));
   // The matrix also tests the CLI's Node 22.0 minimum; scaffold tools require 22.12+.
   if (process.versions.node !== "22.0.0") await checkProject(project);
   await assertScaffold(cliPath, project);
