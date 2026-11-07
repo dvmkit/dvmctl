@@ -6,6 +6,19 @@
 - Pin the CLI runtime and new project scaffolds to exact `@dvmkit/sdk` `0.11.0-rc.1`. Separately installed project dependencies stay unchanged until explicitly upgraded. `dvmctl serve` and `dvmctl dev` run the CLI's pinned SDK, so upgrading or downgrading dvmctl changes their SDK on the next restart. Pause monetary writes and coordinate upgrades or rollbacks across these processes under the rules below, even when the project's own SDK dependency is unchanged. Custom credit stores must implement the SDK's transactional `refundDraw` accounting and report enqueueing.
 - Before activating refunds, pause monetary writes and upgrade every process sharing the credit database and report queue, including funding writers and retry workers. Mixed-version monetary history after new metadata is written needs a state compatibility assessment, as does rollback after refund state exists. Older readers cannot interpret refund reports or known-zero Bitcoin lots. Additive schema initialization alone does not make a rolling upgrade or rollback safe. See [refund guidance](docs/refund-command.md) and the [SDK upgrade details](https://github.com/dvmkit/sdk/blob/v0.11.0-rc.1/CHANGELOG.md).
 
+## [0.17.0](https://github.com/dvmkit/dvmctl/compare/v0.16.0...v0.17.0) (2026-11-06)
+
+
+### Features
+
+* add DVM discovery visibility controls ([751df54](https://github.com/dvmkit/dvmctl/commit/751df5467e61c47027a738c176f43f40fdd35029))
+
+
+### Bug Fixes
+
+* **create:** typecheck every scaffold source file and document work-shaped DVMs ([779f986](https://github.com/dvmkit/dvmctl/commit/779f9866892d57725eea2cf703348d60f98b7e6a))
+* **deps:** advance builder SDK to 0.25.0 ([4aecb3a](https://github.com/dvmkit/dvmctl/commit/4aecb3aeebf3ee98ac822c1a0c4d557b5f24cc73))
+
 ## [0.16.0](https://github.com/dvmkit/dvmctl/compare/v0.15.0...v0.16.0) (2026-11-02)
 
 
