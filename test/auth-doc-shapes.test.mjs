@@ -6,9 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-const betaHint = "dvmkit is in a closed beta: sign in with an invited account. No invite yet? Join the waitlist at https://dvmkit.com/waitlist";
-const timeoutMessage = "Authentication timed out. Try again, or join the waitlist at https://dvmkit.com/waitlist if you don't have an invite yet. DVMKIT_API_KEY skips the browser.";
-const account = "invited@example.test";
+const account = "new-builder@example.test";
 
 async function fixture(context, mode) {
   const directory = mkdtempSync(join(tmpdir(), "dvmctl-auth-"));
@@ -71,6 +69,7 @@ for (const mode of ["cancel", "timeout", "success"]) {
       const f = await fixture(context, mode);
       const result = await f.run(["auth", ...(human ? ["--human"] : [])]);
       assert.equal(result.code, mode === "success" ? 0 : 1, result.stderr);
+      assert.doesNotMatch(result.stdout + result.stderr, /closed beta|invit(?:e|ed)|waitlist/i);
       assert.equal(f.polls(), mode === "timeout" ? 300 : 1);
       const browser = f.browser();
       assert.match(browser.command, /https:\/\/example\.test\/cli-auth\?session=[a-f0-9]{32}&hash=[a-f0-9]{64}&host=/);
@@ -79,23 +78,39 @@ for (const mode of ["cancel", "timeout", "success"]) {
         assert.match(request.authorization, /^Bearer [a-f0-9]{64}$/);
       }
       if (human) {
-        assert.ok(browser.stdout.startsWith(`\nOpening browser to authenticate...\n${betaHint}\n`));
-        if (mode === "cancel") assert.ok(result.stdout.endsWith(`\nSign-in cancelled.\n${betaHint}\n`));
-        if (mode === "timeout") assert.equal(result.stderr, `\n${timeoutMessage}\n`);
+        assert.match(browser.stdout, /^\nOpening browser to authenticate\.\.\.\n[^\n]+\n/);
+        const sessionCode = browser.command.match(/session=([a-f0-9]{32})/)[1].slice(0, 12);
+        assert.ok(browser.stdout.includes(`Session code: ${sessionCode}`));
+        if (mode === "cancel") assert.match(result.stdout, /\nSign-in cancelled\.\n[^\n]*dvmctl auth[^\n]*\n$/);
+        if (mode === "timeout") assert.match(result.stderr, /Authentication timed out.*Try again.*DVMKIT_API_KEY/s);
         if (mode === "success") assert.ok(result.stdout.endsWith(`\nAuthenticated as ${account}\n`));
       } else {
         assert.equal(browser.stdout, "");
         const startup = JSON.parse(browser.stderr);
         assert.equal(startup.status, "opening_browser");
-        assert.equal(startup.display, "Opening browser to authenticate...");
-        assert.equal(startup.hint, betaHint);
+        assert.equal(typeof startup.hint, "string");
+        assert.ok(startup.hint.length > 0);
         const url = new URL(startup.url);
         assert.equal(startup.fingerprint, url.searchParams.get("session").slice(0, 12));
+        assert.ok(startup.display.includes(`Session code: ${startup.fingerprint}`));
         assert.equal(result.stderr, browser.stderr);
         assert.equal(result.stdout.trim().split("\n").length, 1);
         const final = JSON.parse(result.stdout);
-        if (mode === "cancel") assert.deepEqual(final, { authenticated: false, cancelled: true, display: "Sign-in cancelled.", hint: betaHint });
-        if (mode === "timeout") assert.deepEqual(final, { authenticated: false, timed_out: true, display: timeoutMessage, hint: timeoutMessage });
+        if (mode === "cancel") {
+          assert.deepEqual(Object.keys(final).sort(), ["authenticated", "cancelled", "display", "hint"]);
+          assert.equal(final.authenticated, false);
+          assert.equal(final.cancelled, true);
+          assert.equal(final.display, "Sign-in cancelled.");
+          assert.equal(typeof final.hint, "string");
+          assert.match(final.hint, /dvmctl auth/);
+        }
+        if (mode === "timeout") {
+          assert.deepEqual(Object.keys(final).sort(), ["authenticated", "display", "hint", "timed_out"]);
+          assert.equal(final.authenticated, false);
+          assert.equal(final.timed_out, true);
+          assert.match(final.display, /Authentication timed out.*Try again.*DVMKIT_API_KEY/s);
+          assert.match(final.hint, /Try again.*DVMKIT_API_KEY/s);
+        }
         if (mode === "success") assert.deepEqual(final, { authenticated: true, account });
       }
       const configPath = join(f.config, "config.json");

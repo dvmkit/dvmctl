@@ -136,12 +136,7 @@ describe("dvmctl auth login", () => {
     });
   });
 
-  const betaHint =
-    "dvmkit is in a closed beta: sign in with an invited account. No invite yet? Join the waitlist at https://dvmkit.com/waitlist";
-  const timeoutMessage =
-    "Authentication timed out. Try again, or join the waitlist at https://dvmkit.com/waitlist if you don't have an invite yet. DVMKIT_API_KEY skips the browser.";
-
-  it.each([true, false])("shows beta guidance before browser launch (human=%s)", async (human) => {
+  it.each([true, false])("supports open signup and labels the session code before browser launch (human=%s)", async (human) => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -159,10 +154,14 @@ describe("dvmctl auth login", () => {
     const result = auth({ human });
     await vi.advanceTimersByTimeAsync(CLI_AUTH_POLL_INTERVAL_MS);
     await result;
+    expect(JSON.stringify([
+      ...vi.mocked(console.log).mock.calls,
+      ...vi.mocked(progress).mock.calls,
+    ])).not.toMatch(/closed beta|invit(?:e|ed)|waitlist/i);
     if (human) {
       expect(outputBeforeBrowser).toEqual([
         "\nOpening browser to authenticate...",
-        betaHint,
+        expect.any(String),
         expect.stringContaining("/cli-auth?session="),
         expect.stringContaining("Session code:"),
       ]);
@@ -172,8 +171,8 @@ describe("dvmctl auth login", () => {
           status: "opening_browser",
           url: expect.stringMatching(/^https:\/\/dvmkit.com\/cli-auth\?session=/),
           fingerprint: expect.stringMatching(/^[a-f0-9]{12}$/),
-          display: "Opening browser to authenticate...",
-          hint: betaHint,
+          display: expect.any(String),
+          hint: expect.any(String),
         },
       ]);
     }
@@ -186,9 +185,19 @@ describe("dvmctl auth login", () => {
       headers: { Authorization: string };
     }).headers.Authorization;
     const browserCommand = browser.mock.calls[0]?.[0] as string;
-    const advertisedHash = new URL(browserCommand.match(/"(https:[^"]+)"/)?.[1] ?? "").searchParams.get("hash");
+    const browserUrl = new URL(browserCommand.match(/"(https:[^"]+)"/)?.[1] ?? "");
+    const advertisedHash = browserUrl.searchParams.get("hash");
     expect(createHash("sha256").update(authorization.slice("Bearer ".length)).digest("hex"))
       .toBe(advertisedHash);
+    const sessionCode = browserUrl.searchParams.get("session")!.slice(0, 12);
+    if (human) {
+      expect(console.log).toHaveBeenCalledWith(expect.stringContaining(`Session code: ${sessionCode}`));
+    } else {
+      expect(progress).toHaveBeenCalledWith(expect.objectContaining({
+        fingerprint: sessionCode,
+        display: expect.stringContaining(`Session code: ${sessionCode}`),
+      }));
+    }
     if (!human) expect(console.log).toHaveBeenCalledTimes(1);
     expect(mockPlatform.saveAuthToken).toHaveBeenCalledWith({
       token: "dvmk_newkey",
@@ -196,7 +205,7 @@ describe("dvmctl auth login", () => {
     });
   });
 
-  it.each([true, false])("keeps waitlist guidance on cancellation (human=%s)", async (human) => {
+  it.each([true, false])("cancellation preserves its shape without claiming signup is restricted (human=%s)", async (human) => {
     fetchMock.mockResolvedValueOnce({
       ok: true,
       status: 200,
@@ -207,15 +216,19 @@ describe("dvmctl auth login", () => {
     expect(await result).toEqual(new Error("__exit(1)__"));
     if (human) {
       expect(console.log).toHaveBeenCalledWith("\nSign-in cancelled.");
-      expect(console.log).toHaveBeenLastCalledWith(betaHint);
+      expect(console.log).toHaveBeenLastCalledWith(expect.stringContaining("dvmctl auth"));
     } else {
       expect(JSON.parse(vi.mocked(console.log).mock.lastCall?.[0] as string)).toEqual({
         authenticated: false,
         cancelled: true,
         display: "Sign-in cancelled.",
-        hint: betaHint,
+        hint: expect.stringContaining("dvmctl auth"),
       });
     }
+    expect(JSON.stringify([
+      ...vi.mocked(console.log).mock.calls,
+      ...vi.mocked(progress).mock.calls,
+    ])).not.toMatch(/closed beta|invit(?:e|ed)|waitlist/i);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(exitSpy).toHaveBeenCalledWith(1);
     expect(mockPlatform.saveAuthToken).not.toHaveBeenCalled();
@@ -223,22 +236,27 @@ describe("dvmctl auth login", () => {
   });
 
   it.each([true, false])(
-    "auth timeout output shape includes invite guidance (human=%s)",
+    "auth timeout preserves retry and API key guidance without signup restrictions (human=%s)",
     async (human) => {
       fetchMock.mockResolvedValue({ ok: false, status: 404 });
       const result = auth({ human }).catch((error: unknown) => error);
       await vi.advanceTimersByTimeAsync(CLI_AUTH_MAX_POLL_ATTEMPTS * CLI_AUTH_POLL_INTERVAL_MS);
       expect(await result).toEqual(new Error("__exit(1)__"));
       if (human) {
-        expect(console.error).toHaveBeenCalledWith(`\n${timeoutMessage}`);
+        expect(console.error).toHaveBeenCalledWith(expect.stringMatching(/Authentication timed out.*Try again.*DVMKIT_API_KEY/s));
       } else {
         expect(JSON.parse(vi.mocked(console.log).mock.lastCall?.[0] as string)).toEqual({
           authenticated: false,
           timed_out: true,
-          display: timeoutMessage,
-          hint: timeoutMessage,
+          display: expect.stringMatching(/Authentication timed out.*Try again.*DVMKIT_API_KEY/s),
+          hint: expect.stringMatching(/Try again.*DVMKIT_API_KEY/s),
         });
       }
+      expect(JSON.stringify([
+        ...vi.mocked(console.log).mock.calls,
+        ...vi.mocked(console.error).mock.calls,
+        ...vi.mocked(progress).mock.calls,
+      ])).not.toMatch(/closed beta|invit(?:e|ed)|waitlist/i);
       expect(fetchMock).toHaveBeenCalledTimes(CLI_AUTH_MAX_POLL_ATTEMPTS);
       expect(exitSpy).toHaveBeenCalledWith(1);
       expect(mockPlatform.saveAuthToken).not.toHaveBeenCalled();
