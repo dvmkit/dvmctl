@@ -17,10 +17,10 @@ export interface AuthOptions {
 }
 
 const PLATFORM_URL = process.env.DVMKIT_PLATFORM_URL ?? "https://api.dvmkit.dev";
-const BETA_HINT =
-  "dvmkit is in a closed beta: sign in with an invited account. No invite yet? Join the waitlist at https://dvmkit.com/waitlist";
+const SIGN_IN_HINT = "Complete sign-in in your browser, then return here.";
+const CANCELLED_HINT = "Run `dvmctl auth` to try again.";
 const TIMEOUT_MESSAGE =
-  "Authentication timed out. Try again, or join the waitlist at https://dvmkit.com/waitlist if you don't have an invite yet. DVMKIT_API_KEY skips the browser.";
+  "Authentication timed out. Try again. DVMKIT_API_KEY skips the browser.";
 const WEB_URL = process.env.DVMKIT_WEB_URL ?? "https://dvmkit.com";
 
 export async function auth(opts: AuthOptions): Promise<void> {
@@ -80,19 +80,20 @@ async function login(human?: boolean): Promise<void> {
   const host = hostname();
   const authUrl = `${WEB_URL}/cli-auth?session=${sessionId}&hash=${verifierHash}&host=${encodeURIComponent(host)}`;
   const fingerprint = sessionId.slice(0, CLI_AUTH_FINGERPRINT_LEN);
+  const sessionCodeDisplay = `Session code: ${fingerprint}…  (must match the code shown in your browser)`;
 
   if (human) {
     console.log("\nOpening browser to authenticate...");
-    console.log(BETA_HINT);
+    console.log(SIGN_IN_HINT);
     console.log(`\n  ${authUrl}\n`);
-    console.log(`Session code: ${fingerprint}…  (must match the code shown in your browser)\n`);
+    console.log(`${sessionCodeDisplay}\n`);
   } else {
     progress({
       status: "opening_browser",
       url: authUrl,
       fingerprint,
-      display: "Opening browser to authenticate...",
-      hint: BETA_HINT,
+      display: `Opening browser to authenticate... ${sessionCodeDisplay}`,
+      hint: SIGN_IN_HINT,
     });
   }
 
@@ -146,14 +147,14 @@ async function login(human?: boolean): Promise<void> {
     if (data.cancelled) {
       if (human) {
         console.log("\nSign-in cancelled.");
-        console.log(BETA_HINT);
+        console.log(CANCELLED_HINT);
       } else {
         console.log(
           JSON.stringify({
             authenticated: false,
             cancelled: true,
             display: "Sign-in cancelled.",
-            hint: BETA_HINT,
+            hint: CANCELLED_HINT,
           })
         );
       }
