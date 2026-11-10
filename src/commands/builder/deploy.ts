@@ -123,7 +123,11 @@ export async function deploy(opts: DeployOptions, cwd?: string): Promise<void> {
   // source files. They still need a slug (from --name or the dirname).
   if (!opts.endpointUrl) {
     if (!existsSync(resolve(cwd, "handler.ts")) && !existsSync(resolve(cwd, "handler.js"))) {
-      throw new Error("No handler.ts or handler.js found. Run this from a DVM project directory.");
+      throw new DvmError(
+        "handler_not_found",
+        `No handler.ts or handler.js found in ${cwd}.`,
+        "Add handler.ts or handler.js to this directory, or run dvmctl deploy from your DVM project directory."
+      );
     }
   }
 
