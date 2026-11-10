@@ -119,12 +119,14 @@ describe("dvmctl deploy --target self-host", () => {
   });
 
   it("throws when no handler file exists", async () => {
-    const emptyDir = mkdtempSync(join(tmpdir(), "dvmctl-deploy-empty-"));
+    const emptyDir = realpathSync(mkdtempSync(join(tmpdir(), "dvmctl-deploy-empty-")));
     process.chdir(emptyDir);
 
-    await expect(deploy({ target: "self-host" })).rejects.toThrow(
-      "No handler.ts or handler.js found"
-    );
+    await expect(deploy({ target: "self-host" })).rejects.toMatchObject({
+      code: "handler_not_found",
+      message: `No handler.ts or handler.js found in ${emptyDir}.`,
+      hint: expect.stringMatching(/handler\.ts.*handler\.js/),
+    });
 
     rmSync(emptyDir, { recursive: true, force: true });
   });
