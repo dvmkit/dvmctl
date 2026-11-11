@@ -424,6 +424,53 @@ export interface DvmVisibilityResult {
   hidden: boolean;
 }
 
+export interface DvmPayoutPreferences {
+  accept_cashu: boolean | null;
+  accept_tempo: boolean | null;
+  accept_base: boolean | null;
+}
+
+export interface DvmPayoutRoutingResult extends DvmPayoutPreferences {
+  applies_on: "next_deploy";
+}
+
+export async function getDvmPayoutRouting(
+  platformUrl: string, token: string, dvmId: string
+): Promise<DvmPayoutRoutingResult> {
+  return dvmPayoutRoutingRequest(platformUrl, token, dvmId);
+}
+
+export async function setDvmPayoutRouting(
+  platformUrl: string, token: string, dvmId: string, preferences: Partial<DvmPayoutPreferences>
+): Promise<DvmPayoutRoutingResult> {
+  return dvmPayoutRoutingRequest(platformUrl, token, dvmId, preferences);
+}
+
+async function dvmPayoutRoutingRequest(
+  platformUrl: string, token: string, dvmId: string, preferences?: Partial<DvmPayoutPreferences>
+): Promise<DvmPayoutRoutingResult> {
+  const res = await platformFetch(
+    `${platformUrl}/api/v1/builder/dvms/${encodeURIComponent(dvmId)}/payout-routing`,
+    {
+      method: preferences ? "PUT" : "GET",
+      headers: { Authorization: `Bearer ${token}`, ...(preferences ? { "Content-Type": "application/json" } : {}) },
+      ...(preferences ? { body: JSON.stringify(preferences) } : {}),
+    }
+  );
+  if (!res.ok) {
+    const body = (await res.json().catch(() => ({}))) as { error?: PlatformErrorBody & { code?: string } };
+    throw platformResponseError(
+      body.error?.code ?? "payout_routing_failed",
+      body.error,
+      `Failed to ${preferences ? "update" : "read"} DVM payout routing: ${res.status}`,
+      { hint: res.status === 403
+        ? "Payout routing requires an admin or owner role in the DVM's org. Ask an org owner."
+        : undefined }
+    );
+  }
+  return (await res.json()) as DvmPayoutRoutingResult;
+}
+
 export async function setDvmVisibility(
   platformUrl: string,
   token: string,

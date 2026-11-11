@@ -36,6 +36,14 @@ For temporary suspension, use the documented pause/resume path and verify availa
 
 Close with the observed state, change made, and remaining action. Report a payout only when transfer evidence supports it; keep earnings, pending settlement, and funds delivered distinct.
 
+## Per-service payout rail preferences
+
+Run `dvmctl payout-routing <slug>` to read the stored Cashu, Tempo, and Base preferences. Add `--org <handle>` to override the saved organization context; the slug is resolved within that organization. Reading and updating require an organization admin or owner.
+
+Supply any subset of `--cashu <true|false|null>`, `--tempo <true|false|null>`, and `--base <true|false|null>` to update only those preferences. For example, `dvmctl payout-routing my-dvm --cashu false --tempo null` declines Cashu and resets Tempo to inherit, leaving Base unchanged. Values must be exactly `true`, `false`, or `null`.
+
+`false` declines a rail; both `true` and `null` inherit the account setting and cannot override an account disable. These are stored preferences applied at the next deploy, not the running machine's payment configuration. Saving does not deploy, edit environment secrets, or change account settings. Output defaults to JSON with all three nullable `accept_*` preferences and `applies_on: "next_deploy"`; add `--human` for an explanation. Use the [deployment procedure](deploying.md) when ready to apply the saved preferences.
+
 ## Builder feedback nudges
 
 `dvmctl` may include `feedback_nudge` and `feedback_hint` after a failed command, a first deploy, or a periodic check-in. Under `ask`, describe the proposed feedback and get the builder's agreement before `dvmctl feedback send`. Under `auto`, send your own short, specific note without asking. Under `off`, do not act on a nudge; explicit feedback from the builder can still be sent. Never include credentials, source files, or environment values in feedback.

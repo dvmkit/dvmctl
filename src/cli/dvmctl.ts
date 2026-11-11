@@ -134,6 +134,7 @@ import type { TransferOptions } from "../commands/builder/transfer.ts";
 import { transfer } from "../commands/builder/transfer.ts";
 import type { ValidateOptions } from "../commands/builder/validate.ts";
 import { validate } from "../commands/builder/validate.ts";
+import { payoutRouting, type PayoutRoutingOptions } from "../commands/builder/payout-routing.ts";
 import { visibility, type VisibilityOptions } from "../commands/builder/visibility.ts";
 import type { WhoamiOptions } from "../commands/builder/whoami.ts";
 import { whoami } from "../commands/builder/whoami.ts";
@@ -314,6 +315,18 @@ export function buildProgram(): Command {
     .option("--human", "Human-readable output instead of JSON")
     .action((slug: string, opts: InfoOptions) => {
       catchErrors(() => dvmInfo(slug, opts), opts.human);
+    });
+
+  program
+    .command("payout-routing <slug>")
+    .description("Read or update stored payout rail preferences (admin/owner; applies at next deploy)")
+    .option("--cashu <true|false|null>", "Cashu: false declines; true/null inherit account settings")
+    .option("--tempo <true|false|null>", "Tempo: false declines; true/null inherit account settings")
+    .option("--base <true|false|null>", "Base: false declines; true/null inherit account settings")
+    .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
+    .option("--human", "Human-readable output instead of JSON")
+    .action((slug: string, opts: PayoutRoutingOptions) => {
+      catchErrors(() => payoutRouting(slug, opts), opts.human);
     });
 
   program
