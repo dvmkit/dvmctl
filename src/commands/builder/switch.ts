@@ -1,5 +1,6 @@
 import { DvmError } from "@dvmkit/sdk/internal";
 
+import { authRequiredError } from "../../lib/auth-hint.ts";
 import { clearActiveOrg, loadActiveOrg, resolveAuth, saveActiveOrg } from "../../lib/platform.ts";
 import * as platformClient from "../../lib/platform-client.ts";
 import { info, json } from "../../shared/output.ts";
@@ -51,11 +52,7 @@ export async function switchCmd(handle: string | undefined, opts: SwitchOptions)
   // handle that would 404 every subsequent read and 403 every deploy.
   const creds = resolveAuth();
   if (!creds) {
-    throw new DvmError(
-      "auth_required",
-      "Not authenticated.",
-      "Set DVMKIT_API_KEY or run `dvmctl auth`."
-    );
+    throw authRequiredError();
   }
   const platformUrl = process.env.DVMKIT_PLATFORM_URL ?? "https://api.dvmkit.dev";
   const membership = await platformClient.getOrgMembership(platformUrl, creds.token, handle);

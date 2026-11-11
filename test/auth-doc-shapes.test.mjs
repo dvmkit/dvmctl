@@ -8,7 +8,7 @@ import test from "node:test";
 
 const account = "new-builder@example.test";
 
-async function fixture(context, mode) {
+async function fixture(context, mode, { display = ":0" } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "dvmctl-auth-"));
   context.after(() => rmSync(directory, { recursive: true, force: true }));
   const browser = join(directory, "browser.json");
@@ -54,13 +54,15 @@ global.setTimeout = (done, ms, ...args) => originalTimeout(done, ms >= 1000 && m
     DVMCTL_CONFIG_DIR: config,
     DVMKIT_PLATFORM_URL: `http://127.0.0.1:${server.address().port}`,
     DVMKIT_WEB_URL: "https://example.test",
+    // A browser launch is attempted only where a display exists.
+    ...(display ? { DISPLAY: display } : {}),
   };
   const run = args => new Promise(resolve => {
     execFile(process.execPath, ["--require", preload, join(process.cwd(), "dist/dvmctl.js"), ...args],
       { env, encoding: "utf8", timeout: 20_000 },
       (error, stdout, stderr) => resolve({ code: error?.code ?? 0, stdout, stderr }));
   });
-  return { run, config, requests, polls: () => polls, browser: () => JSON.parse(readFileSync(browser, "utf8")) };
+  return { run, config, requests, polls: () => polls, browser: () => JSON.parse(readFileSync(browser, "utf8")), browserLaunched: () => existsSync(browser) };
 }
 
 for (const mode of ["cancel", "timeout", "success"]) {
@@ -87,7 +89,10 @@ for (const mode of ["cancel", "timeout", "success"]) {
       } else {
         assert.equal(browser.stdout, "");
         const startup = JSON.parse(browser.stderr);
-        assert.equal(startup.status, "opening_browser");
+        assert.equal(startup.status, "awaiting_human");
+        assert.equal(startup.browser_opened, true);
+        assert.match(startup.expires_at, /^\d{4}-\d\d-\d\dT/);
+        assert.ok(startup.instruction.includes(startup.url));
         assert.equal(typeof startup.hint, "string");
         assert.ok(startup.hint.length > 0);
         const url = new URL(startup.url);
@@ -134,6 +139,21 @@ test("compiled auth_required retains its API key and auth command hint", async c
   assert.equal(result.stderr, "");
   const error = JSON.parse(result.stdout);
   assert.equal(error.error.code, "auth_required");
-  assert.equal(error.error.hint, "Set DVMKIT_API_KEY or run `dvmctl auth`.");
+  assert.match(error.error.hint, /human must sign in/);
+  assert.match(error.error.hint, /`dvmctl auth`/);
+  assert.match(error.error.hint, /DVMKIT_API_KEY/);
+  assert.match(error.error.hint, /https:\/\/dvmkit\.com\/docs\/cli-auth\.md/);
   assert.equal(f.polls(), 0);
+});
+
+test("compiled auth on a Linux host without a display asks for the link to be relayed", { skip: process.platform !== "linux" }, async context => {
+  const f = await fixture(context, "success", { display: "" });
+  const result = await f.run(["auth"]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(f.browserLaunched(), false);
+  const event = JSON.parse(result.stderr.trim().split("\n")[0]);
+  assert.equal(event.status, "awaiting_human");
+  assert.equal(event.browser_opened, false);
+  assert.match(event.display, /could not open a browser/i);
+  assert.doesNotMatch(result.stderr, /opening browser/i);
 });

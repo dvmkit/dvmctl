@@ -23,6 +23,7 @@ vi.mock("node:os", async (importOriginal) => {
 });
 
 import {
+  CLI_AUTH_TTL_MS,
   CLI_AUTH_MAX_POLL_ATTEMPTS,
   CLI_AUTH_POLL_INTERVAL_MS,
 } from "../../../lib/cli-auth";
@@ -50,6 +51,10 @@ describe("dvmctl auth login", () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
 
     vi.mocked(progress).mockClear();
+    vi.mocked(exec).mockReset();
+    // A browser launch is attempted only where a display exists; pin it so the
+    // suite behaves the same on a headless Linux CI host.
+    vi.stubEnv("DISPLAY", ":0");
     mockPlatform.loadAuthToken.mockReturnValue(null);
     mockPlatform.saveAuthToken.mockClear();
   });
@@ -57,6 +62,7 @@ describe("dvmctl auth login", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.restoreAllMocks();
   });
 
@@ -151,6 +157,7 @@ describe("dvmctl auth login", () => {
         : vi.mocked(progress).mock.calls.map(([event]) => event);
       return undefined as never;
     });
+    const startedAt = Date.now();
     const result = auth({ human });
     await vi.advanceTimersByTimeAsync(CLI_AUTH_POLL_INTERVAL_MS);
     await result;
@@ -168,9 +175,12 @@ describe("dvmctl auth login", () => {
     } else {
       expect(outputBeforeBrowser).toEqual([
         {
-          status: "opening_browser",
+          status: "awaiting_human",
           url: expect.stringMatching(/^https:\/\/dvmkit.com\/cli-auth\?session=/),
           fingerprint: expect.stringMatching(/^[a-f0-9]{12}$/),
+          expires_at: new Date(startedAt + CLI_AUTH_TTL_MS).toISOString(),
+          browser_opened: true,
+          instruction: expect.any(String),
           display: expect.any(String),
           hint: expect.any(String),
         },
@@ -263,4 +273,112 @@ describe("dvmctl auth login", () => {
       expect(vi.getTimerCount()).toBe(0);
     }
   );
+
+  describe("telling the agent to relay the link", () => {
+    const approved = {
+      ok: true,
+      status: 200,
+      json: async () => ({ token: "dvmk_newkey", account: "alice@example.com" }),
+    };
+
+    let startedAt = 0;
+
+    async function run(human: boolean, platformName?: string): Promise<void> {
+      startedAt = Date.now();
+      const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+      if (platformName) Object.defineProperty(process, "platform", { value: platformName });
+      try {
+        fetchMock.mockResolvedValueOnce(approved);
+        const result = auth({ human });
+        await vi.advanceTimersByTimeAsync(CLI_AUTH_POLL_INTERVAL_MS);
+        await result;
+      } finally {
+        Object.defineProperty(process, "platform", original);
+      }
+    }
+
+    function events(): Array<Record<string, unknown>> {
+      return vi.mocked(progress).mock.calls.map(([event]) => event as Record<string, unknown>);
+    }
+
+    function failBrowserLaunch(): void {
+      vi.mocked(exec).mockImplementation(((_cmd: string, callback: (error: Error | null) => void) => {
+        callback(new Error("xdg-open: not found"));
+        return undefined;
+      }) as never);
+    }
+
+    it("emits awaiting_human with the link, code, expiry and both routes, and no secret, when a browser opens", async () => {
+      await run(false);
+
+      expect(events()).toHaveLength(1);
+      const event = events()[0]!;
+      expect(event).toMatchObject({ status: "awaiting_human", browser_opened: true });
+      expect(Date.parse(event.expires_at as string)).toBe(startedAt + CLI_AUTH_TTL_MS);
+      expect(event.instruction).toContain(event.url);
+      expect(event.instruction).toContain(event.fingerprint);
+      expect(event.instruction).toMatch(/any device/);
+      expect(event.instruction).toContain("DVMKIT_API_KEY");
+      expect(event.instruction).toContain("https://dvmkit.com/docs/cli-auth.md");
+      const headers = (fetchMock.mock.calls[0]?.[1] as { headers: { Authorization: string } }).headers;
+      const verifier = headers.Authorization.slice("Bearer ".length);
+      expect(JSON.stringify(events())).not.toContain(verifier);
+    });
+
+    it("reports a browser that fails to launch (asynchronously) and still asks for a relay", async () => {
+      failBrowserLaunch();
+      await run(false);
+
+      expect(events().at(-1)).toMatchObject({
+        status: "awaiting_human",
+        browser_opened: false,
+        display: expect.stringMatching(/could not open a browser.*relayed/i),
+        instruction: expect.stringContaining("Send them this link"),
+      });
+    });
+
+    it("says so in human mode when the browser fails to launch", async () => {
+      failBrowserLaunch();
+      await run(true);
+
+      expect(vi.mocked(console.log).mock.calls.join("\n")).toMatch(/could not open a browser/i);
+    });
+
+    it("does not claim to open a browser on a headless Linux host (JSON)", async () => {
+      vi.stubEnv("DISPLAY", "");
+      vi.stubEnv("WAYLAND_DISPLAY", "");
+      await run(false, "linux");
+
+      expect(exec).not.toHaveBeenCalled();
+      expect(events()).toHaveLength(1);
+      expect(events()[0]).toMatchObject({
+        status: "awaiting_human",
+        browser_opened: false,
+        display: expect.stringMatching(/could not open a browser.*relayed/i),
+        instruction: expect.stringContaining("Send them this link"),
+      });
+      expect(JSON.stringify(events())).not.toMatch(/opening browser/i);
+    });
+
+    it("prints the relay instruction instead of 'Opening browser' on a headless Linux host (human)", async () => {
+      vi.stubEnv("DISPLAY", "");
+      vi.stubEnv("WAYLAND_DISPLAY", "");
+      await run(true, "linux");
+
+      const output = vi.mocked(console.log).mock.calls.join("\n");
+      expect(exec).not.toHaveBeenCalled();
+      expect(output).not.toMatch(/opening browser/i);
+      expect(output).toMatch(/could not open a browser/i);
+      expect(output).toContain("Send them this link");
+    });
+
+    it("still opens a browser on Linux when only WAYLAND_DISPLAY is set", async () => {
+      vi.stubEnv("DISPLAY", "");
+      vi.stubEnv("WAYLAND_DISPLAY", "wayland-0");
+      await run(false, "linux");
+
+      expect(exec).toHaveBeenCalledTimes(1);
+      expect(events()[0]).toMatchObject({ browser_opened: true });
+    });
+  });
 });

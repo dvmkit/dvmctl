@@ -4,7 +4,8 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { clearAuthToken, loadAuthToken, resolveAuth, saveAuthToken } from "../platform";
+import { AUTH_REQUIRED_HINT } from "../auth-hint";
+import { clearAuthToken, loadAuthToken, requireAuth, resolveAuth, saveAuthToken } from "../platform";
 
 // Point the `dvmctl` state root at a fresh dir per test, so each starts with no
 // stored token and nothing touches the real `~/.dvmctl/`. `DVMCTL_CONFIG_DIR`
@@ -65,5 +66,12 @@ describe("platform auth", () => {
 
   it("resolveAuth returns null when nothing configured", () => {
     expect(resolveAuth()).toBeNull();
+  });
+
+  it("requireAuth with nothing configured tells the agent how its human signs in", () => {
+    delete process.env.DVMKIT_API_KEY;
+    expect(() => requireAuth()).toThrow(
+      expect.objectContaining({ code: "auth_required", hint: AUTH_REQUIRED_HINT })
+    );
   });
 });

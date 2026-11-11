@@ -1,6 +1,7 @@
 import { DvmError } from "@dvmkit/sdk/internal";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { AUTH_REQUIRED_HINT } from "../auth-hint";
 import { mapHandshakeError, openDbTunnel, toWsUrl } from "../db-tunnel-client";
 import type { DbTunnelStub } from "./db-tunnel-stub";
 import { startDbTunnelStub } from "./db-tunnel-stub";
@@ -47,7 +48,7 @@ describe("mapHandshakeError", () => {
     const err = mapHandshakeError(401, "cast");
     expect(err).toBeInstanceOf(DvmError);
     expect(err.code).toBe("auth_required");
-    expect(err.hint).toContain("dvmctl auth");
+    expect(err.hint).toBe(AUTH_REQUIRED_HINT);
   });
 
   it("maps 403 to forbidden", () => {

@@ -71,6 +71,7 @@ vi.mock("../../../lib/platform-client", () => ({
 }));
 
 import { loadIdentitySecret } from "@dvmkit/sdk/internal";
+import { AUTH_REQUIRED_HINT } from "../../../lib/auth-hint";
 import { getBuilderMnemonicMigrationHint } from "../../../lib/builder-mnemonic";
 
 import { deriveSlug, slugify } from "../../../lib/deploy-attestation";
@@ -134,6 +135,28 @@ describe("dvmctl deploy --target self-host", () => {
   });
 
   it("fails with `identity_required` when no builder identity is on disk", async () => {
+    vi.mocked(loadIdentitySecret).mockReturnValueOnce(null);
+    await expect(deploy({ target: "self-host" })).rejects.toMatchObject({
+      code: "identity_required",
+    });
+  });
+
+  it("asks for sign-in before the identity step on a cloud deploy with neither", async () => {
+    vi.mocked(resolveAuth).mockReturnValue(null);
+    vi.mocked(loadIdentitySecret).mockReturnValue(null);
+    try {
+      await expect(deploy({ target: "cloud", createIdentity: true })).rejects.toMatchObject({
+        code: "auth_required",
+        hint: AUTH_REQUIRED_HINT,
+      });
+      expect(identityCreate).not.toHaveBeenCalled();
+    } finally {
+      vi.mocked(loadIdentitySecret).mockImplementation(() => "b".repeat(64));
+    }
+  });
+
+  it("does not need sign-in to report a missing identity for self-host", async () => {
+    vi.mocked(resolveAuth).mockReturnValue(null);
     vi.mocked(loadIdentitySecret).mockReturnValueOnce(null);
     await expect(deploy({ target: "self-host" })).rejects.toMatchObject({
       code: "identity_required",
