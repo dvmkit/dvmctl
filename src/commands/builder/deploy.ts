@@ -39,6 +39,13 @@ import { dockerfileTemplate } from "./create/templates/shared.ts";
 import { createTarball, packagedTreeDirtyPaths, resolveBuildContext } from "./deploy-context.ts";
 import { identityCreate } from "./identity.ts";
 import { validateManifest } from "./validate.ts";
+import {
+  checkX402Listing,
+  formatX402ListingLines,
+  listingProgressLine,
+  unverifiedListingReport,
+  type X402ListingReport,
+} from "./x402-listing.ts";
 
 export { createTarball, resolveBuildContext, TARBALL_EXCLUDES } from "./deploy-context.ts";
 
@@ -644,6 +651,7 @@ async function deployCloud(cwd: string, opts: DeployOptions): Promise<void> {
     result.status === "deployed_unverified"
       ? `Run \`curl -s ${verificationUrl}\` and ${commit ? `confirm \`gitSha\` is \`${commit.sha}\`` : "read the served `gitSha`"}.`
       : undefined;
+  const x402Listing = await postDeployX402Listing(result, slug, opts.human);
 
   if (opts.human) {
     info(
@@ -656,6 +664,7 @@ async function deployCloud(cwd: string, opts: DeployOptions): Promise<void> {
       info(`  Public URL: ${result.dvmkitUrl}`);
     }
     for (const line of opts.resultLines ?? []) info(`  ${line}`);
+    if (x402Listing) for (const line of formatX402ListingLines(x402Listing)) info(`  ${line}`);
     const feedbackHint = feedbackHumanHint({ data: { status: result.status, dvmId } });
     if (feedbackHint) info(feedbackHint);
     info("");
@@ -679,8 +688,31 @@ async function deployCloud(cwd: string, opts: DeployOptions): Promise<void> {
             ...(commit ? { expected_git_sha: commit.sha } : {}),
           }
         : {}),
+      ...(x402Listing ? { x402_listing: x402Listing } : {}),
       ...opts.resultFields,
     });
+  }
+}
+
+/**
+ * Coinbase's catalog verdict on the deployed DVM's x402 routes. It is advisory:
+ * any failure here leaves the deploy's result and exit status untouched.
+ */
+async function postDeployX402Listing(
+  result: { status: string; dvmkitUrl: string | null },
+  slug: string,
+  human: boolean | undefined
+): Promise<X402ListingReport | undefined> {
+  if (result.status === "deployed_unverified") return unverifiedListingReport(slug);
+  if (result.status !== "deployed" || !result.dvmkitUrl) return undefined;
+  try {
+    const report = await checkX402Listing(result.dvmkitUrl, slug, (count) => {
+      if (human) info(`  ${listingProgressLine(count)}`);
+      else progress({ event: "x402_listing_check", routes: count });
+    });
+    return report.routes.length > 0 ? report : undefined;
+  } catch {
+    return undefined;
   }
 }
 

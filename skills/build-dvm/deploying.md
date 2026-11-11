@@ -51,6 +51,8 @@ Run `dvmctl visibility <slug> --listed` to restore discovery. Choose exactly one
 
 Inspect the actual endpoint, active revision, and health. Read `/v1/info` or `dvm describe` to confirm capability, price, any declared rate card, signing identity, and intended payment configuration. Test the agreed example and retrieve its output.
 
+A Cloud deploy of a DVM with x402 routes also asks Coinbase's public x402 validator about each route and reports the verdict under `x402_listing`: `listed`, `listed_with_problems` (each failed check, with a fix where one is known), `not_listed` (no catalog listing, which is optional), `unreachable`, `not_x402`, `challenge_invalid` (the route answers 402 but its payment challenge fails Coinbase's checks), or `check_unavailable`. The check never changes the deploy's status. Run `dvmctl x402 listing-check <slug>` to repeat it, for example after a `deployed_unverified` deploy.
+
 For a production paid acceptance, follow [testing](testing.md) with the already approved funds and cap. If that scope is absent, report the deployment evidence and the specific paid check still unperformed. Never claim receipt or payout from a successful build alone.
 
 Record the endpoint, deployed revision, validation result, and any pending payment operation. Continue to [operating](operating.md) for earnings and payout work.

@@ -91,6 +91,8 @@ import {
   withDeployBuildContext,
 } from "../deploy";
 import { identityCreate } from "../identity";
+import { X402_VALIDATOR_URL } from "../x402-listing";
+import { listedResponse } from "./x402-validator-fixtures";
 
 describe("dvmctl deploy --target self-host", () => {
   let originalCwd: string;
@@ -975,6 +977,150 @@ describe("dvmctl deploy cloud dirty-tree guard", { timeout: SPAWN_HEAVY_TIMEOUT 
     expect(listing).not.toContain("active-dvm");
     expect(listing).not.toContain(".verify-logs");
     expect(listing).not.toContain("production-acceptance.log");
+  });
+
+  describe("x402 catalog listing check", () => {
+    const publicUrl = "https://alice--word-counter.dvmkit.ai";
+    const routeUrl = `${publicUrl}/v1/x402/count`;
+    let validator: () => Response;
+
+    beforeEach(() => {
+      validator = () => new Response(JSON.stringify(listedResponse()), { status: 200 });
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: string | URL | Request) => {
+          const url = String(input);
+          if (url === `${publicUrl}/v1/info`) {
+            return new Response(JSON.stringify({ x402_capabilities: { count: { url: routeUrl } } }), { status: 200 });
+          }
+          if (url === X402_VALIDATOR_URL) return validator();
+          return new Response(null, { status: 404 });
+        })
+      );
+      streamDeployLogsMock.mockResolvedValue({ url: "https://word-counter.fly.dev", status: "deployed", dvmkitUrl: publicUrl });
+      vi.mocked(platformClient.deployLocal).mockResolvedValue({
+        dvmId: "dvm-local-1",
+        slug: "word-counter",
+        url: "http://localhost:9090",
+        status: "deployed",
+        paused: false,
+        suspensionReason: null,
+        dvmkitUrl: publicUrl,
+      });
+      vi.mocked(info).mockClear();
+    });
+
+    const validatorCalls = () =>
+      vi.mocked(fetch).mock.calls.filter(([input]) => String(input) === X402_VALIDATOR_URL).length;
+
+    it("merges each route's verdict into the single terminal result", async () => {
+      await deploy({ target: "cloud" });
+
+      expect(json).toHaveBeenCalledTimes(1);
+      expect(json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: "deployed",
+          x402_listing: expect.objectContaining({
+            routes: [expect.objectContaining({ capability: "count", url: routeUrl, status: "listed" })],
+          }),
+        })
+      );
+    });
+
+    it("announces the check before calling the validator", async () => {
+      const validatorCallsWhenAnnounced: number[] = [];
+      vi.mocked(progress).mockImplementation((event) => {
+        if ((event as { event?: string }).event === "x402_listing_check") validatorCallsWhenAnnounced.push(validatorCalls());
+      });
+
+      await deploy({ target: "cloud" });
+
+      expect(progress).toHaveBeenCalledWith({ event: "x402_listing_check", routes: 1 });
+      expect(validatorCallsWhenAnnounced).toEqual([0]);
+      expect(validatorCalls()).toBe(1);
+    });
+
+    it("prints the verdict as human lines with --human", async () => {
+      await deploy({ target: "cloud", human: true });
+
+      expect(info).toHaveBeenCalledWith(`    count: listed (${routeUrl})`);
+    });
+
+    it("adds nothing for a DVM that offers no x402 routes", async () => {
+      vi.mocked(fetch).mockImplementation(async (input) =>
+        String(input) === `${publicUrl}/v1/info`
+          ? new Response(JSON.stringify({ name: "word-counter" }), { status: 200 })
+          : new Response(null, { status: 404 })
+      );
+
+      await deploy({ target: "cloud" });
+
+      expect(validatorCalls()).toBe(0);
+      expect(progress).not.toHaveBeenCalledWith(expect.objectContaining({ event: "x402_listing_check" }));
+      expect(json).toHaveBeenCalledWith(expect.not.objectContaining({ x402_listing: expect.anything() }));
+    });
+
+    it.each([
+      ["a 5xx", () => new Response("down", { status: 500 })],
+      ["an unparseable body", () => new Response("not json", { status: 200 })],
+      [
+        "a timeout",
+        () => {
+          throw new DOMException("timed out", "TimeoutError");
+        },
+      ],
+    ])("keeps the deploy's status and exit code when the validator gives %s", async (_label, failing) => {
+      validator = failing;
+      const exitCodeBefore = process.exitCode;
+
+      await expect(deploy({ target: "cloud" })).resolves.toBeUndefined();
+
+      expect(process.exitCode).toBe(exitCodeBefore);
+      expect(json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: "deployed",
+          x402_listing: { status: "checked", routes: [expect.objectContaining({ status: "check_unavailable" })] },
+        })
+      );
+    });
+
+    it("prints nothing new for a DVM whose /v1/info cannot be read", async () => {
+      vi.mocked(fetch).mockImplementation(async () => new Response(null, { status: 503 }));
+
+      await deploy({ target: "cloud" });
+
+      expect(json).toHaveBeenCalledWith(expect.not.objectContaining({ x402_listing: expect.anything() }));
+      expect(json).toHaveBeenCalledWith(expect.objectContaining({ status: "deployed" }));
+    });
+
+    it("only hints at a later listing check when the deploy is unverified", async () => {
+      streamDeployLogsMock.mockResolvedValue({ url: "https://word-counter.fly.dev", status: "deployed_unverified", dvmkitUrl: publicUrl });
+
+      await deploy({ target: "cloud" });
+
+      expect(validatorCalls()).toBe(0);
+      expect(json).toHaveBeenCalledWith(
+        expect.objectContaining({
+          status: "deployed_unverified",
+          x402_listing: {
+            status: "not_checked",
+            routes: [],
+            hint: expect.stringContaining("dvmctl x402 listing-check word-counter"),
+          },
+        })
+      );
+    });
+
+    it.each([
+      ["--local", { local: true, url: "http://localhost:9090" }],
+      ["self-host", { target: "self-host" as const }],
+      ["--dry-run", { dryRun: true, runtime: "isolate" as const }],
+      ["connect", { endpointUrl: "https://upstream.example" }],
+    ])("makes no validator call for %s", async (_label, opts) => {
+      await deploy(opts);
+
+      expect(validatorCalls()).toBe(0);
+    });
   });
 
   it("reports the uploaded folder and Dockerfile in the result", async () => {

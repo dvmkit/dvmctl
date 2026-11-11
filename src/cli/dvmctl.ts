@@ -148,6 +148,7 @@ import type {
   X402WriteOffOptions,
 } from "../commands/builder/x402-settlements.ts";
 import { x402Reconcile, x402Wedged, x402WriteOff } from "../commands/builder/x402-settlements.ts";
+import { x402ListingCheck, type X402ListingCheckOptions } from "../commands/builder/x402-listing.ts";
 import type { DevOptions } from "../commands/dev.ts";
 import { catchErrors } from "../lib/error-handler.ts";
 import { setFeedbackCommand } from "../lib/builder-feedback-nudges.ts";
@@ -611,6 +612,22 @@ export function buildProgram(): Command {
     .option("--human", "Human-readable output instead of JSON")
     .action((h: string, opts: { human?: boolean }) => {
       catchErrors(() => handleCheck(h, opts), opts.human);
+    });
+
+  const x402Cmd = program
+    .command("x402")
+    .description("Check a DVM's x402 routes against Coinbase's x402 catalog");
+
+  x402Cmd
+    .command("listing-check")
+    .argument("<slug>", "DVM slug")
+    .description(
+      "Ask Coinbase's x402 validator about each x402 route a deployed DVM serves: listed, listed with problems (with fixes), or not listed"
+    )
+    .option("--org <handle>", "Read as this org, overriding the `dvmctl switch` context")
+    .option("--human", "Human-readable output instead of JSON")
+    .action((slug: string, opts: X402ListingCheckOptions) => {
+      catchErrors(() => x402ListingCheck(slug, opts), opts.human);
     });
 
   const identityCmd = program
