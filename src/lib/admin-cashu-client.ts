@@ -2,6 +2,7 @@ import type { ContentHoldsResponse } from "@dvmkit/sdk/server";
 import type { SerializedDLEQ } from "@cashu/cashu-ts";
 import { ADMIN_STATE_UNAVAILABLE, buildAdminAuthHeader, DvmError } from "@dvmkit/sdk/internal";
 
+import { adminEndpoint } from "./admin-endpoint.ts";
 import { readRefundCapability } from "./refund-capability.ts";
 
 /**
@@ -650,7 +651,7 @@ export interface AdminRotateLockPubkeyResponse {
 }
 
 export interface AdminCashuClientOpts {
-  /** Base URL of the DVM (e.g. `https://builder--cast.example.com`). No trailing path. */
+  /** Base URL of the DVM, including its mount path when applicable. */
   endpoint: string;
   /** Identifier bound into the signed challenge. Matches `dvm_id` server-side. */
   dvmId: string;
@@ -676,7 +677,7 @@ export class AdminCashuClient {
   private readonly now: () => number;
 
   constructor(opts: AdminCashuClientOpts) {
-    this.endpoint = opts.endpoint.replace(/\/+$/, "");
+    this.endpoint = adminEndpoint(opts.endpoint);
     this.dvmId = opts.dvmId;
     this.privkeyHex = opts.privkeyHex;
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
@@ -1027,14 +1028,14 @@ export class AdminCashuClient {
     query?: string,
     requireDirectResponse = false
   ): Promise<T> {
+    const url = `${this.endpoint}${path}${query ?? ""}`;
     const { header } = buildAdminAuthHeader({
       method,
-      path,
+      path: new URL(url).pathname,
       dvmId: this.dvmId,
       privkeyHex: this.privkeyHex,
       now: this.now,
     });
-    const url = `${this.endpoint}${path}${query ?? ""}`;
     const init: RequestInit = {
       method,
       ...(requireDirectResponse ? { redirect: "error" as const, signal: AbortSignal.timeout(10_000) } : {}),

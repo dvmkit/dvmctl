@@ -2,6 +2,7 @@ import { createInterface } from "node:readline";
 
 import { DvmError, shellQuoteArg } from "@dvmkit/sdk/internal";
 
+import { validateAdminMountPrefix } from "../../lib/admin-endpoint.ts";
 import * as platformClient from "../../lib/platform-client.ts";
 import { info, json } from "../../shared/output.ts";
 import { connectAdmin } from "./admin-connection.ts";
@@ -13,6 +14,7 @@ export interface DestroyOptions {
   human?: boolean;
   /** Org handle to target, overriding the active `dvmctl switch` context. */
   org?: string;
+  mountPrefix?: string;
 }
 
 /**
@@ -24,6 +26,7 @@ export interface DestroyOptions {
  * so in its answer.
  */
 export async function destroy(slug: string, opts: DestroyOptions): Promise<void> {
+  validateAdminMountPrefix(opts.mountPrefix);
   const { token, platformUrl, dvmId } = await resolveDvm(slug, opts);
   const keepDb = opts.keepDb ?? false;
 
@@ -95,7 +98,7 @@ async function readLedgerReport(
   opts: DestroyOptions
 ): Promise<platformClient.DestroyLedgerReport | null> {
   try {
-    const { client } = await connectAdmin(slug, { org: opts.org });
+    const { client } = await connectAdmin(slug, { org: opts.org, mountPrefix: opts.mountPrefix });
     const res = await client.getBitcoinLiability();
     return {
       open_credits: res.deposit_credits,

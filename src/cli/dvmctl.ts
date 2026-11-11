@@ -341,6 +341,7 @@ export function buildProgram(): Command {
     .description("Destroy a deployed DVM and its paired Postgres cluster")
     .option("--confirm", "Skip confirmation prompt (required in non-interactive mode)")
     .option("--keep-db", "Preserve the Postgres cluster for re-attachment on redeploy")
+    .option("--mount-prefix <path>", "DVM mount path for its admin liability lookup (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((slug: string, opts: DestroyOptions) => {
@@ -845,6 +846,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; required for self-hosted DVMs)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--sync-platform", "Finish a pending platform lock-pubkey sync without rotating again")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
@@ -865,6 +867,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--watch", "Run as a long-lived daemon polling every --interval seconds")
     .option(
@@ -929,6 +932,7 @@ export function buildProgram(): Command {
     const command = holdsCmd.command(`${action} <handle> <job-id>${action === "renew" || action === "clear" ? " <hold-id>" : ""}`)
       .description(`${action} job-scoped content holds`)
       .option("--endpoint <url>", "Service endpoint override for a locally known DVM")
+      .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
       .option("--org <handle>", "Target this org")
       .option("--human", "Human-readable output instead of JSON");
     if (action !== "list") command.option("--reason <text>", "Required reason, recorded in the hold history");
@@ -954,6 +958,7 @@ export function buildProgram(): Command {
     .option("--refund-id <id>", "Override the deterministic refund ID for a deliberate additional partial refund")
     .option("--confirm", "Submit the refund; without this flag, refuse with a local intent and send no HTTP")
     .option("--endpoint <url>", "DVM admin endpoint URL for self-hosted DVMs or local development")
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the dvmctl switch context")
     .option("--human", "Human-readable output instead of JSON")
     .action((jobId: string, opts: RefundOptions) => {
@@ -973,6 +978,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--limit <n>", "Page size (default: 50, max 200)", (v) => Number(v))
     .option("--after <cursor>", "Continue from a previous run's `next_after` value")
@@ -995,6 +1001,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArg: string, paymentHash: string, opts: ReconcileInvoiceOptions) => {
@@ -1011,6 +1018,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArg: string, paymentHash: string, opts: WriteOffInvoiceOptions) => {
@@ -1026,6 +1034,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArg: string, opts: DrainsOwedOptions) => {
@@ -1045,6 +1054,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArgs: string[], opts: CreditLiabilityOptions) => {
@@ -1062,6 +1072,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArg: string, creditId: string, drainId: string, opts: DrainSettleOptions) => {
@@ -1077,6 +1088,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--limit <n>", "Page size (default: 20, max 50)", (v) => Number(v))
     .option("--after <cursor>", "Continue from a previous run's `next_after` value")
@@ -1101,6 +1113,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArg: string, settlementId: string, opts: X402ReconcileOptions) => {
@@ -1117,6 +1130,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArg: string, settlementId: string, opts: X402WriteOffOptions) => {
@@ -1132,6 +1146,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--limit <n>", "Rows to return (default: 20, max 50)", (v) => Number(v))
     .option("--include-resolved", "Also list completed and rejected intents")
@@ -1149,6 +1164,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArg: string, settlementIntentId: string, opts: X402ExactReconcileOptions) => {
@@ -1164,6 +1180,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--limit <n>", "Rows to return (default: 20, max 50)", (v) => Number(v))
     .option("--human", "Human-readable output instead of JSON")
@@ -1180,6 +1197,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--limit <n>", "Page size (default: 20, max 50)", (v) => Number(v))
     .option("--after <cursor>", "Continue from a previous run's `next_after` value")
@@ -1199,6 +1217,7 @@ export function buildProgram(): Command {
     .command("tempo-close-reports <handle>")
     .description("List hosted Tempo close reports and the builder payout at stake; retry searches again, while write-off gives up the payout report")
     .option("--endpoint <url>", "DVM admin endpoint URL (skips the platform getDvm lookup)")
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--limit <n>", "Page size (default: 20, max 50)", (v) => Number(v))
     .option("--after <cursor>", "Continue from next_after using the same --all setting")
@@ -1212,6 +1231,7 @@ export function buildProgram(): Command {
     .command("tempo-close-report-retry <handle> <obligation-id>")
     .description("Reopen the search for a Tempo close so the builder's payout report can still be sent")
     .option("--endpoint <url>", "DVM admin endpoint URL (skips the platform getDvm lookup)")
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArg: string, obligationId: string, opts: TempoCloseReportActionOptions) => {
@@ -1223,6 +1243,7 @@ export function buildProgram(): Command {
     .description("Permanently give up the builder's payout report for a missing Tempo close; does not refund the caller")
     .requiredOption("--note <text>", "Reason for giving up this payout report (1 to 2000 characters after trimming)")
     .option("--endpoint <url>", "DVM admin endpoint URL (skips the platform getDvm lookup)")
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArg: string, obligationId: string, opts: TempoCloseReportActionOptions) => {
@@ -1240,6 +1261,7 @@ export function buildProgram(): Command {
       .option("--evidence <text>", "Audit note/reference (1 to 4000 characters after trimming); not chain proof")
       .option("--confirm", "Submit this named decision; without this flag, send no HTTP")
       .option("--endpoint <url>", "DVM admin endpoint URL (skips the platform getDvm lookup)")
+      .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
       .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
       .option("--human", "Human-readable output instead of JSON")
       .action((handleArg: string, creditId: string, drainId: string, opts: TempoDecisionOptions) => {
@@ -1256,6 +1278,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArg: string, creditId: string, drainId: string, opts: TempoReconcileOptions) => {
@@ -1272,6 +1295,7 @@ export function buildProgram(): Command {
       "--endpoint <url>",
       "DVM admin endpoint URL (skips the platform getDvm lookup; use for self-hosted DVMs or local dev)"
     )
+    .option("--mount-prefix <path>", "DVM mount path, e.g. /feed (no trailing slash)")
     .option("--org <handle>", "Target this org, overriding the `dvmctl switch` context")
     .option("--human", "Human-readable output instead of JSON")
     .action((handleArg: string, creditId: string, drainId: string, opts: TempoWriteOffOptions) => {

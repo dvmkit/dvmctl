@@ -2,6 +2,7 @@ import { deriveBuilderLockKeypair, DvmError } from "@dvmkit/sdk/internal";
 
 import { authRequiredError } from "../../lib/auth-hint.ts";
 import { AdminApiError, AdminCashuClient } from "../../lib/admin-cashu-client.ts";
+import { adminEndpoint, validateAdminMountPrefix } from "../../lib/admin-endpoint.ts";
 import { readBuilderMnemonic } from "../../lib/builder-mnemonic.ts";
 import {
   type BuilderLockKeyring,
@@ -24,6 +25,7 @@ export interface RotateOptions {
    *  self-hosted DVMs. Only valid for container-runtime DVMs — isolate
    *  DVMs have no admin route at their URL. */
   endpoint?: string;
+  mountPrefix?: string;
   syncPlatform?: boolean;
   human?: boolean;
   org?: string;
@@ -58,6 +60,7 @@ interface RotationResult {
  *   sync leaves the same local pending marker.
  */
 export async function rotate(handle: string, opts: RotateOptions): Promise<void> {
+  validateAdminMountPrefix(opts.mountPrefix);
   const mnemonic = readBuilderMnemonic();
   if (!mnemonic) {
     throw new DvmError(
@@ -73,7 +76,7 @@ export async function rotate(handle: string, opts: RotateOptions): Promise<void>
   if (selected) {
     builderEntry = requireSelectedBuilderDvm(selected.dvmId);
   } else {
-    directKeyring = await resolveBuilderLockKeyringByHandle(handle, opts.endpoint);
+    directKeyring = await resolveBuilderLockKeyringByHandle(handle, opts.endpoint ? adminEndpoint(opts.endpoint, opts.mountPrefix) : undefined);
     builderEntry = requireSelectedBuilderDvm(directKeyring.canonicalDvmId);
   }
 
@@ -209,7 +212,7 @@ export async function rotate(handle: string, opts: RotateOptions): Promise<void>
       directKeyring?.currentKeypair ??
       deriveBuilderLockKeypair(mnemonic, builderEntry.canonical_dvm_id, currentIndex);
     const client = new AdminCashuClient({
-      endpoint: target.endpoint,
+      endpoint: adminEndpoint(target.endpoint, opts.mountPrefix),
       dvmId: builderEntry.canonical_dvm_id,
       privkeyHex: currentKeypair.privkey,
     });

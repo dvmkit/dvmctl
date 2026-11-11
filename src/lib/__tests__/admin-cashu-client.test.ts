@@ -19,6 +19,37 @@ function jsonResponse(status: number, body: unknown): Response {
 }
 
 describe("AdminCashuClient", () => {
+  it.each(["/feed", "/services/feed"])("signs the full %s mount path while excluding query parameters", async (prefix) => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(200, { invoices: [] }));
+    const client = new AdminCashuClient({
+      endpoint: `https://dvm.example${prefix}/`, dvmId: "dvm-fixture-1", privkeyHex: PRIVKEY, fetchImpl,
+    });
+    await client.getBlockedInvoices({ limit: 2, after: "cursor", includeResolved: true });
+    const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    const path = `${prefix}/admin/credit/blocked-invoices`;
+    expect(url).toBe(`https://dvm.example${path}?limit=2&after=cursor&include_resolved=true`);
+    const [nonce, ts, sig] = (init.headers as Record<string, string>).Authorization.slice(5).split(".");
+    expect(verifyChallenge(PUBKEY, buildAdminChallenge({
+      method: "GET", path, dvmId: "dvm-fixture-1", nonceHex: nonce, unixSeconds: ts,
+    }), sig)).toBe(true);
+    expect(verifyChallenge(PUBKEY, buildAdminChallenge({
+      method: "GET", path: "/admin/credit/blocked-invoices", dvmId: "dvm-fixture-1", nonceHex: nonce, unixSeconds: ts,
+    }), sig)).toBe(false);
+  });
+
+  it("reads refund capability from the same mount as the signed admin routes", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(200, {
+      protocol_version: 1, name: "Feed", auth: ["none"], capabilities: {},
+      payment: { methods: ["cashu"] }, mints: ["https://mint.example"],
+      cashu: { mints: ["https://mint.example"], lock_pubkeys: [`02${PUBKEY}`] },
+    }));
+    const client = new AdminCashuClient({
+      endpoint: "https://dvm.example/feed", dvmId: "dvm-fixture-1", privkeyHex: PRIVKEY, fetchImpl,
+    });
+    await client.getRefundCapability();
+    expect(fetchImpl).toHaveBeenCalledWith("https://dvm.example/feed/v1/info", expect.any(Object));
+  });
+
   it("signs GET /admin/cashu/pending-batches and parses the batches array", async () => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValueOnce(
       jsonResponse(200, {
@@ -183,11 +214,11 @@ describe("AdminCashuClient", () => {
     });
   });
 
-  it("classifies an older SDK's plain-text missing refund route without hiding typed missing draws", async () => {
+  it.each(["", "/feed"])("classifies a missing refund route at mount '%s' without hiding typed missing draws", async (prefix) => {
     const fetchImpl = vi.fn<typeof fetch>()
       .mockResolvedValueOnce(new Response("404 Not Found", { status: 404 }))
       .mockResolvedValueOnce(jsonResponse(404, { error: "draw_not_found" }));
-    const client = new AdminCashuClient({ endpoint: "https://dvm.example", dvmId: "dvm-fixture-1", privkeyHex: PRIVKEY, fetchImpl });
+    const client = new AdminCashuClient({ endpoint: `https://dvm.example${prefix}`, dvmId: "dvm-fixture-1", privkeyHex: PRIVKEY, fetchImpl });
     await expect(client.refundDraw({ jobId: "job-example", refundId: "refund-example" })).rejects.toMatchObject({ status: 404, body: { error: "not_found" } });
     await expect(client.refundDraw({ jobId: "job-example", refundId: "refund-example" })).rejects.toMatchObject({ status: 404, body: { error: "draw_not_found" } });
   });
@@ -227,8 +258,13 @@ describe("content-hold signed client", () => {
     expect(JSON.parse(fetchImpl.mock.calls[3][1]!.body as string)).toEqual({ reason: "Done" });
   });
 
-  it.each([jsonResponse(404, { error: "not_found" }), new Response("404 Not Found", { status: 404 }), jsonResponse(503, { error: "content_holds_unavailable" })])("gives an upgrade action for an unsupported service", async (response) => {
-    const client = new AdminCashuClient({ endpoint: "https://service.example", dvmId: "service-id", privkeyHex: PRIVKEY, fetchImpl: vi.fn<typeof fetch>().mockResolvedValue(response) });
+  it.each([
+    { prefix: "", response: jsonResponse(404, { error: "not_found" }) },
+    { prefix: "", response: new Response("404 Not Found", { status: 404 }) },
+    { prefix: "", response: jsonResponse(503, { error: "content_holds_unavailable" }) },
+    { prefix: "/feed", response: new Response("404 Not Found", { status: 404 }) },
+  ])("gives an upgrade action for an unsupported service at mount '$prefix'", async ({ prefix, response }) => {
+    const client = new AdminCashuClient({ endpoint: `https://service.example${prefix}`, dvmId: "service-id", privkeyHex: PRIVKEY, fetchImpl: vi.fn<typeof fetch>().mockResolvedValue(response) });
     await expect(client.getContentHolds("job-1")).rejects.toMatchObject({ code: "content_holds_unavailable", hint: expect.stringContaining("@dvmkit/sdk 0.8.0") });
   });
 

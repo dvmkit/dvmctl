@@ -1,6 +1,7 @@
 // Builder-owned authenticated connection to a DVM's self-admin surface.
 import { DvmError, providerProseSources } from "@dvmkit/sdk/internal";
 
+import { adminEndpoint, validateAdminMountPrefix } from "../../lib/admin-endpoint.ts";
 import {
   AdminApiError,
   AdminCashuClient,
@@ -21,10 +22,10 @@ export interface AdminConnection {
   dvmId: string;
 }
 
-/** The two flags every `dvmctl credit` verb takes to reach a DVM's admin surface. */
 export interface AdminConnectionOptions {
   /** DVM admin endpoint URL override; skips the platform `getDvm` lookup. */
   endpoint?: string;
+  mountPrefix?: string;
   org?: string;
 }
 
@@ -36,13 +37,15 @@ export async function connectAdmin(
   handle: string,
   opts: AdminConnectionOptions
 ): Promise<AdminConnection> {
+  validateAdminMountPrefix(opts.mountPrefix);
+  const directEndpoint = opts.endpoint ? adminEndpoint(opts.endpoint, opts.mountPrefix) : undefined;
   const selected = opts.endpoint ? undefined : await resolveDvm(handle, opts);
   const { canonicalDvmId, currentKeypair } = selected
     ? resolveBuilderLockKeyring(selected.dvmId)
-    : await resolveBuilderLockKeyringByHandle(handle, opts.endpoint);
+    : await resolveBuilderLockKeyringByHandle(handle, directEndpoint);
   return {
     client: new AdminCashuClient({
-      endpoint: await resolveAdminEndpoint(handle, opts.endpoint, selected),
+      endpoint: directEndpoint ?? adminEndpoint(await resolveAdminEndpoint(handle, selected), opts.mountPrefix),
       dvmId: canonicalDvmId,
       privkeyHex: currentKeypair.privkey,
     }),
@@ -83,10 +86,8 @@ export async function adminCall<T>(fn: () => Promise<T>): Promise<T> {
 
 async function resolveAdminEndpoint(
   handle: string,
-  override: string | undefined,
   selected?: ResolvedDvm
 ): Promise<string> {
-  if (override) return override.replace(/\/+$/, "");
   const { token, platformUrl } = selected ?? requireAuth();
   const { dvm } = await platformClient.getDvm(platformUrl, token, selected?.dvmId ?? handle);
   if (!dvm.url) {

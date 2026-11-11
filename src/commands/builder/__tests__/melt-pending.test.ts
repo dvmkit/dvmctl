@@ -640,7 +640,7 @@ describe("dvmctl melt-pending", () => {
     expect(getPendingBatches).toHaveBeenCalled();
   });
 
-  it("resolves the endpoint via getDvm when --endpoint is not supplied", async () => {
+  it.each([undefined, "/feed"])("resolves the endpoint via getDvm at mount '%s'", async (mountPrefix) => {
     const { getPendingBatches } = setHappyPath();
     getPendingBatches.mockResolvedValue({ batches: [] });
     vi.mocked(platformClient.getDvm).mockResolvedValue({
@@ -648,7 +648,8 @@ describe("dvmctl melt-pending", () => {
       deploys: [],
       domains: [],
     });
-    await meltPending("dvm", {});
+    await meltPending("dvm", { mountPrefix });
+    expect(clientCtorSpy).toHaveBeenCalledWith(expect.objectContaining({ endpoint: `https://my-dvm.fly.dev${mountPrefix ?? ""}` }));
     expect(platformClient.getDvm).toHaveBeenCalledWith("https://api.example", "t", "dvm-fixture-1");
   });
 

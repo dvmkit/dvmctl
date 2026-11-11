@@ -158,7 +158,7 @@ describe("resolveBuilderLockKeyringByHandle endpoint disambiguation", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("selects the only entry that derives the DVM's advertised current pubkey", async () => {
+  it.each(["", "/feed"])("selects the only entry from the advertised current pubkey at mount '%s'", async (prefix) => {
     const personal = candidate("dvm-personal", 1);
     const acme = candidate("dvm-acme", 2);
     const ambiguity = new DvmError(
@@ -170,9 +170,10 @@ describe("resolveBuilderLockKeyringByHandle endpoint disambiguation", () => {
       throw ambiguity;
     });
     vi.mocked(findBuilderDvmsByHandle).mockReturnValue([personal, acme]);
-    advertise(deriveBuilderLockKeypair(MNEMONIC, acme.canonical_dvm_id, 2).pubkey);
+    const fetchMock = advertise(deriveBuilderLockKeypair(MNEMONIC, acme.canonical_dvm_id, 2).pubkey);
 
-    const keyring = await resolveBuilderLockKeyringByHandle("my-dvm", "https://dvm.example/");
+    const keyring = await resolveBuilderLockKeyringByHandle("my-dvm", `https://dvm.example${prefix}/`);
+    expect(fetchMock).toHaveBeenCalledWith(`https://dvm.example${prefix}/v1/info`, expect.any(Object));
 
     expect(keyring.canonicalDvmId).toBe("dvm-acme");
     expect(keyring.rotationIndex).toBe(2);
