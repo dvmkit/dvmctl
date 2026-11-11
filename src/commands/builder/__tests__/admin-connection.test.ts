@@ -11,7 +11,30 @@ import { AdminApiError } from "../../../lib/admin-cashu-client";
 import { handleError } from "../../../lib/error-handler";
 import { resetFeedbackNotices } from "../../../lib/feedback-notice";
 import { info, json } from "../../../shared/output";
-import { adminCall } from "../admin-connection";
+import { adminCall, connectAdmin } from "../admin-connection";
+import { destroy } from "../destroy";
+import { meltPending } from "../melt-pending";
+import { rotate } from "../rotate";
+
+describe("admin mount prefix validation", () => {
+  const malformed = ["", "/", "feed", "/feed/", "//feed", "/feed//nested", "/feed?query", "/feed#fragment", "/feed/../other", "/feed/%2e%2e/other", "/feed\\other", "/feed with space", "/feed/%zz", "https://dvm.example/feed"];
+  it.each([
+    ["shared connection", connectAdmin],
+    ["melt-pending", meltPending],
+    ["rotate", rotate],
+    ["destroy", destroy],
+  ] as const)("%s refuses malformed prefixes before any request", async (_name, command) => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    try {
+      for (const mountPrefix of malformed) {
+        await expect(command("feed", { mountPrefix })).rejects.toMatchObject({ code: "invalid_mount_prefix" });
+      }
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+});
 
 describe("adminCall", () => {
   beforeEach(() => {

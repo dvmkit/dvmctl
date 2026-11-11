@@ -178,7 +178,7 @@ describe("dvmctl rotate", () => {
     await expect(rotate("my-dvm", {})).rejects.toThrow(/Self-hosted DVM/);
   });
 
-  it("skips platform sync for self-hosted DVMs (only calls the DVM admin endpoint)", async () => {
+  it.each([undefined, "/feed"])("skips platform sync for self-hosted DVMs at mount '%s'", async (mountPrefix) => {
     vi.mocked(builderStore.getBuilderDvm).mockReturnValue({
       handle: "my-dvm",
       canonical_dvm_id: CANONICAL_DVM_ID,
@@ -190,8 +190,9 @@ describe("dvmctl rotate", () => {
     const rotateMock = getRotateMock();
     rotateMock.mockResolvedValue({ current: nextPubkey, retired: [] });
 
-    await rotate("my-dvm", { endpoint: "https://self.example.com" });
+    await rotate("my-dvm", { endpoint: "https://self.example.com", mountPrefix });
 
+    expect(AdminCashuClient).toHaveBeenCalledWith(expect.objectContaining({ endpoint: `https://self.example.com${mountPrefix ?? ""}` }));
     expect(rotateMock).toHaveBeenCalledTimes(1);
     expect(platformClient.setDvmLockPubkey).not.toHaveBeenCalled();
     expect(builderStore.patchBuilderDvm).toHaveBeenCalledWith(CANONICAL_DVM_ID, {

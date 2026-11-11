@@ -10,6 +10,8 @@ A running process does not prove the handler or payment path works. Verify an ap
 
 ## Inspect earnings and collect payouts
 
+For a DVM mounted under a path, pass `--mount-prefix /feed` to its admin commands (`credit`, `refund`, `content-holds`, `melt-pending`, or `rotate`). Use a leading slash and no trailing slash. The prefix is appended to `--endpoint` or the platform-resolved URL; if that URL already includes the full mount path, omit `--mount-prefix`. Identity and refund-capability probes use the same mount. `destroy` also accepts the option for its admin liability lookup.
+
 Use `dvmctl revenue summary` for totals and `revenue events` or `revenue csv` for the requested period and organization. Report these as earnings, not a wallet balance.
 
 For Cashu, confirm the intended Lightning payout destination with the service configuration. Set or change it only within authorization using `dvmctl set-payout`. Run `dvmctl melt-pending <slug>` for a pass or its documented watch mode for continued service, then inspect `dvmctl melt-status` and the destination's receipt evidence.

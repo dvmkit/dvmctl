@@ -1,9 +1,24 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+test("packaged admin commands reject malformed mount prefixes before resolving a target", () => {
+  const cli = join(process.cwd(), "dist/dvmctl.js");
+  for (const args of [
+    ["credit", "drains-owed", "feed"],
+    ["credit", "drain-settle", "feed", "credit-example", "drain-example", "--tx", "transaction-example"],
+    ["melt-pending", "feed"],
+    ["rotate", "feed"],
+    ["destroy", "feed", "--confirm"],
+  ]) {
+    const result = spawnSync(process.execPath, [cli, ...args, "--mount-prefix", "/feed/"], { encoding: "utf8" });
+    assert.equal(result.status, 1, result.stderr);
+    assert.equal(JSON.parse(result.stdout).error.code, "invalid_mount_prefix", result.stdout);
+  }
+});
 
 test("standalone dvmctl exposes public commands and scaffolds a project", (context) => {
   const root = mkdtempSync(join(tmpdir(), "dvmctl-"));

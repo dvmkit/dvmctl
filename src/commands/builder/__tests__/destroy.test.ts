@@ -41,7 +41,7 @@ describe("dvmctl destroy", () => {
     } satisfies ListDvmsResult);
   });
 
-  it("sends what the DVM's own ledger owes, so the platform can wind it down", async () => {
+  it.each([undefined, "/feed"])("sends the DVM ledger liability at mount '%s' before wind-down", async (mountPrefix) => {
     vi.mocked(connectAdmin).mockResolvedValue({
       client: { getBitcoinLiability: vi.fn(async () => liability) },
       dvmId: "dvm-xyz",
@@ -57,8 +57,9 @@ describe("dvmctl destroy", () => {
       display: "my-dvm still owes callers prepaid balances…",
     });
 
-    await destroy("my-dvm", { confirm: true });
+    await destroy("my-dvm", { confirm: true, mountPrefix });
 
+    expect(connectAdmin).toHaveBeenCalledWith("my-dvm", { org: undefined, mountPrefix });
     expect(destroyDvm).toHaveBeenCalledWith("https://platform.example", "tok", "dvm-xyz", {
       keepDb: false,
       ledger: { open_credits: 2, pending_drains: 1, gaps: 1 },

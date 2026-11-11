@@ -22,6 +22,7 @@ import {
   rethrowIfAdminStateUnavailable,
   rethrowIfBadSignature,
 } from "../../lib/admin-cashu-client.ts";
+import { adminEndpoint, validateAdminMountPrefix } from "../../lib/admin-endpoint.ts";
 import {
   resolveBuilderLockKeyring,
   resolveBuilderLockKeyringByHandle,
@@ -57,6 +58,7 @@ export interface MeltPendingOptions {
    *  via the platform API (`getDvm`). Skipping that lookup is required for
    *  self-hosted DVMs and local-dev. */
   endpoint?: string;
+  mountPrefix?: string;
   /** When true, poll forever (daemon mode). */
   watch?: boolean;
   /** Poll interval in seconds for `--watch`. Default 60. Clamped [10, 3600]. */
@@ -187,6 +189,7 @@ const IN_FLIGHT_MELT_ALARM_AFTER_MS = 24 * 60 * 60 * 1000;
  * systemd.
  */
 export async function meltPending(handle: string, opts: MeltPendingOptions): Promise<void> {
+  validateAdminMountPrefix(opts.mountPrefix);
   if (opts.acknowledgeStuck !== undefined || opts.reason !== undefined) {
     await acknowledgeStuck(handle, opts);
     return;
@@ -317,7 +320,7 @@ async function resolveKeyring(handle: string, opts: MeltPendingOptions) {
   const selected = opts.endpoint ? undefined : await resolveDvm(handle, opts);
   const keyring = selected
     ? resolveBuilderLockKeyring(selected.dvmId)
-    : await resolveBuilderLockKeyringByHandle(handle, opts.endpoint);
+    : await resolveBuilderLockKeyringByHandle(handle, opts.endpoint ? adminEndpoint(opts.endpoint, opts.mountPrefix) : undefined);
   return { selected, ...keyring };
 }
 
@@ -327,7 +330,7 @@ async function resolveContext(handle: string, opts: MeltPendingOptions): Promise
     opts
   );
 
-  const endpoint = await resolveEndpoint(handle, opts.endpoint, selected);
+  const endpoint = adminEndpoint(await resolveEndpoint(handle, opts.endpoint, selected), opts.mountPrefix);
 
   const drainsOnly = !!opts.drainsOnly;
   const payoutLnAddress = opts.payout ?? getBuilderDvm(canonicalDvmId)?.payout_ln_address;
