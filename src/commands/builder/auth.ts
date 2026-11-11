@@ -1,7 +1,9 @@
 import { createHash, randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 
+import { CLI_AUTH_DOCS_URL } from "../../lib/auth-hint.ts";
 import {
+  CLI_AUTH_TTL_MS,
   CLI_AUTH_FINGERPRINT_LEN,
   CLI_AUTH_MAX_POLL_ATTEMPTS,
   CLI_AUTH_POLL_INTERVAL_MS,
@@ -18,6 +20,7 @@ export interface AuthOptions {
 
 const PLATFORM_URL = process.env.DVMKIT_PLATFORM_URL ?? "https://api.dvmkit.dev";
 const SIGN_IN_HINT = "Complete sign-in in your browser, then return here.";
+const NO_BROWSER_MESSAGE = "Could not open a browser on this machine. The link must be relayed to a human.";
 const CANCELLED_HINT = "Run `dvmctl auth` to try again.";
 const TIMEOUT_MESSAGE =
   "Authentication timed out. Try again. DVMKIT_API_KEY skips the browser.";
@@ -82,37 +85,49 @@ async function login(human?: boolean): Promise<void> {
   const fingerprint = sessionId.slice(0, CLI_AUTH_FINGERPRINT_LEN);
   const sessionCodeDisplay = `Session code: ${fingerprint}…  (must match the code shown in your browser)`;
 
+  const headless = isHeadless();
+  const expiresAt = new Date(Date.now() + CLI_AUTH_TTL_MS).toISOString();
+  const instruction = relayInstruction(authUrl, fingerprint);
+
   if (human) {
-    console.log("\nOpening browser to authenticate...");
+    console.log(headless ? `\n${NO_BROWSER_MESSAGE}` : "\nOpening browser to authenticate...");
     console.log(SIGN_IN_HINT);
     console.log(`\n  ${authUrl}\n`);
     console.log(`${sessionCodeDisplay}\n`);
   } else {
+    // Emitted whether or not a browser opens: an agent cannot see the
+    // browser, so it must always be told to hand the link to its human.
     progress({
-      status: "opening_browser",
+      status: "awaiting_human",
       url: authUrl,
       fingerprint,
-      display: `Opening browser to authenticate... ${sessionCodeDisplay}`,
+      expires_at: expiresAt,
+      browser_opened: !headless,
+      instruction,
+      display: `${headless ? NO_BROWSER_MESSAGE : "Opening browser to authenticate..."} ${sessionCodeDisplay}`,
       hint: SIGN_IN_HINT,
     });
   }
 
-  // Try to open browser
-  try {
-    const { exec } = await import("node:child_process");
-    const cmd =
-      process.platform === "darwin"
-        ? `open "${authUrl}"`
-        : process.platform === "win32"
-          ? `start "${authUrl}"`
-          : `xdg-open "${authUrl}"`;
-    exec(cmd);
-  } catch {
-    if (human) {
-      console.log("Could not open browser automatically. Please open the URL above.");
-    } else {
-      progress({ display: "Could not open browser automatically. Please open the URL above." });
-    }
+  if (headless) {
+    if (human) console.log(`${instruction}\n`);
+  } else {
+    await openBrowser(authUrl, () => {
+      if (human) {
+        console.log(`${NO_BROWSER_MESSAGE}\n${instruction}`);
+      } else {
+        progress({
+          status: "awaiting_human",
+          url: authUrl,
+          fingerprint,
+          expires_at: expiresAt,
+          browser_opened: false,
+          instruction,
+          display: NO_BROWSER_MESSAGE,
+        });
+      }
+    });
+    if (human) console.log(`${instruction}\n`);
   }
 
   if (human) console.log("Waiting for authentication...");
@@ -185,6 +200,38 @@ async function login(human?: boolean): Promise<void> {
     );
   }
   process.exit(1);
+}
+
+/** Linux with no display server cannot open a browser; `xdg-open` fails asynchronously there. */
+function isHeadless(): boolean {
+  return process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
+}
+
+function relayInstruction(url: string, fingerprint: string): string {
+  return (
+    `A human must finish sign-in. Send them this link and the session code ${fingerprint}: ${url} ` +
+    `They can open it on any device within ${CLI_AUTH_TTL_MS / 60_000} minutes, and it creates their account if they have none. ` +
+    "Keep this command running until it reports authenticated. " +
+    `If you cannot wait, ask them to create an API key in the dashboard and set DVMKIT_API_KEY (${CLI_AUTH_DOCS_URL}).`
+  );
+}
+
+/** Launch the platform browser opener; `onFail` runs if the opener cannot start or exits non-zero. */
+async function openBrowser(authUrl: string, onFail: () => void): Promise<void> {
+  try {
+    const { exec } = await import("node:child_process");
+    const cmd =
+      process.platform === "darwin"
+        ? `open "${authUrl}"`
+        : process.platform === "win32"
+          ? `start "${authUrl}"`
+          : `xdg-open "${authUrl}"`;
+    exec(cmd, (error) => {
+      if (error) onFail();
+    });
+  } catch {
+    onFail();
+  }
 }
 
 function sleep(ms: number): Promise<void> {

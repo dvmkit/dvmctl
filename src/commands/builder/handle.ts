@@ -1,5 +1,4 @@
-import { DvmError } from "@dvmkit/sdk/internal";
-
+import { authRequiredError } from "../../lib/auth-hint.ts";
 import { resolveAuth } from "../../lib/platform.ts";
 import * as platformClient from "../../lib/platform-client.ts";
 import { info, json } from "../../shared/output.ts";
@@ -8,11 +7,7 @@ import { info, json } from "../../shared/output.ts";
 export async function handle(h: string, opts: { human?: boolean }): Promise<void> {
   const creds = resolveAuth();
   if (!creds) {
-    throw new DvmError(
-      "auth_required",
-      "Not authenticated.",
-      "Set DVMKIT_API_KEY or run `dvmctl auth`."
-    );
+    throw authRequiredError();
   }
 
   const platformUrl = process.env.DVMKIT_PLATFORM_URL ?? "https://api.dvmkit.dev";

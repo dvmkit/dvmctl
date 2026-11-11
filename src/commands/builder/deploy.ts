@@ -6,6 +6,7 @@ import { createInterface } from "node:readline";
 
 import { deriveBuilderLockKeypair, DvmError, loadIdentitySecret } from "@dvmkit/sdk/internal";
 
+import { authRequiredError } from "../../lib/auth-hint.ts";
 import { getBuilderMnemonicMigrationHint, readBuilderMnemonic } from "../../lib/builder-mnemonic.ts";
 import { feedbackHumanHint } from "../../lib/builder-feedback-nudges.ts";
 import {
@@ -160,6 +161,10 @@ export async function deploy(opts: DeployOptions, cwd?: string): Promise<void> {
 
   const target = opts.target ?? (await pickTarget());
 
+  // The sign-in step needs a human, so surface it before the identity step an
+  // agent can resolve alone. Self-host never contacts the platform.
+  if (target === "cloud" && !resolveAuth()) throw authRequiredError();
+
   await ensureBuilderIdentity(opts, target);
 
   if (target === "cloud") {
@@ -207,11 +212,7 @@ async function ensureBuilderIdentity(opts: DeployOptions, target: string): Promi
 async function deployLocal(cwd: string, opts: DeployOptions): Promise<void> {
   const creds = resolveAuth();
   if (!creds) {
-    throw new DvmError(
-      "auth_required",
-      "Not authenticated.",
-      "Set DVMKIT_API_KEY (e.g. the seeded `dvmk_aaaa…` key) or run `dvmctl auth`."
-    );
+    throw authRequiredError();
   }
 
   // Local deploys target the local platform by default; DVMKIT_PLATFORM_URL
@@ -397,11 +398,7 @@ function readAttestedReceiptKey(info: Record<string, unknown>): boolean | undefi
 async function deployCloud(cwd: string, opts: DeployOptions): Promise<void> {
   const creds = resolveAuth();
   if (!creds) {
-    throw new DvmError(
-      "auth_required",
-      "Not authenticated.",
-      "Set DVMKIT_API_KEY or run `dvmctl auth`."
-    );
+    throw authRequiredError();
   }
 
   // Builder identity is required for every cloud + connect-tier deploy.

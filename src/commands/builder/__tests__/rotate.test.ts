@@ -72,6 +72,7 @@ vi.mock("../resolve-dvm", () => ({
 
 import { deriveBuilderLockKeypair, DvmError } from "@dvmkit/sdk/internal";
 
+import { AUTH_REQUIRED_HINT } from "../../../lib/auth-hint";
 import { AdminApiError, AdminCashuClient } from "../../../lib/admin-cashu-client";
 import * as builderMnemonic from "../../../lib/builder-mnemonic";
 import * as platform from "../../../lib/platform";
@@ -225,6 +226,22 @@ describe("dvmctl rotate", () => {
       current_rotation_index: 1,
       pending_platform_lock_sync: true,
     });
+  });
+
+  it("tells the agent how its human signs in when nothing is signed in and no endpoint is given", async () => {
+    vi.mocked(builderStore.getBuilderDvm).mockReturnValue({
+      handle: "my-dvm",
+      canonical_dvm_id: CANONICAL_DVM_ID,
+      current_rotation_index: 0,
+      updated_at: "2026-05-01T00:00:00.000Z",
+    });
+    vi.mocked(platform.resolveAuth).mockReturnValue(null);
+
+    await expect(rotate("my-dvm", {})).rejects.toMatchObject({
+      code: "auth_required",
+      hint: AUTH_REQUIRED_HINT,
+    });
+    expect(getRotateMock()).not.toHaveBeenCalled();
   });
 
   it("does not bump builder.json when the DVM admin call fails", async () => {

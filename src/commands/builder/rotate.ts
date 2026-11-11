@@ -1,5 +1,6 @@
 import { deriveBuilderLockKeypair, DvmError } from "@dvmkit/sdk/internal";
 
+import { authRequiredError } from "../../lib/auth-hint.ts";
 import { AdminApiError, AdminCashuClient } from "../../lib/admin-cashu-client.ts";
 import { readBuilderMnemonic } from "../../lib/builder-mnemonic.ts";
 import {
@@ -344,11 +345,7 @@ async function resolveRotationTarget(
     );
   }
   if (!resolveAuth()) {
-    throw new DvmError(
-      "auth_required",
-      "Not authenticated.",
-      "Set DVMKIT_API_KEY or run `dvmctl auth` so the CLI can resolve the DVM endpoint via the platform."
-    );
+    throw authRequiredError("Not authenticated; the CLI needs the platform to resolve the DVM endpoint.");
   }
   const { token, platformUrl } = selected ?? requireAuth();
   const { dvm } = await platformClient.getDvm(platformUrl, token, dvmId);

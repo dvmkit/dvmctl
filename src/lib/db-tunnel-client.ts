@@ -3,6 +3,8 @@ import type { Socket } from "node:net";
 import { DvmError } from "@dvmkit/sdk/internal";
 import WebSocket from "ws";
 
+import { AUTH_REQUIRED_HINT } from "./auth-hint.ts";
+
 /** Connection credentials the platform sends once the Postgres socket is live. */
 export interface DbTunnelReady {
   user: string;
@@ -216,7 +218,7 @@ export function mapHandshakeError(
     return new DvmError(
       code ?? "auth_required",
       message ?? "Not authenticated.",
-      "Set DVMKIT_API_KEY or run `dvmctl auth`.",
+      code === undefined || code === "auth_required" ? AUTH_REQUIRED_HINT : "Set DVMKIT_API_KEY or run `dvmctl auth`.",
       undefined,
       undefined,
       proseSources

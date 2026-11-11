@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-import { DvmError } from "@dvmkit/sdk/internal";
+import { authRequiredError } from "./auth-hint.ts";
 
 /** Stored auth credentials. */
 export interface AuthCredentials {
@@ -23,11 +23,7 @@ export function getPlatformUrl(): string {
 export function requireAuth(): { token: string; platformUrl: string } {
   const creds = resolveAuth();
   if (!creds) {
-    throw new DvmError(
-      "auth_required",
-      "Not authenticated.",
-      "Set DVMKIT_API_KEY or run `dvmctl auth`."
-    );
+    throw authRequiredError();
   }
   return {
     token: creds.token,

@@ -6,7 +6,7 @@ Use this for first deployment and later revisions. Reuse existing authorization;
 
 Inspect the project's SDK version, handler, build inputs, and deployment configuration. Read the [hosting explanation](https://dvmkit.com/docs/deploying.md) and the [deploy command contract](https://dvmkit.com/docs/cli-dvmctl.md#deploy) for the chosen target.
 
-For Cloud, run `dvmctl auth --status`, `dvmctl orgs`, and `dvmctl whoami`. Select the intended organization with `dvmctl switch` only when needed. If login is missing, follow [authentication](https://dvmkit.com/docs/cli-auth.md); the human completes browser consent. Never create or switch an account merely to get past an access refusal.
+For Cloud, run `dvmctl auth --status`, `dvmctl orgs`, and `dvmctl whoami`. Select the intended organization with `dvmctl switch` only when needed. If login is missing (`auth_required`), a human must sign in once, and the human may be on another machine. Either run `dvmctl auth` and relay the printed link and session code to them (they can open it on any device within 5 minutes, and signing in also creates the account if they have none), keeping the command running until it reports authenticated; or, if you cannot wait or run unattended, ask them to create an API key in the dashboard and set `DVMKIT_API_KEY`. See [authentication](https://dvmkit.com/docs/cli-auth.md). Never create or switch an account merely to get past an access refusal.
 
 For an update, record the existing deployment and inspect outstanding jobs and payment obligations. Preserve their database and keys across the update. Establish the effective resources and costs from the current plan; do not promise an unverified spending cap.
 
