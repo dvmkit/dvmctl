@@ -56,7 +56,8 @@ it("serves a builder attestation and chaining job receipt without Cashu recovery
   vi.mocked(sdkServe).mockImplementation(async (descriptor, opts) => {
     // Replace only persistence; the SDK consumes the CLI's attestation env and
     // issues the receipt through its real HTTP and terminal-job paths.
-    server = await actual.serve(descriptor, { ...opts, port: 0, jobStore: new MemoryJobStore() });
+    const { DATABASE_URL: _databaseUrl, ...env } = opts?.env ?? {};
+    server = await actual.serve(descriptor, { ...opts, database: undefined, env, port: 0, jobStore: new MemoryJobStore() });
     return server;
   });
   try {

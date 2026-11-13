@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { assertTempoDrainDecisions } from "./consumer-tempo-decisions.mjs";
 import { assertSignedAuth } from "./consumer-signed-auth.mjs";
+import { assertSettlementHistory } from "./consumer-settlement-history.mjs";
 import { isHealthyResponse } from "./consumer-health.mjs";
 import { scaffoldInstallCommand } from "./consumer-install.mjs";
 import { cleanupAll, INSTALL_COMMAND_TIMEOUT_MS, observeProcess, preservePrimaryFailure, processCommand, removeTemporaryDirectory, stopProcess, waitForProcessClose } from "./consumer-process.mjs";
@@ -15,8 +16,10 @@ const RELOAD_TIMEOUT_MS = 30_000;
 
 const [cliPath, ...flags] = process.argv.slice(2);
 if (!cliPath) fail("pass the installed package's dist/dvmctl.js path");
-if (flags.some((flag) => flag !== "--full")) fail("only --full is supported");
+if (flags.some((flag) => !["--full", "--database"].includes(flag))) fail("only --full and --database are supported");
 const full = flags.includes("--full");
+const database = full || flags.includes("--database");
+if (database && !process.env.DATABASE_URL) fail("database checks require DATABASE_URL for disposable PostgreSQL");
 const root = mkdtempSync(join(tmpdir(), "dvmctl-consumer-"));
 const config = join(root, "config");
 const servers = new Set();
@@ -33,6 +36,12 @@ await preservePrimaryFailure(async () => {
   // The matrix also tests the CLI's Node 22.0 minimum; scaffold tools require 22.12+.
   if (process.versions.node !== "22.0.0") await checkProject(project);
   await assertScaffold(cliPath, project);
+  if (database) {
+    // Compile again after making the starter free, so both entry points serve the same source.
+    await buildProject(project);
+    await assertSettlementHistory(cliPath, project, { ...environment(false), DATABASE_URL: process.env.DATABASE_URL });
+    await live(cliPath, project, "serve", true);
+  }
   await command(cliPath, ["validate"], { cwd: project });
   await assertProjectEnvironment(cliPath, project);
   await live(cliPath, project, "dev", false);
@@ -41,8 +50,6 @@ await preservePrimaryFailure(async () => {
   await expectMissingDatabase(cliPath, project);
   await assertMultiCapability(cliPath, project);
   if (full) {
-    if (!process.env.DATABASE_URL) fail("--full requires DATABASE_URL for disposable PostgreSQL");
-    await live(cliPath, project, "serve", true);
     const second = join(root, "second-project");
     await scaffold(cliPath, second);
     const excluded = ["node_modules", "dist", ".verify-logs", "sample.test.ts-snapshots"];
@@ -99,6 +106,11 @@ async function checkProject(project) {
     await processCommand("npm", ["run", "typecheck"], { cwd: project, env: environment(false) });
     await processCommand("npm", ["test"], { cwd: project, env: environment(false) });
   }
+  await buildProject(project);
+}
+/** @param {string} project */
+async function buildProject(project) {
+  await processCommand(process.execPath, [join(project, "node_modules/typescript/bin/tsc")], { cwd: project, env: environment(false) });
 }
 /** @param {string} cli @param {string} project */
 async function assertProjectEnvironment(cli, project) {
@@ -196,7 +208,7 @@ export default configureDVM({
     await live(cli, project, "dev", false, false, jobs);
     await live(cli, project, "dev", false, true, jobs);
     await expectMissingDatabase(cli, project);
-    if (full) await live(cli, project, "serve", true, false, jobs);
+    if (database) await live(cli, project, "serve", true, false, jobs);
   } finally { writeFileSync(handlerPath, original); }
 }
 /** @param {string} cli @param {string} project */
@@ -208,7 +220,7 @@ async function assertSdkMismatch(cli, project) {
   await install(project);
   await live(cli, project, "dev", false);
   await live(cli, project, "dev", false, true);
-  if (full) await live(cli, project, "serve", true);
+  if (database) await live(cli, project, "serve", true);
 }
 /** @param {string} cli @param {string} project */
 async function assertDevReload(cli, project) {
