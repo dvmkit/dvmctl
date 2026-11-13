@@ -45,7 +45,9 @@ class AdminDatabase extends EventEmitter {
   query = async (input: string | { text: string }, values: unknown[] = []) => {
     const sql = (typeof input === "string" ? input : input.text).replace(/\s+/g, " ").trim();
     let rows: Record<string, unknown>[] = [];
-    if (sql.startsWith("SELECT pubkey, retired_at_ms FROM dvm_lock_pubkeys")) {
+    if (sql.startsWith("SELECT to_regclass('x402_batch_channels') IS NOT NULL")) {
+      rows = [{ x402: false, x402Settlement: false, x402Batch: false, tempo: false, tempoClose: false, reports: false, obligations: false }];
+    } else if (sql.startsWith("SELECT pubkey, retired_at_ms FROM dvm_lock_pubkeys")) {
       rows = [{ pubkey: KEYPAIR.pubkey, retired_at_ms: null }];
     } else if (sql.startsWith("SELECT 1 FROM consumed_credentials")) {
       if (this.nonces.has(String(values[1]))) rows = [{}];
