@@ -19,7 +19,7 @@ Two URLs recur across the DVM payloads and they are not interchangeable. `dvmkit
 
 | Method | How |
 |---|---|
-| Interactive browser flow | `dvmctl auth` — opens browser, stores key in `~/.dvmctl/config.json` |
+| Interactive browser flow | `dvmctl auth` — prints a link and session code, opens the selected browser unless disabled, stores key in `~/.dvmctl/config.json` |
 | Environment variable | `DVMKIT_API_KEY=dvmk_...` — takes precedence over stored key, useful in CI |
 
 ## Environment variables
@@ -28,6 +28,7 @@ Two URLs recur across the DVM payloads and they are not interchangeable. `dvmkit
 |---|---|---|
 | `DVMKIT_API_KEY` | — | API key; overrides stored credentials |
 | `DVMKIT_PLATFORM_URL` | `https://api.dvmkit.dev` | Platform API base URL |
+| `BROWSER` | Platform opener | Browser command for `auth`; supports quoted arguments and `%s` for the URL, otherwise appends the URL; no shell expansion |
 | `DVMKIT_WEB_URL` | `https://dvmkit.com` | Web app base URL (used by `dvmctl auth`) |
 
 ## Error envelope
@@ -55,20 +56,28 @@ Same shape as the `dvm` CLI — every failure exits with code `1` and prints:
 
 ## auth
 
-Authenticate with the dvmkit platform. Opens a browser for the interactive consent flow and stores the returned API key at `~/.dvmctl/config.json` (mode `0600`).
+Authenticate with the dvmkit platform. Prints the URL and session code for the interactive consent flow, opens a browser unless disabled, and stores the returned API key at `~/.dvmctl/config.json` (mode `0600`).
 
 ```sh
 dvmctl auth
+dvmctl auth --no-browser
 dvmctl auth --status
 dvmctl auth --logout
 ```
+
+Set `BROWSER` to select an isolated browser or profile, for example `BROWSER='firefox --private-window %s' dvmctl auth`. Quoted arguments are supported, `%s` is replaced with the URL, and the URL is appended if no placeholder is present. Commands run without a shell or shell expansion. An explicit `BROWSER` is attempted even without a display; `--no-browser` always disables launch. Otherwise a Linux host without a display prints the link without launching anything.
+
+JSON mode emits one `awaiting_human` event on stderr before polling, containing `url`, `fingerprint` (the session code), `expires_at`, `browser_opened`, `instruction`, `display`, and `hint`. `browser_opened` reports a successful opener exit or an opener still running after about three seconds; it cannot confirm that a browser window is visible. Both JSON and `--human` modes always provide the link and code for the human to verify.
+
+Logout uses the stored key, independently of `DVMKIT_API_KEY`. Listing and revocation share a five-second deadline, including response-body reads; a timeout cancels the request and proceeds with local sign-out. It reports `revoked: true` only after the server confirms revocation. If revocation fails or a unique matching key cannot be found, local credentials are still removed and `revoked: false` includes a hint to revoke manually in the dashboard or with `dvmctl api-keys revoke <id>`.
 
 See [Logging in to dvmkit](/docs/cli-auth) for the full flow, security details, and headless CI usage.
 
 | Flag | Description |
 |---|---|
 | `--status` | Show current authentication state |
-| `--logout` | Remove stored credentials |
+| `--logout` | Best-effort revoke the stored API key, then remove local credentials |
+| `--no-browser` | Launch nothing; print the URL and session code and wait for sign-in |
 | `--human` | Prose output |
 
 **JSON output — `--status` (authenticated):**
@@ -80,7 +89,7 @@ See [Logging in to dvmkit](/docs/cli-auth) for the full flow, security details, 
 **JSON output — `--logout`:**
 
 ```json
-{ "status": "logged_out" }
+{ "status": "logged_out", "revoked": true }
 ```
 
 ---

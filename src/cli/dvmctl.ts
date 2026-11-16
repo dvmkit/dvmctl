@@ -602,7 +602,9 @@ export function buildProgram(): Command {
     .command("auth")
     .description("Authenticate with the dvmkit platform")
     .option("--status", "Show current auth status")
-    .option("--logout", "Remove stored credentials")
+    .option("--logout", "Revoke the stored API key and remove local credentials")
+    .option("--no-browser", "Print the sign-in link without launching a browser")
+    .addHelpText("after", "\nBROWSER selects the browser command (quoted arguments supported, no shell expansion).\nUse %s for the URL, or it is appended as the last argument.")
     .option("--human", "Human-readable output instead of JSON")
     .action((opts: AuthOptions) => {
       catchErrors(() => auth(opts), opts.human);
