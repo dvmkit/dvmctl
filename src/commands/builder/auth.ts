@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { hostname } from "node:os";
 
@@ -10,12 +11,14 @@ import {
   CLI_AUTH_POLL_JITTER_MS,
 } from "../../lib/cli-auth.ts";
 import { clearAuthToken, loadAuthToken, resolveAuth, saveAuthToken } from "../../lib/platform.ts";
+import { deleteApiKey, listApiKeys } from "../../lib/platform-client.ts";
 import { progress } from "../../shared/output.ts";
 
 export interface AuthOptions {
   human?: boolean;
   logout?: boolean;
   status?: boolean;
+  browser?: boolean;
 }
 
 const PLATFORM_URL = process.env.DVMKIT_PLATFORM_URL ?? "https://api.dvmkit.dev";
@@ -33,11 +36,11 @@ export async function auth(opts: AuthOptions): Promise<void> {
   }
 
   if (opts.logout) {
-    logout(opts.human);
+    await logout(opts.human);
     return;
   }
 
-  await login(opts.human);
+  await login(opts.human, opts.browser);
 }
 
 function showStatus(human?: boolean): void {
@@ -57,16 +60,34 @@ function showStatus(human?: boolean): void {
   }
 }
 
-function logout(human?: boolean): void {
-  clearAuthToken();
+async function logout(human?: boolean): Promise<void> {
+  const stored = loadAuthToken();
+  let revoked = false;
+  try {
+    if (stored) {
+      const { keys } = await listApiKeys(PLATFORM_URL, stored.token);
+      const matches = keys.filter((key) => key.key_prefix && stored.token.startsWith(key.key_prefix));
+      // A prefix is not a unique identity: never revoke an ambiguous match.
+      if (matches.length === 1) {
+        await deleteApiKey(PLATFORM_URL, stored.token, matches[0]!.id);
+        revoked = true;
+      }
+    }
+  } catch {
+    // Offline or already-revoked keys must not prevent local sign-out.
+  } finally {
+    clearAuthToken();
+  }
+  const hint = revoked ? undefined :
+    "Server revocation could not be confirmed. Revoke the key in the dashboard or use `dvmctl api-keys revoke <id>`.";
   if (human) {
-    console.log("Logged out.");
+    console.log(revoked ? "Logged out. API key revoked." : `Logged out locally. ${hint}`);
   } else {
-    console.log(JSON.stringify({ status: "logged_out" }));
+    console.log(JSON.stringify({ status: "logged_out", revoked, ...(hint ? { hint } : {}) }));
   }
 }
 
-async function login(human?: boolean): Promise<void> {
+async function login(human?: boolean, browser = true): Promise<void> {
   const existing = loadAuthToken();
   if (existing) {
     if (human) {
@@ -85,52 +106,35 @@ async function login(human?: boolean): Promise<void> {
   const fingerprint = sessionId.slice(0, CLI_AUTH_FINGERPRINT_LEN);
   const sessionCodeDisplay = `Session code: ${fingerprint}…  (must match the code shown in your browser)`;
 
-  const headless = isHeadless();
+  const skipBrowser = !browser || (!process.env.BROWSER?.trim() && isHeadless());
   const expiresAt = new Date(Date.now() + CLI_AUTH_TTL_MS).toISOString();
   const instruction = relayInstruction(authUrl, fingerprint);
 
   if (human) {
-    console.log(headless ? `\n${NO_BROWSER_MESSAGE}` : "\nOpening browser to authenticate...");
+    console.log(skipBrowser ? `\n${NO_BROWSER_MESSAGE}` : "\nOpening browser to authenticate...");
     console.log(SIGN_IN_HINT);
     console.log(`\n  ${authUrl}\n`);
     console.log(`${sessionCodeDisplay}\n`);
+  }
+
+  const browserOpened = !skipBrowser && await openBrowser(authUrl);
+  if (human) {
+    if (!skipBrowser && !browserOpened) console.log(NO_BROWSER_MESSAGE);
+    console.log(`${instruction}\n`);
+    console.log("Waiting for authentication...");
   } else {
-    // Emitted whether or not a browser opens: an agent cannot see the
-    // browser, so it must always be told to hand the link to its human.
+    // An agent cannot see the browser, so always provide the link to relay.
     progress({
       status: "awaiting_human",
       url: authUrl,
       fingerprint,
       expires_at: expiresAt,
-      browser_opened: !headless,
+      browser_opened: browserOpened,
       instruction,
-      display: `${headless ? NO_BROWSER_MESSAGE : "Opening browser to authenticate..."} ${sessionCodeDisplay}`,
+      display: `${browserOpened ? "Browser launched to authenticate." : NO_BROWSER_MESSAGE} ${sessionCodeDisplay}`,
       hint: SIGN_IN_HINT,
     });
   }
-
-  if (headless) {
-    if (human) console.log(`${instruction}\n`);
-  } else {
-    await openBrowser(authUrl, () => {
-      if (human) {
-        console.log(`${NO_BROWSER_MESSAGE}\n${instruction}`);
-      } else {
-        progress({
-          status: "awaiting_human",
-          url: authUrl,
-          fingerprint,
-          expires_at: expiresAt,
-          browser_opened: false,
-          instruction,
-          display: NO_BROWSER_MESSAGE,
-        });
-      }
-    });
-    if (human) console.log(`${instruction}\n`);
-  }
-
-  if (human) console.log("Waiting for authentication...");
 
   // Poll for token. The verifier is sent as a bearer token so anyone who
   // sees only the URL (which contains the hash, not the verifier) cannot
@@ -202,7 +206,7 @@ async function login(human?: boolean): Promise<void> {
   process.exit(1);
 }
 
-/** Linux with no display server cannot open a browser; `xdg-open` fails asynchronously there. */
+/** Skip the default graphical opener on Linux without a display server. */
 function isHeadless(): boolean {
   return process.platform === "linux" && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY;
 }
@@ -216,21 +220,74 @@ function relayInstruction(url: string, fingerprint: string): string {
   );
 }
 
-/** Launch the platform browser opener; `onFail` runs if the opener cannot start or exits non-zero. */
-async function openBrowser(authUrl: string, onFail: () => void): Promise<void> {
+// Tokenize before inserting the URL so its ampersands and spaces cannot become syntax.
+// Quotes and escaped whitespace are supported; shell expansion is deliberately absent.
+function browserArguments(value: string): string[] {
+  const args: string[] = [];
+  let token = "";
+  let quote = "";
+  let inToken = false;
+  for (let i = 0; i < value.length; i++) {
+    const char = value[i]!;
+    if (char === "\\" && quote !== "'" && /[\s\\"']/.test(value[i + 1] ?? "")) {
+      token += value[++i];
+      inToken = true;
+    } else if (quote) {
+      if (char === quote) quote = "";
+      else token += char;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      inToken = true;
+    } else if (/\s/.test(char)) {
+      if (inToken) args.push(token);
+      token = "";
+      inToken = false;
+    } else {
+      token += char;
+      inToken = true;
+    }
+  }
+  if (quote) throw new Error("Unclosed quote in BROWSER");
+  if (inToken) args.push(token);
+  return args;
+}
+
+async function openBrowser(authUrl: string): Promise<boolean> {
   try {
-    const { exec } = await import("node:child_process");
-    const cmd =
-      process.platform === "darwin"
-        ? `open "${authUrl}"`
-        : process.platform === "win32"
-          ? `start "${authUrl}"`
-          : `xdg-open "${authUrl}"`;
-    exec(cmd, (error) => {
-      if (error) onFail();
+    const configured = process.env.BROWSER?.trim();
+    const command = configured ? browserArguments(configured) :
+      process.platform === "darwin" ? ["open"] :
+        process.platform === "win32" ? ["rundll32.exe", "url.dll,FileProtocolHandler"] : ["xdg-open"];
+    const executable = command.shift();
+    if (!executable) return false;
+    const hasPlaceholder = command.some((arg) => arg.includes("%s"));
+    const args = command.map((arg) => arg.replaceAll("%s", () => authUrl));
+    if (!hasPlaceholder) args.push(authUrl);
+
+    return await new Promise<boolean>((resolve) => {
+      const child = spawn(executable, args, { stdio: "ignore", detached: true, shell: false });
+      let started = false;
+      let settled = false;
+      const onSpawn = () => { started = true; };
+      const onExit = (code: number | null) => finish(started && code === 0);
+      const finish = (opened: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        child.removeListener("spawn", onSpawn);
+        child.removeListener("exit", onExit);
+        child.unref();
+        resolve(opened);
+      };
+      // Browsers and some openers stay alive. Leave them running independently.
+      const timer = setTimeout(() => finish(started), 3000);
+      child.once("spawn", onSpawn);
+      child.once("exit", onExit);
+      // Keep the error handler after the deadline to absorb a late launch failure.
+      child.once("error", () => finish(false));
     });
   } catch {
-    onFail();
+    return false;
   }
 }
 

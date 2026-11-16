@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +8,7 @@ import test from "node:test";
 
 const account = "new-builder@example.test";
 
-async function fixture(context, mode, { display = ":0" } = {}) {
+async function fixture(context, mode, { display = ":0", browserCommand, browserFailure = false, revocation = "success" } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "dvmctl-auth-"));
   context.after(() => rmSync(directory, { recursive: true, force: true }));
   const browser = join(directory, "browser.json");
@@ -32,7 +32,16 @@ fs.writeSync = (fd, buffer, ...args) => {
   if (fd === 2) stderr += text;
   return written;
 };
-childProcess.exec = command => { writeFileSync(${JSON.stringify(browser)}, JSON.stringify({ command, stdout, stderr })); };
+childProcess.spawn = (command, args, options) => {
+  writeFileSync(${JSON.stringify(browser)}, JSON.stringify({ command, args, options, stdout, stderr }));
+  const child = new (require("node:events").EventEmitter)();
+  child.unref = () => {};
+  setImmediate(() => {
+    if (${browserFailure}) child.emit("error", new Error("missing browser"));
+    else { child.emit("spawn"); child.emit("exit", 0, null); }
+  });
+  return child;
+};
 syncBuiltinESMExports();
 const originalTimeout = global.setTimeout;
 global.setTimeout = (done, ms, ...args) => originalTimeout(done, ms >= 1000 && ms < 1500 ? 1 : ms, ...args);
@@ -40,8 +49,16 @@ global.setTimeout = (done, ms, ...args) => originalTimeout(done, ms >= 1000 && m
   let polls = 0;
   const requests = [];
   const server = createServer((req, res) => {
+    requests.push({ method: req.method, path: req.url, authorization: req.headers.authorization });
+    if (req.url.startsWith("/api/v1/builder/api-keys")) {
+      const failed = revocation === "list-fails" || (revocation === "delete-fails" && req.method === "DELETE");
+      const keys = revocation === "ambiguous" ? [{ id: "one", key_prefix: "local-test" }, { id: "two", key_prefix: "local-test" }] :
+        [{ id: "other", key_prefix: "unrelated" }, { id: "stored", key_prefix: "local-test" }];
+      res.writeHead(failed ? 503 : 200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(failed ? { error: { message: "offline" } } : { keys, count: keys.length, limit: 10 }));
+      return;
+    }
     polls += 1;
-    requests.push({ path: req.url, authorization: req.headers.authorization });
     res.writeHead(mode === "timeout" ? 404 : 200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(mode === "cancel" ? { cancelled: true } : { token: "local-test-token", account }));
   });
@@ -56,13 +73,18 @@ global.setTimeout = (done, ms, ...args) => originalTimeout(done, ms >= 1000 && m
     DVMKIT_WEB_URL: "https://example.test",
     // A browser launch is attempted only where a display exists.
     ...(display ? { DISPLAY: display } : {}),
+    ...(browserCommand ? { BROWSER: browserCommand } : {}),
   };
   const run = args => new Promise(resolve => {
     execFile(process.execPath, ["--require", preload, join(process.cwd(), "dist/dvmctl.js"), ...args],
       { env, encoding: "utf8", timeout: 20_000 },
       (error, stdout, stderr) => resolve({ code: error?.code ?? 0, stdout, stderr }));
   });
-  return { run, config, requests, polls: () => polls, browser: () => JSON.parse(readFileSync(browser, "utf8")), browserLaunched: () => existsSync(browser) };
+  const seedAuth = () => {
+    mkdirSync(config, { recursive: true });
+    writeFileSync(join(config, "config.json"), JSON.stringify({ auth: { token: "local-test-token", account }, context: { activeOrg: "test-org" } }));
+  };
+  return { run, config, requests, seedAuth, polls: () => polls, browser: () => JSON.parse(readFileSync(browser, "utf8")), browserLaunched: () => existsSync(browser) };
 }
 
 for (const mode of ["cancel", "timeout", "success"]) {
@@ -74,21 +96,22 @@ for (const mode of ["cancel", "timeout", "success"]) {
       assert.doesNotMatch(result.stdout + result.stderr, /closed beta|invit(?:e|ed)|waitlist/i);
       assert.equal(f.polls(), mode === "timeout" ? 300 : 1);
       const browser = f.browser();
-      assert.match(browser.command, /https:\/\/example\.test\/cli-auth\?session=[a-f0-9]{32}&hash=[a-f0-9]{64}&host=/);
+      assert.match(browser.args.at(-1), /https:\/\/example\.test\/cli-auth\?session=[a-f0-9]{32}&hash=[a-f0-9]{64}&host=/);
       for (const request of f.requests) {
         assert.match(request.path, /^\/api\/v1\/cli-auth\/[a-f0-9]{32}$/);
         assert.match(request.authorization, /^Bearer [a-f0-9]{64}$/);
       }
       if (human) {
         assert.match(browser.stdout, /^\nOpening browser to authenticate\.\.\.\n[^\n]+\n/);
-        const sessionCode = browser.command.match(/session=([a-f0-9]{32})/)[1].slice(0, 12);
+        const sessionCode = browser.args.at(-1).match(/session=([a-f0-9]{32})/)[1].slice(0, 12);
         assert.ok(browser.stdout.includes(`Session code: ${sessionCode}`));
         if (mode === "cancel") assert.match(result.stdout, /\nSign-in cancelled\.\n[^\n]*dvmctl auth[^\n]*\n$/);
         if (mode === "timeout") assert.match(result.stderr, /Authentication timed out.*Try again.*DVMKIT_API_KEY/s);
         if (mode === "success") assert.ok(result.stdout.endsWith(`\nAuthenticated as ${account}\n`));
       } else {
         assert.equal(browser.stdout, "");
-        const startup = JSON.parse(browser.stderr);
+        assert.equal(browser.stderr, "");
+        const startup = JSON.parse(result.stderr);
         assert.equal(startup.status, "awaiting_human");
         assert.equal(startup.browser_opened, true);
         assert.match(startup.expires_at, /^\d{4}-\d\d-\d\dT/);
@@ -98,7 +121,7 @@ for (const mode of ["cancel", "timeout", "success"]) {
         const url = new URL(startup.url);
         assert.equal(startup.fingerprint, url.searchParams.get("session").slice(0, 12));
         assert.ok(startup.display.includes(`Session code: ${startup.fingerprint}`));
-        assert.equal(result.stderr, browser.stderr);
+        assert.equal(result.stderr.trim().split("\n").length, 1);
         assert.equal(result.stdout.trim().split("\n").length, 1);
         const final = JSON.parse(result.stdout);
         if (mode === "cancel") {
@@ -157,3 +180,60 @@ test("compiled auth on a Linux host without a display asks for the link to be re
   assert.match(event.display, /could not open a browser/i);
   assert.doesNotMatch(result.stderr, /opening browser/i);
 });
+
+
+for (const human of [false, true]) {
+  test(`compiled auth --no-browser preserves the URL and code (human=${human})`, async context => {
+    const f = await fixture(context, "success", { browserCommand: "isolated-browser" });
+    const result = await f.run(["auth", "--no-browser", ...(human ? ["--human"] : [])]);
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(f.browserLaunched(), false);
+    if (human) {
+      const session = result.stdout.match(/session=([a-f0-9]{32})/)[1];
+      assert.ok(result.stdout.includes(`Session code: ${session.slice(0, 12)}`));
+    } else {
+      const event = JSON.parse(result.stderr);
+      assert.equal(event.browser_opened, false);
+      assert.equal(event.fingerprint, new URL(event.url).searchParams.get("session").slice(0, 12));
+      assert.ok(event.instruction.includes(event.url));
+      assert.ok(event.display.includes(`Session code: ${event.fingerprint}`));
+    }
+  });
+}
+
+for (const browserFailure of [false, true]) {
+  test(`compiled auth uses the selected browser and reports its outcome (failure=${browserFailure})`, async context => {
+    const f = await fixture(context, "success", { browserCommand: 'isolated-browser --profile "test profile" %s', browserFailure });
+    const result = await f.run(["auth"]);
+    assert.equal(result.code, 0, result.stderr);
+    const event = JSON.parse(result.stderr);
+    assert.equal(event.browser_opened, !browserFailure);
+    const browser = f.browser();
+    assert.equal(browser.command, "isolated-browser");
+    assert.deepEqual(browser.args, ["--profile", "test profile", event.url]);
+    assert.equal(browser.options.shell, false);
+    assert.ok(event.instruction.includes(event.url));
+    assert.ok(event.display.includes(`Session code: ${event.fingerprint}`));
+  });
+}
+
+for (const revocation of ["success", "list-fails", "delete-fails", "ambiguous"]) {
+  test(`compiled logout clears only auth state and reports server revocation (${revocation})`, async context => {
+    const f = await fixture(context, "success", { revocation });
+    f.seedAuth();
+    const result = await f.run(["auth", "--logout"]);
+    assert.equal(result.code, 0, result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.status, "logged_out");
+    assert.equal(output.revoked, revocation === "success");
+    if (revocation !== "success") assert.match(output.hint, /dashboard.*dvmctl api-keys revoke <id>/);
+    assert.deepEqual(f.requests.map(({ method, path }) => ({ method, path })), [
+      { method: "GET", path: "/api/v1/builder/api-keys" },
+      ...(["success", "delete-fails"].includes(revocation) ? [{ method: "DELETE", path: "/api/v1/builder/api-keys/stored" }] : []),
+    ]);
+    for (const request of f.requests) assert.equal(request.authorization, "Bearer local-test-token");
+    assert.deepEqual(JSON.parse(readFileSync(join(f.config, "config.json"), "utf8")), { context: { activeOrg: "test-org" } });
+    assert.equal(f.browserLaunched(), false);
+    assert.equal(f.polls(), 0);
+  });
+}
