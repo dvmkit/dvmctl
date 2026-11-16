@@ -186,9 +186,17 @@ The helper requires a clean live default-branch tip, an absent tag, and a separa
 
 ## Recover a disrupted release
 
-Never retag, unpublish, overwrite, or move a dist-tag to recover a release. The publisher accepts an existing version only when its tarball digest and channel dist-tag exactly match the reviewed artifact. Registry visibility is retried for a bounded interval. Recovery also requires cryptographically verified npm provenance bound to the exact archive, repository, release workflow, signed tag, and prepared commit. Missing attestations wait within the same bound; invalid signatures or source bindings fail.
+Never retag, unpublish, overwrite, or move a dist-tag to recover a release. The publisher accepts an existing version only when its tarball digest and channel dist-tag exactly match the reviewed artifact. Recovery also requires cryptographically verified npm provenance bound to the exact archive, repository, release workflow, signed tag, and prepared commit. Missing attestations wait within the same bound; invalid signatures or source bindings fail.
 
-Use manual dispatch with the existing tag only to verify that tag or to restore notes and labels after the exact registry artifact is visible. Manual dispatch never publishes.
+npm malware scanning can hold an accepted upload for more than 15 minutes after `npm publish` exits successfully. Registry visibility and the subsequent exact-version consumer install each receive a separate 30-minute retry budget, polling every 15 seconds. Requests and install attempts add to that elapsed time; these are retry budgets rather than strict wall-clock deadlines. The release jobs use GitHub's default 360-minute job timeout, which exceeds the retry budgets and leaves time for setup.
+
+If visibility times out, npm may still be processing the accepted upload. Keep the existing signed tag and reviewed archive, and wait for that exact npm version to become visible. Then manually dispatch the Release workflow with the existing tag and `github_release_recovery=true` to restore GitHub release notes and the release-PR labels:
+
+```sh
+gh workflow run release.yml --ref master -f tag=vX.Y.Z -f github_release_recovery=true
+```
+
+Use `vX.Y.Z-rc.N` for a release candidate. Recovery verifies and builds the tagged commit, then checks the exact registry bytes, dist-tag, and provenance before changing notes or labels. Omit `github_release_recovery` to verify and build the tag only. Manual dispatch never publishes; do not start another upload just because the visibility wait timed out.
 
 ## Migrations and rollback
 

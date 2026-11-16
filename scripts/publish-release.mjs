@@ -11,8 +11,9 @@ import { releaseChannel } from "./release-channel.mjs";
 
 const registry = "https://registry.npmjs.org";
 const name = "@dvmkit/dvmctl";
-export const PROPAGATION_TIMEOUT_MS = 180_000;
-export const PROPAGATION_RETRY_DELAY_MS = 5_000;
+// npm malware scanning can hold an accepted upload for more than 15 minutes.
+export const PROPAGATION_TIMEOUT_MS = 30 * 60 * 1_000;
+export const PROPAGATION_RETRY_DELAY_MS = 15_000;
 export const PROPAGATION_ATTEMPTS = Math.floor(PROPAGATION_TIMEOUT_MS / PROPAGATION_RETRY_DELAY_MS) + 1;
 const options = parseArguments(process.argv.slice(2));
 if (isMainModule() && options.archive) await publishRelease({ archive: options.archive, distTag: required(options, "dist-tag"), repository: required(options, "repository"), tag: required(options, "tag"), commit: required(options, "commit") });
