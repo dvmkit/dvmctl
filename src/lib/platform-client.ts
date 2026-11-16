@@ -2596,9 +2596,10 @@ export interface ApiKeyCreateResult {
   created_at: number;
 }
 
-export async function listApiKeys(platformUrl: string, token: string): Promise<ApiKeysListResult> {
+export async function listApiKeys(platformUrl: string, token: string, signal?: AbortSignal): Promise<ApiKeysListResult> {
   const res = await platformFetch(`${platformUrl}/api/v1/builder/api-keys`, {
     headers: { Authorization: `Bearer ${token}` },
+    signal,
   });
   if (!res.ok) {
     const body = (await res.json().catch(() => ({}))) as {
@@ -2679,12 +2680,13 @@ export async function getBuilderTrace(
   return (await res.json()) as TraceResult;
 }
 
-export async function deleteApiKey(platformUrl: string, token: string, id: string): Promise<void> {
+export async function deleteApiKey(platformUrl: string, token: string, id: string, signal?: AbortSignal): Promise<void> {
   const res = await platformFetch(
     `${platformUrl}/api/v1/builder/api-keys/${encodeURIComponent(id)}`,
     {
       method: "DELETE",
       headers: { Authorization: `Bearer ${token}` },
+      signal,
     }
   );
   if (!res.ok) {

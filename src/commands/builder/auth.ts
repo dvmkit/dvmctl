@@ -27,6 +27,7 @@ const NO_BROWSER_MESSAGE = "Could not open a browser on this machine. The link m
 const CANCELLED_HINT = "Run `dvmctl auth` to try again.";
 const TIMEOUT_MESSAGE =
   "Authentication timed out. Try again. DVMKIT_API_KEY skips the browser.";
+const LOGOUT_REVOCATION_TIMEOUT_MS = 5000;
 const WEB_URL = process.env.DVMKIT_WEB_URL ?? "https://dvmkit.com";
 
 export async function auth(opts: AuthOptions): Promise<void> {
@@ -63,19 +64,25 @@ function showStatus(human?: boolean): void {
 async function logout(human?: boolean): Promise<void> {
   const stored = loadAuthToken();
   let revoked = false;
+  // Share one deadline across both requests, including response-body reads.
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), LOGOUT_REVOCATION_TIMEOUT_MS);
   try {
     if (stored) {
-      const { keys } = await listApiKeys(PLATFORM_URL, stored.token);
+      const { keys } = await listApiKeys(PLATFORM_URL, stored.token, controller.signal);
+      controller.signal.throwIfAborted();
       const matches = keys.filter((key) => key.key_prefix && stored.token.startsWith(key.key_prefix));
       // A prefix is not a unique identity: never revoke an ambiguous match.
       if (matches.length === 1) {
-        await deleteApiKey(PLATFORM_URL, stored.token, matches[0]!.id);
+        await deleteApiKey(PLATFORM_URL, stored.token, matches[0]!.id, controller.signal);
+        controller.signal.throwIfAborted();
         revoked = true;
       }
     }
   } catch {
     // Offline or already-revoked keys must not prevent local sign-out.
   } finally {
+    clearTimeout(timeout);
     clearAuthToken();
   }
   const hint = revoked ? undefined :

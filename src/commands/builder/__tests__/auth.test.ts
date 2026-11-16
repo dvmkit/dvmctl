@@ -556,8 +556,8 @@ describe("dvmctl auth login", () => {
         expect(mockPlatform.clearAuthToken).not.toHaveBeenCalled();
       });
       await auth({ logout: true, human });
-      expect(listApiKeys).toHaveBeenCalledExactlyOnceWith(expect.any(String), stored.token);
-      expect(deleteApiKey).toHaveBeenCalledExactlyOnceWith(expect.any(String), stored.token, "matching");
+      expect(listApiKeys).toHaveBeenCalledExactlyOnceWith(expect.any(String), stored.token, expect.any(AbortSignal));
+      expect(deleteApiKey).toHaveBeenCalledExactlyOnceWith(expect.any(String), stored.token, "matching", expect.any(AbortSignal));
       expect(mockPlatform.clearAuthToken).toHaveBeenCalledOnce();
       if (human) expect(console.log).toHaveBeenCalledWith(expect.stringContaining("API key revoked"));
       else expect(JSON.parse(vi.mocked(console.log).mock.lastCall![0])).toEqual({ status: "logged_out", revoked: true });
