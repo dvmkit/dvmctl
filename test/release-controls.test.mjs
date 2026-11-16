@@ -326,8 +326,50 @@ test("visible release with a pending tarball is recovered without a second publi
   } finally { fixture.remove(); }
 });
 
-test("registry propagation keeps non-404 failures fatal and bounds default waits to three minutes", async () => {
-  assert.equal(PROPAGATION_TIMEOUT_MS, 180_000); assert.equal(PROPAGATION_ATTEMPTS, 37);
+test("publisher tolerates twenty minutes of scan delay with its default retry budget", async () => {
+  const fixture = makeArchive("1.2.3");
+  try {
+    let elapsed = 0; let published = 0;
+    const fetchFn = async (url) => {
+      if (String(url).includes(".tgz")) return response(readFileSync(fixture.archive));
+      return jsonResponse({ versions: elapsed < 1_200_000 ? {} : { "1.2.3": { name: "@dvmkit/dvmctl", version: "1.2.3", dist: { tarball: "https://registry.npmjs.org/dvmctl.tgz" } } }, "dist-tags": { latest: "1.2.3" } });
+    };
+    assert.equal(await publishRelease({ archive: fixture.archive, distTag: "latest", fetchFn, publishFn: () => { published += 1; return 0; }, waitFn: async (ms) => { elapsed += ms; } }), "published");
+    assert.equal(elapsed, 1_200_000);
+    assert.equal(published, 1);
+  } finally { fixture.remove(); }
+});
+
+test("release job timeouts accommodate the registry retry budgets", () => {
+  const workflow = readFileSync(join(root, ".github/workflows/release.yml"), "utf8");
+  for (const job of ["publish", "registry-smoke", "github-release"]) {
+    const block = workflow.split(`\n  ${job}:\n`)[1]?.split(/\n {2}[\w-]+:\n/u)[0];
+    assert.ok(block, `missing ${job} job`);
+    const assertTimeout = (source) => {
+      const configured = source.match(/^ {4}timeout-minutes: (.*)$/mu)?.[1];
+      const minutes = configured === undefined ? 360 : Number(configured);
+      assert.ok(minutes >= 30, `${job} needs at least thirty minutes for registry retries`);
+    };
+    assertTimeout(block);
+    const withoutTimeout = block.replace(/^ {4}timeout-minutes: .*\n/mu, "");
+    assertTimeout(withoutTimeout);
+    assert.throws(() => assertTimeout(`    timeout-minutes: 3\n${withoutTimeout}`), /thirty minutes/);
+  }
+});
+
+test("publisher stops after thirty minutes of default retry delays without republishing", async () => {
+  const fixture = makeArchive("1.2.3");
+  try {
+    let elapsed = 0; let published = 0; let reads = 0;
+    await assert.rejects(publishRelease({ archive: fixture.archive, distTag: "latest", fetchFn: async () => { reads += 1; return new Response("missing", { status: 404 }); }, publishFn: () => { published += 1; return 0; }, waitFn: async (ms) => { elapsed += ms; } }), /npm publish exited 0, and the exact release did not appear in the registry within 1800000ms/);
+    assert.equal(elapsed, 1_800_000);
+    assert.equal(reads, 122); // One pre-publish inspection plus 121 visibility polls.
+    assert.equal(published, 1);
+  } finally { fixture.remove(); }
+});
+
+test("registry propagation keeps non-404 failures fatal and allows thirty minutes of retry delays", async () => {
+  assert.equal(PROPAGATION_TIMEOUT_MS, 1_800_000); assert.equal(PROPAGATION_RETRY_DELAY_MS, 15_000); assert.equal(PROPAGATION_ATTEMPTS, 121);
   const fixture = makeArchive("1.2.3-rc.4");
   try {
     const fetchFn = async (url) => String(url).includes(".tgz") ? new Response("unavailable", { status: 503 }) : releaseMetadata("1.2.3-rc.4");
@@ -356,6 +398,26 @@ test("verify CLI cannot invoke npm publish while registry metadata is missing", 
     const result = spawnSync(process.execPath, ["--import", preload, join(root, "scripts/verify-published-release.mjs"), "--archive", fixture.archive, "--dist-tag", "next", "--repository", "dvmkit/dvmctl", "--tag", "v1.2.3-rc.4", "--commit", commit], { encoding: "utf8", env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` } });
     assert.notEqual(result.status, 0); assert.match(result.stderr, /exact release did not appear/); assert.equal(existsSync(published), false);
   } finally { fixture.remove(); rmSync(directory, { recursive: true, force: true }); }
+});
+
+test("registry install has a separate default budget for delayed exact-version availability", async () => {
+  for (const available of [true, false]) {
+    let elapsed = 0; let calls = 0;
+    const operation = installPublishedRelease({ version: "1.2.3", sdkVersion: selectedSdkVersion, prefix: root, waitFn: async (ms) => { elapsed += ms; }, runNpm: (args) => {
+      assert.ok(args.includes("@dvmkit/dvmctl@1.2.3"));
+      calls += 1;
+      return available && elapsed >= 1_200_000 ? { status: 0 } : { status: 1, stderr: "npm error code ETARGET\nnpm error notarget No matching version found for @dvmkit/dvmctl@1.2.3." };
+    } });
+    if (available) {
+      await operation;
+      assert.equal(elapsed, 1_200_000);
+      assert.equal(calls, 81);
+    } else {
+      await assert.rejects(operation, /exact @dvmkit\/dvmctl@1\.2\.3 did not propagate within 1800000ms/);
+      assert.equal(elapsed, 1_800_000);
+      assert.equal(calls, 121);
+    }
+  }
 });
 
 test("registry install retries only an exact dvmctl propagation error", async () => {
