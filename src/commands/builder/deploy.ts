@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -844,26 +844,47 @@ function deployDryRun(cwd: string, opts: DeployOptions): void {
   if (contextRoot && dockerfilePath) {
     const buildDockerfilePath = dockerfilePath;
     const buildRoot = contextRoot;
+    let outputTail = "";
     try {
       withDeployBuildContext(buildRoot, (buildContext) => {
-        execFileSync(
-          "docker",
-          ["build", "-q", "-f", resolve(buildContext, buildDockerfilePath), buildContext],
-          {
-            // The scaffold Dockerfile carries a `# syntax` directive, which only
-            // parses under BuildKit. Force it on for engines still defaulting to
-            // the legacy builder.
-            env: { ...process.env, DOCKER_BUILDKIT: "1" },
-            stdio: opts.human ? "inherit" : ["ignore", "ignore", "ignore"],
-          }
-        );
+        // A shared file preserves both streams without execFileSync's pipe
+        // buffer limit. It lives outside the build context and is removed with it.
+        const logFd = opts.human ? undefined : openSync(join(buildContext, "..", "docker-build.log"), "w+", 0o600);
+        try {
+          execFileSync(
+            "docker",
+            ["build", "-q", "-f", resolve(buildContext, buildDockerfilePath), buildContext],
+            {
+              // The scaffold Dockerfile carries a `# syntax` directive, which only
+              // parses under BuildKit. Force it on for engines still defaulting to
+              // the legacy builder.
+              env: { ...process.env, DOCKER_BUILDKIT: "1" },
+              stdio: logFd === undefined ? "inherit" : ["ignore", logFd, logFd],
+            }
+          );
+        } catch (err) {
+          if (logFd !== undefined) outputTail = dockerBuildLogTail(logFd);
+          throw err;
+        } finally {
+          if (logFd !== undefined) closeSync(logFd);
+        }
       });
       dockerBuilt = true;
     } catch (err) {
+      const spawnError = err as NodeJS.ErrnoException;
+      const unavailable = spawnError?.path === "docker" && typeof spawnError.code === "string";
+      const daemonUnavailable = /cannot connect to (?:the )?docker daemon|is the docker daemon running|error during connect|failed to connect to (?:the )?docker (?:daemon|api)/i.test(outputTail);
+      const message = unavailable
+        ? "Docker is not available for the local dry-run check."
+        : daemonUnavailable
+          ? "The Docker daemon is not available for the local dry-run check."
+          : opts.human
+            ? `docker build failed: ${err instanceof Error ? err.message : String(err)}`
+            : "The Dockerfile failed to build locally.";
       throw new DvmError(
         "docker_build_failed",
-        `docker build failed: ${err instanceof Error ? err.message : String(err)}`,
-        "Ensure Docker is running and the Dockerfile builds locally."
+        outputTail ? `${message}\n${outputTail}` : message,
+        "A hosted `dvmctl deploy` builds on the platform and does not require local Docker. The Docker step in --dry-run is an optional local check; install/start Docker or fix the Dockerfile to use it."
       );
     }
   }
@@ -892,6 +913,19 @@ function deployDryRun(cwd: string, opts: DeployOptions): void {
       inherit_secrets: inheritSecrets.length > 0 ? inheritSecrets : undefined,
     });
   }
+}
+
+function dockerBuildLogTail(fd: number): string {
+  const size = fstatSync(fd).size;
+  const tail = Buffer.alloc(Math.min(size, 4096));
+  readSync(fd, tail, 0, tail.length, size - tail.length);
+  // Truncate only at a character boundary so a partial multibyte character
+  // cannot expand into replacement characters beyond the byte budget.
+  let start = 0;
+  while (start < tail.length && (tail[start]! & 0xc0) === 0x80) start++;
+  const lines = tail.toString("utf8", start).split("\n");
+  const count = lines.at(-1) === "" ? lines.length - 1 : lines.length;
+  return lines.slice(Math.max(0, count - 40)).join("\n");
 }
 
 // ── Self-host deploy ───────────────────────────────────────────────────
