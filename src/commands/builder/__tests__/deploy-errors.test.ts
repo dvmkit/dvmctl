@@ -43,10 +43,13 @@ describe("deploy CLI diagnostics", () => {
     writeFileSync(join(directory, "Dockerfile"), "FROM scratch\n");
     const bin = join(directory, "bin");
     mkdirSync(bin);
-    // Keep archive creation real while excluding any installed Docker binary.
-    const tar = process.env.PATH?.split(delimiter).map((path) => join(path, "tar")).find(existsSync);
-    if (!tar) throw new Error("Tests require tar on PATH");
-    symlinkSync(tar, join(bin, "tar"));
+    // GNU tar invokes gzip for compressed archives. Preserve both tools while
+    // excluding any installed Docker binary.
+    for (const tool of ["tar", "gzip"]) {
+      const executable = process.env.PATH?.split(delimiter).map((path) => join(path, tool)).find(existsSync);
+      if (!executable) throw new Error(`Tests require ${tool} on PATH`);
+      symlinkSync(executable, join(bin, tool));
+    }
     executablePath = bin;
     if (script !== undefined) {
       writeFileSync(join(bin, "docker"), `#!${process.execPath}\n${script}\n`, { mode: 0o755 });
