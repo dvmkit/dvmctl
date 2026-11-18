@@ -1,7 +1,9 @@
 import { PassThrough } from "node:stream";
+
+import { DvmError } from "@dvmkit/sdk/internal";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { readDeployEnvironmentStdin } from "../deploy-environment-stdin.ts";
+import { readDeployEnvironmentStdin, redactDeployEnvironmentError } from "../deploy-environment-stdin.ts";
 
 function input() {
   const stream = new PassThrough();
@@ -12,6 +14,72 @@ function input() {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
+});
+
+describe("deploy environment error redaction", () => {
+  it("redacts the supplied network while preserving a longer network in the hint", () => {
+    const error = new DvmError(
+      "invalid_deployment",
+      "Unsupported network eip155:8453.",
+      "Set DVMKIT_X402_NETWORK=eip155:84532."
+    );
+
+    expect(redactDeployEnvironmentError(error, { DVMKIT_X402_NETWORK: "eip155:8453" })).toMatchObject({
+      message: "Unsupported network [redacted].",
+      hint: "Set DVMKIT_X402_NETWORK=eip155:84532.",
+    });
+  });
+
+  it("matches literal eight-character values only at token boundaries", () => {
+    const error = new DvmError("invalid_deployment", "Values: (a.b$[c]d), éa.b$[c]d, a.b$[c]d9, axb$[c]d.");
+
+    expect(redactDeployEnvironmentError(error, { DVMKIT_MODE: "a.b$[c]d" })).toMatchObject({
+      message: "Values: ([redacted]), éa.b$[c]d, a.b$[c]d9, axb$[c]d.",
+    });
+  });
+
+  it("preserves a short boolean value under an ordinary key", () => {
+    const error = new DvmError("invalid_deployment", "Enable DVMKIT_FAIL_FAST=true before retrying.");
+
+    expect(redactDeployEnvironmentError(error, { DVMKIT_FAIL_FAST: "true", EMPTY_SECRET: "" })).toMatchObject({
+      message: "Enable DVMKIT_FAIL_FAST=true before retrying.",
+    });
+  });
+
+  it("redacts a short value from a secret key even when an ordinary key has the same value", () => {
+    const error = new DvmError("invalid_deployment", "Provider rejected the value 'abc123'.");
+
+    expect(redactDeployEnvironmentError(error, { DVMKIT_MODE: "abc123", provider_password: "abc123" })).toMatchObject({
+      message: "Provider rejected the value '[redacted]'.",
+    });
+  });
+
+  it("redacts overlapping values without reprocessing the replacement", () => {
+    const error = new DvmError("invalid_deployment", "Provider rejected (left.middle-right).");
+
+    expect(redactDeployEnvironmentError(error, {
+      FIRST_TOKEN: "left.middle",
+      SECOND_TOKEN: "middle-right",
+      THIRD_TOKEN: "redacted",
+    })).toMatchObject({ message: "Provider rejected ([redacted])." });
+  });
+
+  it("redacts the full span of overlapping occurrences of one value", () => {
+    const error = new DvmError("invalid_deployment", "Provider rejected (abc-def-abc-def-abc).");
+
+    expect(redactDeployEnvironmentError(error, { TOKEN: "abc-def-abc" })).toMatchObject({
+      message: "Provider rejected ([redacted]).",
+    });
+  });
+
+  it("redacts a literal value that fills the stdin allowance", () => {
+    const secret = "+".repeat(65_524);
+    const error = new DvmError("invalid_deployment", `Provider rejected (${secret}).`);
+
+    expect(redactDeployEnvironmentError(error, { TOKEN: secret })).toMatchObject({
+      message: "Provider rejected ([redacted]).",
+    });
+  });
 });
 
 describe("deploy environment input", () => {
