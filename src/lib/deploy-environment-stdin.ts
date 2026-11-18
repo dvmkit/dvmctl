@@ -68,17 +68,13 @@ export function redactDeployEnvironmentError(error: unknown, environment: Readon
   const text = (value: string) => {
     const matches: Array<{ start: number; end: number }> = [];
     for (const secret of secrets) {
-      let start = value.indexOf(secret);
-      while (start !== -1) {
+      for (let start = value.indexOf(secret); start !== -1; start = value.indexOf(secret, start + 1)) {
         const end = start + secret.length;
         // A neighboring Unicode character can occupy two code units.
         const before = value.slice(Math.max(0, start - 2), start);
         const after = value.slice(end, end + 2);
         if (!/[\p{L}\p{Nd}]$/u.test(before) && !/^[\p{L}\p{Nd}]/u.test(after)) {
           matches.push({ start, end });
-          start = value.indexOf(secret, end);
-        } else {
-          start = value.indexOf(secret, start + 1);
         }
       }
     }

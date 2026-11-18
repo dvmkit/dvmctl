@@ -64,6 +64,14 @@ describe("deploy environment error redaction", () => {
     })).toMatchObject({ message: "Provider rejected ([redacted])." });
   });
 
+  it("redacts the full span of overlapping occurrences of one value", () => {
+    const error = new DvmError("invalid_deployment", "Provider rejected (abc-def-abc-def-abc).");
+
+    expect(redactDeployEnvironmentError(error, { TOKEN: "abc-def-abc" })).toMatchObject({
+      message: "Provider rejected ([redacted]).",
+    });
+  });
+
   it("redacts a literal value that fills the stdin allowance", () => {
     const secret = "+".repeat(65_524);
     const error = new DvmError("invalid_deployment", `Provider rejected (${secret}).`);
