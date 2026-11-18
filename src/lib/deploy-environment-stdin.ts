@@ -2,6 +2,7 @@ import { DvmError } from "@dvmkit/sdk/internal";
 
 const MAX_INPUT_BYTES = 64 * 1024;
 const INPUT_DEADLINE_MS = 5_000;
+const SECRET_KEY = /KEY|SECRET|TOKEN|PASSWORD|PRIVATE|MNEMONIC|SEED|AUTH/i;
 
 /** Bound the secret-bearing input without reflecting its contents in errors. */
 export async function readDeployEnvironmentStdin(): Promise<Record<string, string>> {
@@ -60,12 +61,37 @@ export async function readDeployEnvironmentStdin(): Promise<Record<string, strin
 
 /** Retain deployment diagnostics while removing known stdin values reflected by a provider. */
 export function redactDeployEnvironmentError(error: unknown, environment: Readonly<Record<string, string>>): unknown {
-  const secrets = [...new Set(Object.values(environment).filter((value) => value !== ""))]
-    .sort((a, b) => b.length - a.length);
-  if (secrets.length === 0) return error;
+  const secrets = new Set(Object.entries(environment)
+    .filter(([key, value]) => value !== "" && (SECRET_KEY.test(key) || [...value].length >= 8))
+    .map(([, value]) => value));
+  if (secrets.size === 0) return error;
   const text = (value: string) => {
-    for (const secret of secrets) value = value.split(secret).join("[redacted]");
-    return value;
+    const matches: Array<{ start: number; end: number }> = [];
+    for (const secret of secrets) {
+      let start = value.indexOf(secret);
+      while (start !== -1) {
+        const end = start + secret.length;
+        // A neighboring Unicode character can occupy two code units.
+        const before = value.slice(Math.max(0, start - 2), start);
+        const after = value.slice(end, end + 2);
+        if (!/[\p{L}\p{Nd}]$/u.test(before) && !/^[\p{L}\p{Nd}]/u.test(after)) {
+          matches.push({ start, end });
+          start = value.indexOf(secret, end);
+        } else {
+          start = value.indexOf(secret, start + 1);
+        }
+      }
+    }
+
+    // Merge overlapping matches in the original text so replacements cannot
+    // change token boundaries or hide part of another match.
+    let result = "";
+    let cursor = 0;
+    for (const { start, end } of matches.sort((a, b) => a.start - b.start)) {
+      if (start >= cursor) result += value.slice(cursor, start) + "[redacted]";
+      cursor = Math.max(cursor, end);
+    }
+    return result + value.slice(cursor);
   };
   const fields = (value: unknown): unknown => {
     if (typeof value === "string") return text(value);
