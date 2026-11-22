@@ -10,6 +10,7 @@ import {
   rmSync,
   statSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -21,6 +22,11 @@ vi.mock("../../../lib/platform", () => ({
   resolveAuth: vi.fn(() => null),
   resolveOrgScope: vi.fn((opts: { org?: string }) => opts.org),
 }));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const fs = await importOriginal<typeof import("node:fs")>();
+  return { ...fs, writeSync: vi.fn(fs.writeSync) };
+});
 
 vi.mock("../../../shared/output", () => ({
   info: vi.fn(),
@@ -175,24 +181,40 @@ describe("dvmctl deploy --target self-host", () => {
     });
   });
 
-  it("emits DVMKIT_BUILDER_* env vars on the self-host JSON line", async () => {
-    const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
+  it("writes one traced self-host result with the complete attestation environment", async () => {
+    const output = await vi.importActual<typeof import("../../../shared/output")>("../../../shared/output");
+    const traceId = "4".repeat(32);
+    let stdout = "";
+    const logSpy = vi.spyOn(console, "log").mockImplementation((line: string) => {
+      stdout += line + "\n";
+    });
+    vi.mocked(writeSync).mockImplementationOnce((fd, chunk) => {
+      expect(fd).toBe(1);
+      const bytes = Buffer.from(chunk);
+      stdout += bytes.toString("utf8");
+      return bytes.length;
+    });
+    output.setOutputTraceId(traceId);
+    vi.mocked(json).mockImplementationOnce(output.json);
     try {
       await deploy({ target: "self-host" });
-      const lines = logSpy.mock.calls.map((c) => String(c[0]));
-      const json = lines.find((l) => l.startsWith("{"));
-      expect(json).toBeDefined();
-      const parsed = JSON.parse(json ?? "{}") as {
-        attestation_env?: Record<string, string>;
-      };
-      expect(parsed.attestation_env).toMatchObject({
-        DVMKIT_BUILDER_PUBKEY: expect.any(String) as unknown as string,
-        DVMKIT_BUILDER_ATTESTATION: expect.any(String) as unknown as string,
-        DVMKIT_BUILDER_SIGNATURE: expect.any(String) as unknown as string,
-        DVMKIT_DVM_ID: "dvm-selfhost-test",
-        DVMKIT_CANONICAL_DVM_ID: "dvm-selfhost-test",
+      expect(stdout).toMatch(/^[^\n]+\n$/);
+      expect(JSON.parse(stdout)).toEqual({
+        trace_id: traceId,
+        status: "ready",
+        file: "Dockerfile",
+        target: "self-host",
+        attestation_env: {
+          DVMKIT_BUILDER_PUBKEY: expect.stringMatching(/^[0-9a-f]{64}$/),
+          DVMKIT_BUILDER_ATTESTATION: expect.any(String),
+          DVMKIT_BUILDER_SIGNATURE: expect.stringMatching(/^[0-9a-f]{128}$/),
+          DVMKIT_DVM_ID: "dvm-selfhost-test",
+          DVMKIT_CANONICAL_DVM_ID: "dvm-selfhost-test",
+          DVMKIT_RECEIPT_KEY: expect.stringMatching(/^[0-9a-f]{64}$/),
+        },
       });
     } finally {
+      output.setOutputTraceId(null);
       logSpy.mockRestore();
     }
   });
@@ -1268,7 +1290,10 @@ describe("dvmctl deploy cloud dirty-tree guard", { timeout: SPAWN_HEAVY_TIMEOUT 
     writeFileSync(join(dir, "handler.ts"), "export default { changed: true };", "utf-8");
     const logSpy = vi.spyOn(console, "log").mockImplementation(() => undefined);
     try {
-      await expect(deploy({ target: "self-host" })).resolves.toBeUndefined();
+      await expect(deploy({ target: "self-host", human: true })).resolves.toBeUndefined();
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("Dockerfile ready."));
+      expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("docker build -t my-dvm ."));
+      expect(json).not.toHaveBeenCalled();
     } finally {
       logSpy.mockRestore();
     }

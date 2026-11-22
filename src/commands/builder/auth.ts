@@ -12,7 +12,7 @@ import {
 } from "../../lib/cli-auth.ts";
 import { clearAuthToken, loadAuthToken, resolveAuth, saveAuthToken } from "../../lib/platform.ts";
 import { deleteApiKey, listApiKeys } from "../../lib/platform-client.ts";
-import { progress } from "../../shared/output.ts";
+import { json, progress } from "../../shared/output.ts";
 
 export interface AuthOptions {
   human?: boolean;
@@ -50,14 +50,14 @@ function showStatus(human?: boolean): void {
     if (human) {
       console.log("Not authenticated. Run `dvmctl auth` to log in.");
     } else {
-      console.log(JSON.stringify({ authenticated: false }));
+      json({ authenticated: false }, { feedback: false });
     }
     return;
   }
   if (human) {
     console.log(`Authenticated as ${creds.account}`);
   } else {
-    console.log(JSON.stringify({ authenticated: true, account: creds.account }));
+    json({ authenticated: true, account: creds.account }, { feedback: false });
   }
 }
 
@@ -90,7 +90,7 @@ async function logout(human?: boolean): Promise<void> {
   if (human) {
     console.log(revoked ? "Logged out. API key revoked." : `Logged out locally. ${hint}`);
   } else {
-    console.log(JSON.stringify({ status: "logged_out", revoked, ...(hint ? { hint } : {}) }));
+    json({ status: "logged_out", revoked, ...(hint ? { hint } : {}) }, { feedback: false });
   }
 }
 
@@ -100,7 +100,7 @@ async function login(human?: boolean, browser = true): Promise<void> {
     if (human) {
       console.log(`Already authenticated as ${existing.account}. Use --logout to sign out first.`);
     } else {
-      console.log(JSON.stringify({ authenticated: true, account: existing.account }));
+      json({ authenticated: true, account: existing.account }, { feedback: false });
     }
     return;
   }
@@ -175,14 +175,12 @@ async function login(human?: boolean, browser = true): Promise<void> {
         console.log("\nSign-in cancelled.");
         console.log(CANCELLED_HINT);
       } else {
-        console.log(
-          JSON.stringify({
-            authenticated: false,
-            cancelled: true,
-            display: "Sign-in cancelled.",
-            hint: CANCELLED_HINT,
-          })
-        );
+        json({
+          authenticated: false,
+          cancelled: true,
+          display: "Sign-in cancelled.",
+          hint: CANCELLED_HINT,
+        }, { feedback: false });
       }
       process.exit(1);
     }
@@ -192,7 +190,7 @@ async function login(human?: boolean, browser = true): Promise<void> {
       if (human) {
         console.log(`\nAuthenticated as ${data.account}`);
       } else {
-        console.log(JSON.stringify({ authenticated: true, account: data.account }));
+        json({ authenticated: true, account: data.account }, { feedback: false });
       }
       return;
     }
@@ -201,14 +199,12 @@ async function login(human?: boolean, browser = true): Promise<void> {
   if (human) {
     console.error(`\n${TIMEOUT_MESSAGE}`);
   } else {
-    console.log(
-      JSON.stringify({
-        authenticated: false,
-        timed_out: true,
-        display: TIMEOUT_MESSAGE,
-        hint: TIMEOUT_MESSAGE,
-      })
-    );
+    json({
+      authenticated: false,
+      timed_out: true,
+      display: TIMEOUT_MESSAGE,
+      hint: TIMEOUT_MESSAGE,
+    }, { feedback: false });
   }
   process.exit(1);
 }
