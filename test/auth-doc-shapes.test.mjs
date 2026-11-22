@@ -85,6 +85,7 @@ global.setTimeout = (done, ms, ...args) => originalTimeout(done, ms >= 1000 && m
     PATH: process.env.PATH,
     HOME: directory,
     DVMCTL_CONFIG_DIR: config,
+    DVMKIT_CONFIG_DIR: config,
     DVMKIT_PLATFORM_URL: `http://127.0.0.1:${server.address().port}`,
     DVMKIT_WEB_URL: "https://example.test",
     // A browser launch is attempted only where a display exists.
