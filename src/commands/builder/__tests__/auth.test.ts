@@ -14,7 +14,7 @@ vi.mock("../../../lib/platform", () => ({
 
 vi.mock("../../../lib/platform-client", () => ({ listApiKeys: vi.fn(), deleteApiKey: vi.fn() }));
 
-vi.mock("../../../shared/output", () => ({ progress: vi.fn() }));
+vi.mock("../../../shared/output", () => ({ json: vi.fn(), progress: vi.fn() }));
 
 vi.mock("node:child_process", () => ({
   spawn: vi.fn(),
@@ -32,7 +32,7 @@ import {
 } from "../../../lib/cli-auth";
 import * as platform from "../../../lib/platform";
 import { listApiKeys, deleteApiKey } from "../../../lib/platform-client";
-import { progress } from "../../../shared/output";
+import { json, progress } from "../../../shared/output";
 import { auth } from "../auth";
 
 const mockPlatform = vi.mocked(platform);
@@ -185,6 +185,7 @@ describe("dvmctl auth login", () => {
     expect(JSON.stringify([
       ...vi.mocked(console.log).mock.calls,
       ...vi.mocked(progress).mock.calls,
+      ...vi.mocked(json).mock.calls,
     ])).not.toMatch(/closed beta|invit(?:e|ed)|waitlist/i);
     if (human) {
       expect(outputBeforeBrowser).toEqual([
@@ -227,7 +228,11 @@ describe("dvmctl auth login", () => {
         display: expect.stringContaining(`Session code: ${sessionCode}`),
       }));
     }
-    if (!human) expect(console.log).toHaveBeenCalledTimes(1);
+    if (!human) {
+      expect(console.log).not.toHaveBeenCalled();
+      expect(json).toHaveBeenCalledTimes(1);
+      expect(json).toHaveBeenCalledWith({ authenticated: true, account: "alice@example.com" }, { feedback: false });
+    }
     expect(mockPlatform.saveAuthToken).toHaveBeenCalledWith({
       token: "dvmk_newkey",
       account: "alice@example.com",
@@ -247,16 +252,17 @@ describe("dvmctl auth login", () => {
       expect(console.log).toHaveBeenCalledWith("\nSign-in cancelled.");
       expect(console.log).toHaveBeenLastCalledWith(expect.stringContaining("dvmctl auth"));
     } else {
-      expect(JSON.parse(vi.mocked(console.log).mock.lastCall?.[0] as string)).toEqual({
+      expect(json).toHaveBeenCalledWith({
         authenticated: false,
         cancelled: true,
         display: "Sign-in cancelled.",
         hint: expect.stringContaining("dvmctl auth"),
-      });
+      }, { feedback: false });
     }
     expect(JSON.stringify([
       ...vi.mocked(console.log).mock.calls,
       ...vi.mocked(progress).mock.calls,
+      ...vi.mocked(json).mock.calls,
     ])).not.toMatch(/closed beta|invit(?:e|ed)|waitlist/i);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(exitSpy).toHaveBeenCalledWith(1);
@@ -274,17 +280,18 @@ describe("dvmctl auth login", () => {
       if (human) {
         expect(console.error).toHaveBeenCalledWith(expect.stringMatching(/Authentication timed out.*Try again.*DVMKIT_API_KEY/s));
       } else {
-        expect(JSON.parse(vi.mocked(console.log).mock.lastCall?.[0] as string)).toEqual({
+        expect(json).toHaveBeenCalledWith({
           authenticated: false,
           timed_out: true,
           display: expect.stringMatching(/Authentication timed out.*Try again.*DVMKIT_API_KEY/s),
           hint: expect.stringMatching(/Try again.*DVMKIT_API_KEY/s),
-        });
+        }, { feedback: false });
       }
       expect(JSON.stringify([
         ...vi.mocked(console.log).mock.calls,
         ...vi.mocked(console.error).mock.calls,
         ...vi.mocked(progress).mock.calls,
+        ...vi.mocked(json).mock.calls,
       ])).not.toMatch(/closed beta|invit(?:e|ed)|waitlist/i);
       expect(fetchMock).toHaveBeenCalledTimes(CLI_AUTH_MAX_POLL_ATTEMPTS);
       expect(exitSpy).toHaveBeenCalledWith(1);
@@ -560,7 +567,7 @@ describe("dvmctl auth login", () => {
       expect(deleteApiKey).toHaveBeenCalledExactlyOnceWith(expect.any(String), stored.token, "matching", expect.any(AbortSignal));
       expect(mockPlatform.clearAuthToken).toHaveBeenCalledOnce();
       if (human) expect(console.log).toHaveBeenCalledWith(expect.stringContaining("API key revoked"));
-      else expect(JSON.parse(vi.mocked(console.log).mock.lastCall![0])).toEqual({ status: "logged_out", revoked: true });
+      else expect(json).toHaveBeenCalledWith({ status: "logged_out", revoked: true }, { feedback: false });
       expect(fetchMock).not.toHaveBeenCalled();
       expect(spawn).not.toHaveBeenCalled();
     });
@@ -575,9 +582,9 @@ describe("dvmctl auth login", () => {
       if (failure === "missing stored key") mockPlatform.loadAuthToken.mockReturnValue(null);
       await auth({ logout: true });
       expect(mockPlatform.clearAuthToken).toHaveBeenCalledOnce();
-      const result = JSON.parse(vi.mocked(console.log).mock.lastCall![0]);
+      const result = vi.mocked(json).mock.lastCall?.[0];
       expect(result).toMatchObject({ status: "logged_out", revoked: false, hint: expect.stringContaining("dvmctl api-keys revoke <id>") });
-      expect(result.hint).toContain("dashboard");
+      expect(result).toHaveProperty("hint", expect.stringContaining("dashboard"));
       expect(JSON.stringify(result)).not.toContain(stored.token);
       if (failure !== "delete fails") expect(deleteApiKey).not.toHaveBeenCalled();
       if (failure === "missing stored key") expect(listApiKeys).not.toHaveBeenCalled();

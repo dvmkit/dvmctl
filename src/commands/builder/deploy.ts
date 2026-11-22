@@ -973,14 +973,12 @@ function deploySelfHost(cwd: string, opts: DeployOptions): void {
       `    docker run -p 8080:8080 \\\n      -e DVMKIT_BUILDER_PUBKEY=... \\\n      -e DVMKIT_BUILDER_ATTESTATION='...' \\\n      -e DVMKIT_BUILDER_SIGNATURE=... \\\n      -e DVMKIT_RECEIPT_KEY=... \\\n      my-dvm\n`
     );
   } else {
-    console.log(
-      JSON.stringify({
-        status: "ready",
-        file: "Dockerfile",
-        target: "self-host",
-        attestation_env: envVars,
-      })
-    );
+    json({
+      status: "ready",
+      file: "Dockerfile",
+      target: "self-host",
+      attestation_env: envVars,
+    }, { feedback: false });
   }
 }
 

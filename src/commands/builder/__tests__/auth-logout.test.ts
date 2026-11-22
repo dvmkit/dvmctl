@@ -5,7 +5,13 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { loadAuthToken, saveAuthToken } from "../../../lib/platform";
+import { json } from "../../../shared/output";
 import { auth } from "../auth";
+
+vi.mock("../../../shared/output", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../shared/output")>()),
+  json: vi.fn(),
+}));
 
 const stored = { token: "dvmk_stored_test_key", account: "builder@example.test" };
 const matchingKeys = { keys: [{ id: "stored-key", key_prefix: "dvmk_stored" }], count: 1, limit: 10 };
@@ -35,7 +41,6 @@ describe("logout revocation deadline", () => {
     directory = mkdtempSync(join(tmpdir(), "dvmctl-logout-"));
     vi.stubEnv("DVMCTL_CONFIG_DIR", directory);
     saveAuthToken(stored);
-    vi.spyOn(console, "log").mockImplementation(() => undefined);
   });
 
   afterEach(() => {
@@ -66,8 +71,7 @@ describe("logout revocation deadline", () => {
       expect(completed).toBe(true);
       await result;
       expect(loadAuthToken()).toBeNull();
-      const output = JSON.parse(vi.mocked(console.log).mock.lastCall![0]);
-      expect(output).toMatchObject({ status: "logged_out", revoked: false, hint: expect.stringContaining("dvmctl api-keys revoke <id>") });
+      expect(json).toHaveBeenCalledWith({ status: "logged_out", revoked: false, hint: expect.stringContaining("dvmctl api-keys revoke <id>") }, { feedback: false });
       expect(fetchMock).toHaveBeenCalledTimes(stage.startsWith("delete") ? 2 : 1);
       expect(signals.every((signal) => signal?.aborted)).toBe(true);
       expect(new Set(signals).size).toBe(1);
@@ -91,7 +95,7 @@ describe("logout revocation deadline", () => {
     expect(completed).toBe(true);
     await result;
     expect(loadAuthToken()).toBeNull();
-    expect(JSON.parse(vi.mocked(console.log).mock.lastCall![0]).revoked).toBe(false);
+    expect(json).toHaveBeenCalledWith(expect.objectContaining({ revoked: false }), { feedback: false });
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -103,7 +107,7 @@ describe("logout revocation deadline", () => {
     await auth({ logout: true });
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(loadAuthToken()).toBeNull();
-    expect(JSON.parse(vi.mocked(console.log).mock.lastCall![0])).toEqual({ status: "logged_out", revoked: true });
+    expect(json).toHaveBeenCalledWith({ status: "logged_out", revoked: true }, { feedback: false });
     expect(vi.getTimerCount()).toBe(0);
     await vi.advanceTimersByTimeAsync(5000);
     expect(fetchMock.mock.calls[0]![1]!.signal!.aborted).toBe(false);

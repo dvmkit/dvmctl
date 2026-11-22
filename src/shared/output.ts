@@ -33,8 +33,10 @@ export function getOutputTraceId(): string | null {
  * When a trace_id has been set via `setOutputTraceId`, it is injected as the
  * first key of the output object — unless `data` already contains `trace_id`
  * (e.g. a trace lookup returns the *queried* trace's ID).
+ * Use feedback: false for payloads that must omit feedback fields and leave
+ * feedback state untouched.
  */
-export function json(data: unknown): void {
+export function json(data: unknown, { feedback = true }: { feedback?: boolean } = {}): void {
   const out =
     _traceId !== null &&
     typeof data === "object" &&
@@ -43,8 +45,13 @@ export function json(data: unknown): void {
     !("trace_id" in data)
       ? { trace_id: _traceId, ...(data as Record<string, unknown>) }
       : data;
-  const enriched = typeof out === "object" && out !== null && !Array.isArray(out)
-    ? { ...(out as Record<string, unknown>), ...("error" in out || (process.exitCode ?? 0) !== 0 ? {} : feedbackNudge({ data: out as Record<string, unknown>, traceId: _traceId })) }
+  const enriched = feedback && typeof out === "object" && out !== null && !Array.isArray(out)
+    ? {
+      ...(out as Record<string, unknown>),
+      ...("error" in out || (process.exitCode ?? 0) !== 0
+        ? {}
+        : feedbackNudge({ data: out as Record<string, unknown>, traceId: _traceId })),
+    }
     : out;
   writeAllSync(1, JSON.stringify(enriched) + "\n");
 }

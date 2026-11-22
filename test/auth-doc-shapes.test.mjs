@@ -7,6 +7,16 @@ import { join } from "node:path";
 import test from "node:test";
 
 const account = "new-builder@example.test";
+const listTrace = "1".repeat(32);
+const deleteTrace = "2".repeat(32);
+const pollTrace = "3".repeat(32);
+
+function authResult(stdout) {
+  assert.match(stdout, /^[^\n]+\n$/);
+  const { trace_id, ...payload } = JSON.parse(stdout);
+  assert.match(trace_id, /^(?!0{32}$)[0-9a-f]{32}$/, "expected a valid trace_id");
+  return { traceId: trace_id, payload };
+}
 
 async function fixture(context, mode, { display = ":0", browserCommand, browserFailure = false, revocation = "success" } = {}) {
   const directory = mkdtempSync(join(tmpdir(), "dvmctl-auth-"));
@@ -54,12 +64,18 @@ global.setTimeout = (done, ms, ...args) => originalTimeout(done, ms >= 1000 && m
       const failed = revocation === "list-fails" || (revocation === "delete-fails" && req.method === "DELETE");
       const keys = revocation === "ambiguous" ? [{ id: "one", key_prefix: "local-test" }, { id: "two", key_prefix: "local-test" }] :
         [{ id: "other", key_prefix: "unrelated" }, { id: "stored", key_prefix: "local-test" }];
-      res.writeHead(failed ? 503 : 200, { "Content-Type": "application/json" });
+      res.writeHead(failed ? 503 : 200, {
+        "Content-Type": "application/json",
+        traceparent: "00-" + (req.method === "DELETE" ? deleteTrace : listTrace) + "-1234567890abcdef-01",
+      });
       res.end(JSON.stringify(failed ? { error: { message: "offline" } } : { keys, count: keys.length, limit: 10 }));
       return;
     }
     polls += 1;
-    res.writeHead(mode === "timeout" ? 404 : 200, { "Content-Type": "application/json" });
+    res.writeHead(mode === "timeout" ? 404 : 200, {
+      "Content-Type": "application/json",
+      traceparent: "00-" + pollTrace + "-1234567890abcdef-01",
+    });
     res.end(JSON.stringify(mode === "cancel" ? { cancelled: true } : { token: "local-test-token", account }));
   });
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
@@ -123,7 +139,8 @@ for (const mode of ["cancel", "timeout", "success"]) {
         assert.ok(startup.display.includes(`Session code: ${startup.fingerprint}`));
         assert.equal(result.stderr.trim().split("\n").length, 1);
         assert.equal(result.stdout.trim().split("\n").length, 1);
-        const final = JSON.parse(result.stdout);
+        const { traceId, payload: final } = authResult(result.stdout);
+        assert.notEqual(traceId, pollTrace);
         if (mode === "cancel") {
           assert.deepEqual(Object.keys(final).sort(), ["authenticated", "cancelled", "display", "hint"]);
           assert.equal(final.authenticated, false);
@@ -147,13 +164,35 @@ for (const mode of ["cancel", "timeout", "success"]) {
         assert.deepEqual(JSON.parse(readFileSync(configPath, "utf8")).auth, { token: "local-test-token", account });
         const existing = await f.run(["auth"]);
         assert.equal(existing.code, 0);
-        assert.deepEqual(JSON.parse(existing.stdout), { authenticated: true, account });
+        assert.deepEqual(authResult(existing.stdout).payload, { authenticated: true, account });
         assert.equal(existing.stderr, "");
         assert.equal(f.polls(), 1);
       }
     });
   }
 }
+
+test("compiled auth status adds a trace without enriching the payload or updating feedback state", async context => {
+  const f = await fixture(context, "success");
+  mkdirSync(f.config, { recursive: true });
+  const feedbackPath = join(f.config, "feedback-nudges.json");
+  const feedbackState = JSON.stringify({ posture: "ask", first_seen: Date.now() - 15 * 86_400_000 });
+  writeFileSync(feedbackPath, feedbackState);
+
+  const unauthenticated = await f.run(["auth", "--status"]);
+  assert.equal(unauthenticated.code, 0);
+  assert.equal(unauthenticated.stderr, "");
+  assert.deepEqual(authResult(unauthenticated.stdout).payload, { authenticated: false });
+  assert.equal(readFileSync(feedbackPath, "utf8"), feedbackState);
+
+  f.seedAuth();
+  const authenticated = await f.run(["auth", "--status"]);
+  assert.equal(authenticated.code, 0);
+  assert.equal(authenticated.stderr, "");
+  assert.deepEqual(authResult(authenticated.stdout).payload, { authenticated: true, account });
+  assert.equal(readFileSync(feedbackPath, "utf8"), feedbackState);
+  assert.deepEqual(f.requests, []);
+});
 
 test("compiled auth_required retains its API key and auth command hint", async context => {
   const f = await fixture(context, "cancel");
@@ -174,7 +213,8 @@ test("compiled auth on a Linux host without a display asks for the link to be re
   const result = await f.run(["auth"]);
   assert.equal(result.code, 0, result.stderr);
   assert.equal(f.browserLaunched(), false);
-  const event = JSON.parse(result.stderr.trim().split("\n")[0]);
+  const event = JSON.parse(result.stderr);
+  assert.deepEqual(authResult(result.stdout).payload, { authenticated: true, account });
   assert.equal(event.status, "awaiting_human");
   assert.equal(event.browser_opened, false);
   assert.match(event.display, /could not open a browser/i);
@@ -193,6 +233,7 @@ for (const human of [false, true]) {
       assert.ok(result.stdout.includes(`Session code: ${session.slice(0, 12)}`));
     } else {
       const event = JSON.parse(result.stderr);
+      assert.deepEqual(authResult(result.stdout).payload, { authenticated: true, account });
       assert.equal(event.browser_opened, false);
       assert.equal(event.fingerprint, new URL(event.url).searchParams.get("session").slice(0, 12));
       assert.ok(event.instruction.includes(event.url));
@@ -223,7 +264,12 @@ for (const revocation of ["success", "list-fails", "delete-fails", "ambiguous"])
     f.seedAuth();
     const result = await f.run(["auth", "--logout"]);
     assert.equal(result.code, 0, result.stderr);
-    const output = JSON.parse(result.stdout);
+    assert.equal(result.stderr, "");
+    const { traceId, payload: output } = authResult(result.stdout);
+    assert.equal(traceId, ["success", "delete-fails"].includes(revocation) ? deleteTrace : listTrace);
+    assert.deepEqual(Object.keys(output).sort(), revocation === "success"
+      ? ["revoked", "status"]
+      : ["hint", "revoked", "status"]);
     assert.equal(output.status, "logged_out");
     assert.equal(output.revoked, revocation === "success");
     if (revocation !== "success") assert.match(output.hint, /dashboard.*dvmctl api-keys revoke <id>/);

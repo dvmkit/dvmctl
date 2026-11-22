@@ -2,6 +2,8 @@
 
 ## Upgrade details
 
+- Final JSON results from `dvmctl auth` and self-host deploy now include a top-level `trace_id`. Browser sign-in still sends the separate `awaiting_human` progress event to stderr.
+
 - Add `dvmctl refund <job-id>` for full or partial completed-job refunds onto the caller's credit. Confirmation is required before any HTTP request. Stable refund IDs make retries return the original result; `--refund-id` permits a deliberate additional partial refund.
 - Pin the CLI runtime and new project scaffolds to exact `@dvmkit/sdk` `0.37.0`. Separately installed project dependencies stay unchanged until explicitly upgraded. `dvmctl serve` and `dvmctl dev` run the CLI's pinned SDK, so upgrading or downgrading dvmctl changes their SDK on the next restart. A project's own `serve.ts` uses its installed SDK. Pause monetary writes and coordinate upgrades or rollbacks across these processes under the rules below, even when the project's own SDK dependency is unchanged. Custom credit stores must implement the SDK's transactional `refundDraw` accounting and report enqueueing.
 - With PostgreSQL and `DVMKIT_DVM_ID`, settlement history and reporting identity now initialize at boot without hosting-control settings. Fresh databases start with complete history; existing incomplete or missing historical evidence is not certified by upgrading. Reporting identity inherits the single scope owning the DVM's obligations, and ambiguous historical scope or instance ownership refuses boot. The SDK removes hosting-control exports, options and routes; its former environment variables are ignored. The CLI and starter do not use those APIs.
