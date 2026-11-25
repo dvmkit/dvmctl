@@ -4,12 +4,12 @@ On November 21, 2026, we ran `npm audit --json` and `npm audit --omit=dev --json
 
 | Graph | Baseline | After the update |
 | --- | --- | --- |
-| Repository, full | 15 entries (3 high, 11 moderate, 1 low) | 1 low |
+| Repository, full | 15 entries (3 high, 11 moderate, 1 low) | 0 |
 | Repository, production only | 0 | 0 |
 | Fresh install of the packed CLI, production only | | 0 |
 | Fresh generated scaffold, full and production only | | 0 in each |
 
-Counts include affected parent packages when npm reports them. Lockfile-only runs with npm's cache disabled reported 22 full entries before the update and eight after it, with the same underlying advisories as the clean-install runs.
+Counts include affected parent packages when npm reports them. Lockfile-only runs with npm's cache disabled reported 22 full entries before the update and eight after the SDK update, with the same underlying advisories as the clean-install runs. On November 25, 2026, the repository full and production-only audits were rerun after a clean install with Node 22.23.2 and npm 10.9.8, following the esbuild update below. Both reported 0 entries.
 
 ## Runtime
 
@@ -29,4 +29,4 @@ Counts include affected parent packages when npm reports them. Lockfile-only run
 | **Vite.** Vitest brings Vite into the test toolchain. The advisories affect development-server features such as launching an editor, custom middleware, and serving files. The CLI serves DVMs through the SDK. | Vite resolves to 8.3.8 in both the repository and the fresh scaffold. [Windows argument escaping](https://github.com/advisories/GHSA-698v-4r3x-3vcv), [editor flags](https://github.com/advisories/GHSA-r825-w8mm-5pxw), [Windows path validation](https://github.com/advisories/GHSA-587h-7wmj-h5pm), [custom middleware](https://github.com/advisories/GHSA-9jrq-w75r-8gcw), [file serving](https://github.com/advisories/GHSA-rq7h-c2jc-7f22), [WebAssembly file serving](https://github.com/advisories/GHSA-vfpm-58rq-9qcg) |
 | **Minimatch and brace-expansion.** ESLint and typescript-eslint use these packages for glob matching in the authoring and CI lint workflow. The reported denial-of-service conditions require crafted patterns. | ESLint 10.15.0 and typescript-eslint 8.73.0 select minimatch 11.0.9 and brace-expansion 5.0.13. [Minimatch](https://github.com/advisories/GHSA-g3hv-75wg-m249), [expansion cost](https://github.com/advisories/GHSA-q2hr-2g5m-vwhr), [nested groups](https://github.com/advisories/GHSA-qhr7-859c-m2p7), [comma parsing](https://github.com/advisories/GHSA-6j4f-fj2g-mc7p) |
 | **Source Map JS.** PostCSS brings the parser into the build and test toolchain. The affected operation parses indexed source maps. | The repository lockfile resolves `source-map-js` 1.2.4. [Indexed source-map parsing](https://github.com/advisories/GHSA-68fv-2mgg-jv7q) |
-| **esbuild.** The development lockfile retains 0.27.7. The advisory requires running esbuild's own development server on Windows. The CLI's [optional `tsx` loader](../src/lib/load-handler.ts) registers a module transform for local handlers. | The Windows development-server advisory is tracked separately. The fresh packed CLI install resolved optional `tsx` 4.23.15 with esbuild 0.28.2 and reported zero production entries. [Windows development server](https://github.com/advisories/GHSA-g7r4-m6w7-qqqr) |
+| **esbuild.** The advisory requires running esbuild's own development server on Windows. The CLI's [optional `tsx` loader](../src/lib/load-handler.ts) registers a module transform for local handlers. | The development lockfile now resolves esbuild 0.28.2, which is outside the advisory's affected range (`>=0.27.3 <0.28.1`), through tsup 9.0.0 and `tsx` 4.23.15. Vitest's Vite shares the same copy. The fresh packed CLI install resolved optional `tsx` 4.23.15 with esbuild 0.28.2 and reported zero production entries. [Windows development server](https://github.com/advisories/GHSA-g7r4-m6w7-qqqr) |
