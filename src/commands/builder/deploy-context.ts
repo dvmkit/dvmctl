@@ -216,6 +216,8 @@ export function createTarball(cwd: string, maxBytes = MAX_ARCHIVE_BYTES): Buffer
       execFileSync("tar", ["czf", "-", ...TARBALL_EXCLUDES.map((e) => `--exclude=${e}`),
         ...(files === null ? ["."] : ["--no-recursion", "--null", "-T", "-"])], {
         cwd,
+        // macOS tar otherwise adds AppleDouble entries for extended attributes.
+        env: { ...process.env, COPYFILE_DISABLE: "1" },
         // Prefixing paths also prevents option-like filenames being interpreted by tar.
         input: files === null ? undefined : files.map((path) => `./${path}\0`).join(""),
         stdio: ["pipe", fd, "pipe"],
