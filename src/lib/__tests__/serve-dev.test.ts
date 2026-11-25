@@ -4,6 +4,35 @@ import { expect, it } from "vitest";
 import { createDevHost } from "../serve-dev.ts";
 import { SDK_VERSION } from "../version.ts";
 
+it("completes a local job after the handler wakes", async () => {
+  const server = await createDevHost(configureDVM({
+    name: "Watch",
+    capability: "watch",
+    async onJob(ctx) {
+      await ctx.sleep("watch-interval", 100);
+      ctx.complete("watch finished");
+    },
+  }), { port: 0, env: {}, devMode: true }).serve();
+
+  try {
+    const response = await fetch(`${server.url}/v1/job`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ capability: "watch", data: "check again" }),
+    });
+    expect(response.ok).toBe(true);
+    const { job_id, job_token } = await response.json();
+    await expect.poll(async () => {
+      const status = await fetch(`${server.url}/v1/job/${job_id}`, {
+        headers: { "x-job-token": job_token },
+      });
+      return status.json();
+    }).toMatchObject({ status: "completed", summary: "watch finished" });
+  } finally {
+    await server.close();
+  }
+});
+
 function host() {
   return createDevHost(configureDVM({ name: "Echo", capability: "echo", onJob() {} }), { devMode: true });
 }
