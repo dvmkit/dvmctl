@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { DvmError } from "@dvmkit/sdk/internal";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { gitRunner } from "../../../test-support/git-sandbox.ts";
 import { SPAWN_HEAVY_TIMEOUT } from "../../../test-support/spawn-budget.ts";
@@ -27,6 +27,7 @@ function entries(dir: string): string[] {
 }
 
 afterEach(() => {
+  vi.unstubAllEnvs();
   for (const dir of directories.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -47,6 +48,23 @@ describe("git-visible deploy context", { timeout: SPAWN_HEAVY_TIMEOUT }, () => {
     symlinkSync("missing-target", join(dir, "broken-link"));
 
     expect(entries(dir)).toEqual(["-input.txt", ".gitignore", "broken-link", "tracked.txt", "untracked.txt"]);
+  });
+
+  it.skipIf(process.platform !== "darwin")("omits AppleDouble entries for files with extended attributes", () => {
+    const dir = fixture();
+    git(dir, "init");
+    const file = join(dir, "input.txt");
+    writeFileSync(file, "source");
+    execFileSync("/usr/bin/xattr", ["-w", "com.dvmkit.test", "metadata", file]);
+    vi.stubEnv("PATH", `/usr/bin:${process.env.PATH}`);
+    vi.stubEnv("COPYFILE_DISABLE", undefined);
+
+    // The macOS tar reader normally hides AppleDouble entries in the listing.
+    const listing = execFileSync("/usr/bin/tar", ["tzf", "-", "--options", "tar:!mac-ext"], {
+      input: createTarball(dir),
+      encoding: "utf8",
+    });
+    expect(listing.trim().split("\n")).toEqual(["./input.txt"]);
   });
 
   it("scopes archive entries and dirty paths to a nested context", () => {
