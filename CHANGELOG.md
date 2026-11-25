@@ -10,6 +10,13 @@
 - Authenticated object input schemas must declare `pubkey`, `signature`, `timestamp` and `nonce`, or preserve unknown fields. Capabilities remain on the job channel by default; adding x402 channels requires explicit job-channel selection, bounded runtime and pricing. Upgrade every instance sharing a job database before serving x402 channel jobs, since older instances do not preserve the channel during recovery. The starter remains an unauthenticated job-channel capability.
 - Before activating refunds, pause monetary writes and upgrade every process sharing the credit database and report queue, including funding writers and retry workers. Mixed-version monetary history after new metadata is written needs a state compatibility assessment, as does rollback after refund state exists. Older readers cannot interpret refund reports or known-zero Bitcoin lots. Additive schema initialization alone does not make a rolling upgrade or rollback safe. If enabling hosted Stripe Checkout, upgrade all processes sharing its store together and keep Checkout-aware recovery running until recorded sessions resolve before rollback. See [refund guidance](docs/refund-command.md) and the [SDK upgrade details](https://github.com/dvmkit/sdk/blob/v0.46.0/CHANGELOG.md).
 
+## [0.20.3](https://github.com/dvmkit/dvmctl/compare/v0.20.2...v0.20.3) (2026-11-25)
+
+
+### Bug Fixes
+
+* **deploy:** omit AppleDouble metadata from archives ([4ad2730](https://github.com/dvmkit/dvmctl/commit/4ad2730f90901238c78fea19a18d7239004ba62c))
+
 ## [0.20.2](https://github.com/dvmkit/dvmctl/compare/v0.20.1...v0.20.2) (2026-11-25)
 
 
