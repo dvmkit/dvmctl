@@ -10,6 +10,19 @@
 - Authenticated object input schemas must declare `pubkey`, `signature`, `timestamp` and `nonce`, or preserve unknown fields. Capabilities remain on the job channel by default; adding x402 channels requires explicit job-channel selection, bounded runtime and pricing. Upgrade every instance sharing a job database before serving x402 channel jobs, since older instances do not preserve the channel during recovery. The starter remains an unauthenticated job-channel capability.
 - Before activating refunds, pause monetary writes and upgrade every process sharing the credit database and report queue, including funding writers and retry workers. Mixed-version monetary history after new metadata is written needs a state compatibility assessment, as does rollback after refund state exists. Older readers cannot interpret refund reports or known-zero Bitcoin lots. Additive schema initialization alone does not make a rolling upgrade or rollback safe. If enabling hosted Stripe Checkout, upgrade all processes sharing its store together and keep Checkout-aware recovery running until recorded sessions resolve before rollback. See [refund guidance](docs/refund-command.md) and the [SDK upgrade details](https://github.com/dvmkit/sdk/blob/v0.37.0/CHANGELOG.md).
 
+## [0.20.2](https://github.com/dvmkit/dvmctl/compare/v0.20.1...v0.20.2) (2026-11-25)
+
+
+### Bug Fixes
+
+* **auth:** control browser launches and revoke stored keys on logout ([4627333](https://github.com/dvmkit/dvmctl/commit/462733323183272ea02492a3c4cbaed400140299))
+* **deploy:** expose dry-run Docker failure diagnostics ([ff62c36](https://github.com/dvmkit/dvmctl/commit/ff62c36f4bb633701298cc47bbceba99c3c87e04))
+* **deps:** pin @dvmkit/sdk 0.40.0 ([#82](https://github.com/dvmkit/dvmctl/issues/82)) ([ece311f](https://github.com/dvmkit/dvmctl/commit/ece311ff6ee3303c69cd06f3393af18efb5b7b9f))
+* **deps:** pin @dvmkit/sdk 0.46.0 so dev and serve run sleeping handlers ([#89](https://github.com/dvmkit/dvmctl/issues/89)) ([74dc02a](https://github.com/dvmkit/dvmctl/commit/74dc02a7c52d9488cfc5bcda886f7928270f4ba2))
+* include trace IDs in auth and self-host deploy JSON ([52cc804](https://github.com/dvmkit/dvmctl/commit/52cc804feb0898d9d3bb688450db6a015c420e85))
+* preserve deploy guidance during stdin redaction ([525db76](https://github.com/dvmkit/dvmctl/commit/525db769e6685df8de0c0842b2079c8d1a192802))
+* **release:** tolerate npm publication scan delays ([1c25965](https://github.com/dvmkit/dvmctl/commit/1c259656584f00002f67578e3b1ab61e6cad1a3a))
+
 ## [0.20.1](https://github.com/dvmkit/dvmctl/compare/v0.20.0...v0.20.1) (2026-11-13)
 
 
